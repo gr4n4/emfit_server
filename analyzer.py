@@ -207,6 +207,28 @@ def handover(sn, user, location, group, when):
     return new_id
 
 
+def update_active_user(sn, new_user):
+    """sn 기기의 활성 배정 user 이름만 수정 (location/group/start 등은 보존).
+    종료된 배정은 건드리지 않음 — 옛 배정의 이름은 그 시기의 역사 기록이므로 보존.
+    활성 배정이 없으면 False."""
+    new_user = (str(new_user) or "").strip()
+    if not new_user:
+        return False
+    with _ASSIGNMENTS_LOCK:
+        target = None
+        for a in ASSIGNMENTS:
+            if a.get("sn") == sn and not a.get("end"):
+                target = a
+                break
+        if target is None:
+            return False
+        target["user"] = new_user
+        _save_assignments()
+        _rebuild_assign_index()
+    _rebuild_device_info()
+    return True
+
+
 def update_active_assignments(updates):
     """{sn: {name, location, group}} — 각 기기의 활성 배정 필드를 수정(오타 수정 등)."""
     with _ASSIGNMENTS_LOCK:
@@ -234,6 +256,8 @@ def invalidate_cache():
     _cache["path"] = None
     _cache["storage"] = None
     _cache["offset"] = 0
+    _latest_states_cache["key"] = None
+    _latest_states_cache["result"] = None
 
 
 # ── 모듈 초기화: 배정 이력 로드 후 DEVICE_INFO 동기화 ──
@@ -499,9 +523,19 @@ def list_available_assignments(jsonl_path):
     return sorted(combos, key=lambda k: k[1], reverse=True)
 
 
+_latest_states_cache = {"key": None, "result": None}
+
+
 def get_latest_states(jsonl_path):
-    """기기별 가장 최근 HR 포함 레코드를 반환. {device_sn: record}"""
+    """기기별 가장 최근 HR 포함 레코드를 반환. {device_sn: record}
+
+    카드 대시보드가 15초마다 호출하므로, 데이터(파일 mtime)가 그대로면
+    전체 storage 풀스캔을 건너뛰고 이전 결과를 그대로 돌려준다."""
     storage = _load_storage(jsonl_path)
+    cache_key = (_cache.get("path"), _cache.get("mtime"))
+    if (_latest_states_cache["key"] == cache_key
+            and _latest_states_cache["result"] is not None):
+        return _latest_states_cache["result"]
     latest = {}
     for (sn, _date), records in storage.items():
         for r in records:
@@ -514,6 +548,8 @@ def get_latest_states(jsonl_path):
             cur_key = (cur["날짜"], cur["시간(KST)"]) if cur else ("", "")
             if this_key > cur_key:
                 latest[sn] = r
+    _latest_states_cache["key"] = cache_key
+    _latest_states_cache["result"] = latest
     return latest
 
 

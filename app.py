@@ -8,16 +8,18 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.0.2"
+VERSION = "3.2.2"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
 FEEDBACK_FILE = "feedback.jsonl"
 TOKENS_FILE = "device_tokens.json"
+VIEW_TOKENS_FILE = "view_tokens.json"  # 그룹(여러 기기 묶음) 보기 토큰
 ADMIN_PW_FILE = "admin_password.txt"
 PREFERENCES_FILE = "preferences.json"  # viewer 단위 UI 환경설정 (블록 순서 등)
 ADMIN_COOKIE = "emfit_admin"  # device 토큰 쿠키 이름 (변수 이름은 옛 잔재)
 SESSION_COOKIE = "emfit_session"  # 관리자 로그인 세션 쿠키
+VIEW_COOKIE = "emfit_view"  # 그룹(view) 토큰 쿠키
 # 관리자 ID — 비번은 ADMIN_PW_FILE에서 읽음. ID 변경 원하면 환경변수로.
 ADMIN_USERNAME = os.environ.get("EMFIT_ADMIN_USER", "operator")
 # 세션 쿠키 서명용 비밀키 — 서버 부팅 시 1회 생성. 재시작하면 모두 로그아웃됨.
@@ -25,6 +27,7 @@ _SESSION_SECRET = secrets.token_bytes(32)
 # 외부 접속 URL (DDNS). 내부 base는 사용자가 들어온 host에서 자동 추출.
 EXTERNAL_BASE = os.environ.get("EMFIT_EXTERNAL_BASE", "http://monitoring.example.com")
 _tokens_lock = threading.Lock()
+_view_tokens_lock = threading.Lock()
 _feedback_lock = threading.Lock()
 _prefs_lock = threading.Lock()
 
@@ -109,6 +112,26 @@ def _save_tokens(tokens):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(tokens, f, ensure_ascii=False, indent=2)
         os.replace(tmp, TOKENS_FILE)
+
+
+def _load_view_tokens():
+    """view_tokens.json 로드. 형식: {"<token>": {"name": "A시설", "sns": ["EMFIT-DEMO-01", ...]}}."""
+    if not os.path.exists(VIEW_TOKENS_FILE):
+        return {}
+    try:
+        with open(VIEW_TOKENS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_view_tokens(views):
+    with _view_tokens_lock:
+        tmp = VIEW_TOKENS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(views, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, VIEW_TOKENS_FILE)
 
 
 def _load_preferences():
@@ -212,6 +235,34 @@ def _get_token_from_request(request: Request):
     if t:
         return t
     return request.cookies.get(ADMIN_COOKIE)
+
+
+def _get_view_token_from_request(request: Request):
+    """쿼리 파라미터 ?view= 또는 쿠키에서 view(그룹) 토큰 추출.
+
+    admin도 그룹 대시보드(/view)를 봐야 하므로 쿠키를 막지 않는다.
+    'admin이 전체 대시보드에서 그룹 기기를 눌렀을 때 그룹으로 빨려가는' 문제는
+    여기서가 아니라 /device/{sn} 의 in_view 판정에서 '명시적 ?view=' 로만
+    그룹 컨텍스트를 인정하는 방식으로 따로 처리한다."""
+    t = request.query_params.get("view")
+    if t:
+        return t
+    return request.cookies.get(VIEW_COOKIE)
+
+
+def _resolve_view(request: Request):
+    """현재 view 토큰이 가리키는 그룹 정보. 유효하면 {token, name, sns} 반환, 아니면 None."""
+    t = _get_view_token_from_request(request)
+    if not t:
+        return None
+    views = _load_view_tokens()
+    v = views.get(t)
+    if not isinstance(v, dict):
+        return None
+    sns = v.get("sns") or []
+    if not isinstance(sns, list) or not sns:
+        return None
+    return {"token": t, "name": str(v.get("name") or ""), "sns": list(sns)}
 
 # ── 점검(워밍업) 게이트 ───────────────────────────────────────────────
 # 재배포·재시작 직후 대용량 로그를 파싱하는 동안 깔끔한 '점검 중' 페이지를 보여준다.
@@ -428,7 +479,7 @@ def _card_sort_key(sn, state, ds, now):
     return (4, sn)
 
 
-def _render_inactive_card(sn, info, ds, now, token=""):
+def _render_inactive_card(sn, info, ds, now, link_suffix=""):
     """비활성 기기용 minimal 카드. 측정값은 안 보여주고 위치/이름/마지막 통신만."""
     location_text = info['location'] if info['location'] and info['location'] != '-' else '미지정'
     if ds is None:
@@ -440,7 +491,7 @@ def _render_inactive_card(sn, info, ds, now, token=""):
         else:
             last_text = "통신 끊김"
     return f"""
-    <a href="/device/{sn}" style="display:block; text-decoration:none; color:inherit;">
+    <a href="/device/{sn}{link_suffix}" style="display:block; text-decoration:none; color:inherit;">
     <div style="background:#fafafa; padding:12px 14px; border-radius:10px; border:1px solid #e0e0e0; transition:transform 0.1s;" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
         <div style="display:flex; justify-content:space-between; align-items:center;">
             <div>
@@ -456,7 +507,7 @@ def _render_inactive_card(sn, info, ds, now, token=""):
     """
 
 
-def _render_card(sn, info, state, ds, now, token=""):
+def _render_card(sn, info, state, ds, now, link_suffix=""):
     location_text = info['location'] if info['location'] and info['location'] != '-' else '미지정'
 
     if ds is None:
@@ -479,7 +530,7 @@ def _render_card(sn, info, state, ds, now, token=""):
 
     if state is None:
         return f"""
-        <a href="/device/{sn}" style="display:block; text-decoration:none; color:inherit;">
+        <a href="/device/{sn}{link_suffix}" style="display:block; text-decoration:none; color:inherit;">
         <div style="background:#fff8e1; padding:16px; border-radius:14px; border:2px solid #ffd54f; transition:transform 0.1s;" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
             <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                 <div>
@@ -533,7 +584,7 @@ def _render_card(sn, info, state, ds, now, token=""):
         rr_str = f"{rr:.0f}" if isinstance(rr, (int, float)) else "-"
 
     return f"""
-    <a href="/device/{sn}" style="display:block; text-decoration:none; color:inherit;">
+    <a href="/device/{sn}{link_suffix}" style="display:block; text-decoration:none; color:inherit;">
     <div style="background:{bg}; padding:16px; border-radius:14px; border:2px solid {border}; transition:transform 0.1s;" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
         <div style="display:flex; justify-content:space-between; align-items:flex-start;">
             <div>
@@ -571,8 +622,13 @@ def _render_card(sn, info, state, ds, now, token=""):
     """
 
 
-def _build_cards_payload(token=""):
-    """대시보드 카드 영역 + 헤더 요약을 HTML 조각으로 빌드. /dashboard 첫 렌더와 /api/cards 갱신 양쪽에서 재사용."""
+def _build_cards_payload(token="", sn_filter=None, view_token=""):
+    """대시보드 카드 영역 + 헤더 요약을 HTML 조각으로 빌드.
+    /dashboard·/api/cards (전체) 와 /view·/api/view/cards (그룹 필터) 양쪽에서 재사용.
+    sn_filter (list of SNs) 주면 그 기기들만 포함.
+    view_token 주면 카드 링크에 ?view= 를 붙여 그룹 컨텍스트를 명시한다
+    (그래야 admin이 그룹 대시보드에서 누른 기기의 '뒤로가기'가 /view 로 돌아감)."""
+    link_suffix = f"?view={view_token}" if view_token else ""
     now = datetime.now()
     now_ts = now.timestamp()
 
@@ -585,9 +641,13 @@ def _build_cards_payload(token=""):
 
     statuses = analyzer.get_device_statuses()
 
+    sn_set = set(sn_filter) if sn_filter else None
+    visible_sns = [sn for sn in analyzer.DEVICE_INFO.keys()
+                   if sn_set is None or sn in sn_set]
+
     active_sns, inactive_sns = [], []
     connected_count = 0
-    for sn in analyzer.DEVICE_INFO.keys():
+    for sn in visible_sns:
         ds = statuses.get(sn)
         if _is_active(ds, now_ts):
             active_sns.append(sn)
@@ -600,14 +660,14 @@ def _build_cards_payload(token=""):
     inactive_sns.sort()
 
     active_html = "\n".join(
-        _render_card(sn, analyzer.DEVICE_INFO[sn], latest.get(sn), statuses.get(sn), now, token)
+        _render_card(sn, analyzer.DEVICE_INFO[sn], latest.get(sn), statuses.get(sn), now, link_suffix)
         for sn in active_sns
     ) or '<p style="grid-column:1/-1; text-align:center; color:#90a4ae; padding:40px;">활성 기기가 없습니다.</p>'
 
     inactive_html = ""
     if inactive_sns:
         cards = "\n".join(
-            _render_inactive_card(sn, analyzer.DEVICE_INFO[sn], statuses.get(sn), now, token)
+            _render_inactive_card(sn, analyzer.DEVICE_INFO[sn], statuses.get(sn), now, link_suffix)
             for sn in inactive_sns
         )
         inactive_html = f"""
@@ -619,7 +679,7 @@ def _build_cards_payload(token=""):
             </div>
         """
 
-    total = len(analyzer.DEVICE_INFO)
+    total = len(visible_sns)
     summary_parts = [f'<b style="color:#2e7d32;">{connected_count}</b> / {total} 연결됨']
     if inactive_sns:
         summary_parts.append(f'<span style="color:#90a4ae;">비활성 {len(inactive_sns)}</span>')
@@ -717,6 +777,109 @@ def api_cards(request: Request, _: str = Depends(require_admin)):
     return _build_cards_payload(_get_token_from_request(request) or "")
 
 
+# 그룹(view) 대시보드 — 공무원/외부 관람자가 admin이 묶어준 기기만 모아 봄
+@app.get("/v/{token}", response_class=HTMLResponse)
+def view_group_entry(token: str):
+    """발급된 그룹 URL 진입 → 쿠키 저장 후 /view 로 리다이렉트."""
+    views = _load_view_tokens()
+    v = views.get(token)
+    if not isinstance(v, dict) or not v.get("sns"):
+        raise HTTPException(status_code=401, detail="invalid view token")
+    resp = RedirectResponse("/view", status_code=303)
+    resp.set_cookie(VIEW_COOKIE, token, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
+    return resp
+
+
+@app.get("/view", response_class=HTMLResponse)
+def view_group_dashboard(request: Request):
+    """그룹 토큰 보유자 전용 대시보드 — 본인 그룹 SN만 카드 노출."""
+    view = _resolve_view(request)
+    if view is None:
+        return HTMLResponse(
+            "<p style='font-family:sans-serif; padding:40px; text-align:center;'>"
+            "접근할 수 있는 그룹이 없습니다. 관리자에게 받은 URL로 다시 접속해주세요.</p>",
+            status_code=401,
+        )
+    name_safe = html.escape(view["name"])
+    p = _build_cards_payload(token=view["token"], sn_filter=view["sns"], view_token=view["token"])
+    return f"""
+    <html>
+        <head>
+            <title>{name_safe} · Emfit 관제</title>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body {{ font-family: 'Malgun Gothic', sans-serif; padding:20px; background:#f0f2f5; margin:0; }}
+                a {{ -webkit-tap-highlight-color: transparent; }}
+                @media (max-width: 600px) {{
+                    body {{ padding: 10px; }}
+                    h1 {{ font-size: 1.3em !important; }}
+                    .nav-buttons a {{
+                        display:block !important; margin: 6px 0 !important;
+                    }}
+                }}
+            </style>
+        </head>
+        <body>
+            <div style="max-width:1400px; margin:auto;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+                    <h1 style="color:#1a73e8; margin:0;">📡 {name_safe}</h1>
+                    <div style="color:#7f8c8d; font-size:0.9em;">
+                        <span id="clock">{p['now']}</span> · <span id="header-summary">{p['summary']}</span>
+                    </div>
+                </div>
+
+                <div id="active-cards" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(240px, 1fr)); gap:15px; margin-top:20px;">
+                    {p['active']}
+                </div>
+
+                <div id="inactive-section">
+                    {p['inactive']}
+                </div>
+
+                <p class="nav-buttons" style="text-align:center; margin-top:30px;">
+                    <a href="/help" style="display:inline-block; padding:10px 20px; background:#27ae60; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">📘 사용 가이드</a>
+                    <a href="/feedback" style="display:inline-block; padding:10px 20px; background:#e67e22; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">💬 의견 보내기</a>
+                </p>
+
+                <p style="text-align:center; color:#bdc3c7; font-size:0.8em; margin-top:10px;">
+                    15초마다 자동 갱신 · 카드를 누르면 기기별 상세 그래프
+                </p>
+                <p style="text-align:center; color:#90a4ae; font-size:0.75em; margin-top:20px;">
+                    Emfit Server v{VERSION}
+                </p>
+            </div>
+            <script>
+                async function refreshCards() {{
+                    try {{
+                        const r = await fetch('/api/view/cards');
+                        if (!r.ok) return;
+                        const d = await r.json();
+                        document.getElementById('active-cards').innerHTML = d.active;
+                        document.getElementById('inactive-section').innerHTML = d.inactive;
+                        document.getElementById('header-summary').innerHTML = d.summary;
+                        document.getElementById('clock').textContent = d.now;
+                    }} catch (e) {{}}
+                }}
+                setInterval(refreshCards, 15000);
+                document.addEventListener('visibilitychange', () => {{
+                    if (!document.hidden) refreshCards();
+                }});
+            </script>
+        </body>
+    </html>
+    """
+
+
+@app.get("/api/view/cards")
+def api_view_cards(request: Request):
+    """그룹 대시보드 카드 갱신용."""
+    view = _resolve_view(request)
+    if view is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return _build_cards_payload(token=view["token"], sn_filter=view["sns"], view_token=view["token"])
+
+
 def _build_single_card(sn, token=""):
     """단일 기기 카드 HTML — /device/{sn} 페이지의 실시간 현황 영역에 사용."""
     info = analyzer.DEVICE_INFO.get(sn)
@@ -734,8 +897,8 @@ def _build_single_card(sn, token=""):
     state = latest.get(sn)
     ds = statuses.get(sn)
     if _is_active(ds, now_ts):
-        return _render_card(sn, info, state, ds, now, token)
-    return _render_inactive_card(sn, info, ds, now, token)
+        return _render_card(sn, info, state, ds, now)
+    return _render_inactive_card(sn, info, ds, now)
 
 
 @app.get("/api/device/{sn}/card", response_class=HTMLResponse)
@@ -746,32 +909,39 @@ def api_device_card(sn: str, request: Request):
 
 
 def _require_device_access(request: Request, sn: str):
-    """admin 세션이면 무조건 통과 (남아있는 device 토큰 쿠키 무시).
-    그 외엔 device 토큰이 그 SN과 매핑되어야 통과.
-    토큰은 있는데 SN 불일치면 403 — 외부 사용자가 다른 기기 보려는 시도 차단."""
-    # admin 먼저 검사 — admin이 테스트로 /d/{token} 접속한 후 토큰 쿠키가 남아있어도
-    # 자기 다른 기기에 접근할 수 있게 해야 함.
+    """admin → device 토큰 → view(그룹) 토큰 순으로 접근 검사.
+    어디에도 안 맞으면 401/403."""
+    # admin 먼저 — admin이 테스트로 /d/{token} 접속해 쿠키가 남아있어도 다른 기기 접근 가능해야 함.
     if _is_admin_authenticated(request):
         return None
     t = _get_token_from_request(request)
+    mapped = None
     if t:
-        tokens = _load_tokens()
-        mapped = tokens.get(t)
-        if mapped == sn:
+        mapped = _load_tokens().get(t)
+        if mapped == sn or mapped == "*":
             return t  # device 토큰 통과
-        if mapped is not None and mapped != "*":
-            raise HTTPException(status_code=403, detail="other device")
+    # device 토큰이 이 기기를 허용하지 않더라도 곧장 막지 말고 view(그룹) 토큰을 먼저 확인한다.
+    # (잔류 device 토큰 쿠키가 그룹 접근을 가로채던 버그 fix)
+    view = _resolve_view(request)
+    if view is not None and sn in view["sns"]:
+        return view["token"]
+    # 어떤 토큰으로도 이 기기 접근이 허용되지 않음.
+    if mapped is not None or (view is not None):
+        raise HTTPException(status_code=403, detail="other device")  # 토큰은 있으나 이 기기는 권한 밖
     raise HTTPException(status_code=401, detail="login required")
 
 
 def _get_viewer_id(request: Request):
-    """현재 viewer 식별자. admin 세션이면 'admin', device 토큰 보유면 토큰 값.
-    UI 환경설정(블록 순서 등)을 어떤 단위로 저장/조회할지 결정하는 키."""
+    """현재 viewer 식별자. UI 환경설정(블록 순서 등) 저장 키.
+    admin 세션 → 'admin', device 토큰 → 토큰 값, view 토큰 → 'view:' + 토큰."""
     if _is_admin_authenticated(request):
         return "admin"
     t = _get_token_from_request(request)
     if t:
         return t
+    view = _resolve_view(request)
+    if view is not None:
+        return "view:" + view["token"]
     return None
 
 
@@ -970,7 +1140,15 @@ def api_device_timeseries(
 @app.get("/device/{sn}", response_class=HTMLResponse)
 def view_device(sn: str, request: Request, assignment: str = Query(None)):
     device_token = _require_device_access(request, sn)
-    is_admin = device_token is None  # device 토큰 없이 통과 = admin
+    # device_token: None (admin) | device 토큰 | view(그룹) 토큰. is_admin/view 따로 판정.
+    is_admin = _is_admin_authenticated(request)
+    view = _resolve_view(request)
+    sn_in_group = view is not None and sn in view["sns"]
+    # admin은 명시적으로 그룹을 미리보기(?view=)로 들어왔을 때만 그룹 컨텍스트로 취급한다.
+    # (전체 대시보드에서 그룹 기기를 눌렀을 때 잔류 쿠키 때문에 그룹으로 빨려가던 버그 fix)
+    # 실사용자(그룹 토큰 보유, admin 아님)는 쿠키만으로도 그룹 컨텍스트.
+    explicit_view = bool(request.query_params.get("view"))
+    in_view = sn_in_group and (explicit_view or not is_admin)
     info = analyzer.DEVICE_INFO.get(sn)
     if info is None:
         return HTMLResponse("<p>기기를 찾을 수 없습니다.</p>", status_code=404)
@@ -999,13 +1177,50 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
         except Exception:
             pass
     today = available_for_sn[0] if available_for_sn else datetime.now(KST).strftime("%Y-%m-%d")
-    if not is_admin:
+    if in_view:
+        # view(그룹) 컨텍스트 우선 — admin이 테스트 중이든 진짜 그룹 사용자든 그룹 대시보드로 돌아감
+        back_link = '<a href="/view" style="color:#1a73e8; text-decoration:none;">← 그룹 대시보드</a>'
+    elif not is_admin:
         back_link = f'<a href="/d/{device_token}" style="color:#1a73e8; text-decoration:none;">← 메인</a>'
     elif assignment:
         back_link = '<a href="/devices" style="color:#1a73e8; text-decoration:none;">← 배정 이력</a>'
     else:
         back_link = '<a href="/dashboard" style="color:#1a73e8; text-decoration:none;">← 대시보드</a>'
+
+    # 이름 수정 권한 — admin OR view(그룹) 권한자만, 활성 배정만 (종료된 옛 배정은 역사 기록 보존)
+    can_edit_name = (is_admin or in_view) and not is_closed_stint
+    if can_edit_name:
+        name_safe_val = html.escape(str(info['name']), quote=True)
+        edit_name_ui = f"""
+        <button type="button" id="name-edit-btn" onclick="document.getElementById('name-edit-form').style.display='block'; this.style.display='none';"
+            style="margin-left:8px; padding:4px 10px; background:transparent; color:#1a73e8; border:1px solid #1a73e8; border-radius:6px; cursor:pointer; font-size:0.8em; vertical-align:middle;"
+            title="활성 배정의 사용자명 수정">✏️ 이름 수정</button>
+        <form id="name-edit-form" method="post" action="/devices/edit_user" style="display:none; margin:10px 0 16px 0; padding:12px 14px; background:#fff8e1; border:1px solid #ffd54f; border-radius:8px;">
+            <input type="hidden" name="sn" value="{sn}">
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <label style="font-size:0.9em; color:#5d4037;">새 이름:</label>
+                <input type="text" name="user" value="{name_safe_val}" required maxlength="50" autofocus
+                    style="flex:1; min-width:180px; padding:6px 10px; border:1px solid #ccc; border-radius:6px;">
+                <button type="submit" style="padding:6px 14px; background:#16a085; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold;">저장</button>
+                <button type="button" onclick="document.getElementById('name-edit-form').style.display='none'; document.getElementById('name-edit-btn').style.display='inline-block';"
+                    style="padding:6px 10px; background:#b0bec5; color:white; border:none; border-radius:6px; cursor:pointer;">취소</button>
+            </div>
+            <p style="margin:8px 0 0 0; font-size:0.78em; color:#8d6e63; line-height:1.4;">
+                ⚠️ 이름을 바꾸면 이 활성 배정 <b>기간 전체</b>의 데이터가 새 이름으로 표시됩니다. (옛 배정/리포트는 그대로)
+            </p>
+        </form>
+        """
+    else:
+        edit_name_ui = ""
     token = device_token or ""
+    # API fetch(XHR) 인증을 쿠키에만 의존하지 않도록 — 토큰/뷰 토큰을 쿼리로도 실어 보낸다.
+    # (모바일 브라우저가 백그라운드 요청에 쿠키를 빠뜨리면 401→로그인HTML→JSON파싱 폭발하던 버그 차단)
+    if device_token is None:
+        auth_qs = ""  # admin — 세션 쿠키로 충분
+    elif view is not None and device_token == view.get("token"):
+        auth_qs = f"view={device_token}"
+    else:
+        auth_qs = f"token={device_token}"
     initial_card_html = _build_single_card(sn, token)
     # 종료된 배정(과거 조회)이면 실시간 카드 대신 안내문, 활성 배정이면 실시간 카드
     if is_closed_stint:
@@ -1092,7 +1307,7 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
         <body>
             <div class="container">
                 <p style="margin: 0 0 12px 0;">{back_link}</p>
-                <h1 style="margin: 8px 0; color: #1a237e;">{info['name']}</h1>
+                <h1 style="margin: 8px 0; color: #1a237e; display:inline-block;">{info['name']}</h1>{edit_name_ui}
                 <p style="color: #607d8b; margin: 0 0 16px 0;">{location_text} · {sn}</p>
 
                 {realtime_section}
@@ -1174,6 +1389,12 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
             <script>
                 const sn = "{sn}";
                 const token = "{token}";
+                const authQS = "{auth_qs}";
+                // 쿠키가 안 실려도 인증되도록 모든 API 요청에 토큰을 붙인다.
+                function apiUrl(path) {{
+                    if (!authQS) return path;
+                    return path + (path.indexOf('?') >= 0 ? '&' : '?') + authQS;
+                }}
                 const charts = {{}};
                 const CHART_KEYS = ['hr', 'rr', 'act'];
                 const CHART_COLORS = {{ hr: '#e74c3c', rr: '#3498db', act: '#f39c12' }};
@@ -1349,7 +1570,20 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                     refreshActiveStates(sdt, edt);
                     try {{
                         const url = `/api/device/${{sn}}/timeseries?start_dt=${{encodeURIComponent(sdt)}}&end_dt=${{encodeURIComponent(edt)}}`;
-                        const r = await fetch(url);
+                        const r = await fetch(apiUrl(url));
+                        if (!r.ok) {{
+                            destroyCharts();
+                            const el = document.getElementById('data-status');
+                            if (r.status === 401 || r.status === 403) {{
+                                el.textContent = '⚠️ 접속 인증이 만료됐어요. 받으신 링크를 다시 한 번 열어주세요.';
+                            }} else if (r.status === 503) {{
+                                el.textContent = '🛠️ 서버 점검 중이에요. 잠시 후 자동으로 다시 시도합니다…';
+                                setTimeout(loadFromInputs, 6000);
+                            }} else {{
+                                el.textContent = `데이터를 불러오지 못했어요 (오류 ${{r.status}}). 잠시 후 다시 시도해주세요.`;
+                            }}
+                            return;
+                        }}
                         const d = await r.json();
                         lastSummaries = d.summaries || [];
                         lastPoints = d.points || [];
@@ -1428,7 +1662,7 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                 // ─ 블록 순서 변경: 드래그 + ▲/▼ 버튼 ─
                 async function applySavedOrder() {{
                     try {{
-                        const r = await fetch('/api/preferences/order');
+                        const r = await fetch(apiUrl('/api/preferences/order'));
                         if (!r.ok) return;
                         const d = await r.json();
                         const container = document.getElementById('blocks-container');
@@ -1442,7 +1676,7 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                     const container = document.getElementById('blocks-container');
                     const order = Array.from(container.children).map(el => el.dataset.blockId).filter(Boolean);
                     try {{
-                        await fetch('/api/preferences/order', {{
+                        await fetch(apiUrl('/api/preferences/order'), {{
                             method: 'POST',
                             headers: {{ 'Content-Type': 'application/json' }},
                             body: JSON.stringify({{ order }}),
@@ -1585,7 +1819,7 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
 
                 async function refreshStatusCard() {{
                     try {{
-                        const r = await fetch(`/api/device/${{sn}}/card`);
+                        const r = await fetch(apiUrl(`/api/device/${{sn}}/card`));
                         if (r.ok) {{
                             document.getElementById('status-card').innerHTML = await r.text();
                         }}
@@ -2183,18 +2417,52 @@ async def devices_handover(request: Request, _: str = Depends(require_admin)):
     return RedirectResponse("/devices?handover=1", status_code=303)
 
 
+@app.post("/devices/edit_user")
+async def devices_edit_user(request: Request):
+    """활성 배정의 사용자명만 수정. admin 또는 view(그룹)+자기 SN 일 때 허용.
+    옛 배정(end 있는 것)은 건드리지 않음 — 그건 역사 기록."""
+    form = await request.form()
+    sn = (form.get("sn") or "").strip()
+    new_user = (form.get("user") or "").strip()
+    if not sn or sn not in analyzer.DEVICE_INFO:
+        return PlainTextResponse("기기를 찾을 수 없습니다.", status_code=400)
+    if not new_user:
+        return PlainTextResponse("이름을 입력하세요.", status_code=400)
+    # 권한 검사 — admin OR (view 토큰 + sn 포함)
+    if not _is_admin_authenticated(request):
+        view = _resolve_view(request)
+        if view is None or sn not in view["sns"]:
+            raise HTTPException(status_code=403, detail="not allowed")
+    try:
+        ok = analyzer.update_active_user(sn, new_user)
+        if not ok:
+            return PlainTextResponse("활성 배정을 찾지 못했습니다.", status_code=400)
+        analyzer.invalidate_cache()
+    except Exception as e:
+        return PlainTextResponse(f"이름 변경 실패: {e}", status_code=500)
+    return RedirectResponse(f"/device/{sn}", status_code=303)
+
+
 # 의견/개선사항 페이지 (관리자 ID/PW 또는 device 토큰 보유자)
 @app.get("/feedback", response_class=HTMLResponse)
 def view_feedback(request: Request, ok: int = 0):
     is_admin = _is_admin_authenticated(request)
     device_token = None
+    view = None
     if not is_admin:
         t = _get_token_from_request(request)
         if t and t in _load_tokens():
             device_token = t
         else:
-            raise HTTPException(status_code=401, detail="login required")
-    back_link = '<a href="/dashboard" style="color:#1a73e8; text-decoration:none;">← 대시보드</a>' if is_admin else f'<a href="/d/{device_token}" style="color:#1a73e8; text-decoration:none;">← 메인</a>'
+            view = _resolve_view(request)
+            if view is None:
+                raise HTTPException(status_code=401, detail="login required")
+    if is_admin:
+        back_link = '<a href="/dashboard" style="color:#1a73e8; text-decoration:none;">← 대시보드</a>'
+    elif view is not None:
+        back_link = '<a href="/view" style="color:#1a73e8; text-decoration:none;">← 그룹 대시보드</a>'
+    else:
+        back_link = f'<a href="/d/{device_token}" style="color:#1a73e8; text-decoration:none;">← 메인</a>'
     items = _load_feedback_items()
     total = len(items)
 
@@ -2317,8 +2585,10 @@ async def submit_feedback(request: Request):
     form = await request.form()
     if not _is_admin_authenticated(request):
         token = _get_token_from_request(request)
-        if not token or token not in _load_tokens():
-            raise HTTPException(status_code=401, detail="login required")
+        if not (token and token in _load_tokens()):
+            # device 토큰도 없으면 view(그룹) 토큰 허용
+            if _resolve_view(request) is None:
+                raise HTTPException(status_code=401, detail="login required")
     text = (form.get("text") or "").strip()
     if not text:
         return RedirectResponse("/feedback", status_code=303)
@@ -2403,8 +2673,9 @@ def admin_tokens(request: Request, _: str = Depends(require_admin)):
         bases.append(("🏠 내부 (같은 와이파이)", request_base))
         bases.append(("🌍 외부 (DDNS)", EXTERNAL_BASE))
 
-    def _url_block(t):
-        path = f"/d/{t}"
+    def _url_block(t, prefix="d"):
+        """URL 한 묶음(내부/외부 base × token) 렌더. prefix='d' (개별) 또는 'v' (그룹)."""
+        path = f"/{prefix}/{t}"
         rows = ""
         for label, b in bases:
             full = f"{b}{path}"
@@ -2412,7 +2683,7 @@ def admin_tokens(request: Request, _: str = Depends(require_admin)):
             <div style="display:flex; gap:6px; align-items:center; margin-bottom:4px; flex-wrap:wrap;">
                 <span style="min-width:170px; font-size:0.8em; color:#546e7a;">{label}</span>
                 <input readonly value="{full}" onclick="this.select()" style="flex:1; min-width:200px; padding:6px 8px; font-family:monospace; font-size:0.8em; border:1px solid #ddd; border-radius:6px; background:#fafafa;">
-                <button type="button" onclick="navigator.clipboard.writeText('{full}'); this.textContent='✓'; setTimeout(()=>this.textContent='📋', 1500);" style="padding:6px 10px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-size:0.85em;">📋</button>
+                <button type="button" onclick="copyText('{full}', this)" style="padding:6px 10px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-size:0.85em;">📋</button>
             </div>
             """
         return rows
@@ -2457,6 +2728,75 @@ def admin_tokens(request: Request, _: str = Depends(require_admin)):
         </tr>
         """
 
+    # ── 그룹(view) URL 섹션 ─────────────────────────────────────
+    views = _load_view_tokens()
+    if views:
+        view_rows = ""
+        for vtok, vinfo in views.items():
+            vname = html.escape(str(vinfo.get("name", "")))
+            vsns = vinfo.get("sns") or []
+            sn_chips = "".join(
+                f'<span style="display:inline-block; background:#eef; color:#1a237e; padding:3px 8px; border-radius:10px; font-family:monospace; font-size:0.75em; margin:2px;">{html.escape(s)}</span>'
+                for s in vsns
+            )
+            view_rows += f"""
+            <tr>
+                <td style="padding:12px; vertical-align:top;">
+                    <div style="font-weight:bold; color:#1a237e;">{vname}</div>
+                    <div style="margin-top:4px;">{sn_chips}</div>
+                </td>
+                <td style="padding:12px;">
+                    <div style="border:1px solid #eee; border-radius:8px; padding:10px; background:white;">
+                        {_url_block(vtok, prefix='v')}
+                        <form method="post" action="/admin/views/revoke" style="margin:6px 0 0 0; text-align:right;">
+                            <input type="hidden" name="target" value="{vtok}">
+                            <button type="submit" onclick="return confirm('이 그룹 URL을 폐기할까요?\\n받은 사람에게 새 URL을 다시 보내야 합니다.');" style="padding:6px 10px; background:#e57373; color:white; border:none; border-radius:6px; cursor:pointer; font-size:0.8em;">🗑️ 폐기</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            """
+        views_table_html = f"""
+        <table style="margin-top:8px;">
+            <thead>
+                <tr>
+                    <th style="width:30%;">그룹</th>
+                    <th>URL</th>
+                </tr>
+            </thead>
+            <tbody>{view_rows}</tbody>
+        </table>
+        """
+    else:
+        views_table_html = '<p style="color:#90a4ae; padding:12px 0;">발급된 그룹 URL이 없습니다.</p>'
+
+    sn_checkboxes = ""
+    for sn in sorted(analyzer.DEVICE_INFO.keys()):
+        info = analyzer.DEVICE_INFO[sn]
+        dname = html.escape(str(info.get("name", "")))
+        dloc = html.escape(str(info.get("location", "")))
+        sn_checkboxes += f"""
+        <label style="display:inline-flex; align-items:center; gap:6px; padding:6px 10px; margin:4px; background:white; border:1px solid #ddd; border-radius:6px; cursor:pointer;">
+            <input type="checkbox" name="sns" value="{sn}">
+            <span><b>{dname}</b> <span style="color:#90a4ae; font-size:0.85em;">— {dloc}</span></span>
+        </label>
+        """
+    issue_view_form_html = f"""
+    <form method="post" action="/admin/views/issue" style="margin-top:12px; padding:16px; background:#f5f7fa; border-radius:8px; border:1px dashed #cfd8dc;">
+        <div style="display:flex; gap:10px; align-items:center; margin-bottom:12px; flex-wrap:wrap;">
+            <label style="font-weight:bold; color:#1a237e;">그룹 이름:</label>
+            <input type="text" name="name" placeholder="예: OO요양원 실증, OO병원 실증 등" required style="flex:1; min-width:200px; padding:8px 10px; border:1px solid #ccc; border-radius:6px;">
+        </div>
+        <div style="margin-bottom:12px;">
+            <div style="font-weight:bold; color:#1a237e; margin-bottom:6px;">포함할 기기 (체크):</div>
+            {sn_checkboxes}
+        </div>
+        <div style="text-align:right;">
+            <button type="submit" style="padding:8px 16px; background:#16a085; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold;">+ 그룹 URL 발급</button>
+        </div>
+    </form>
+    """
+
     return f"""
     <html>
     <head>
@@ -2485,6 +2825,7 @@ def admin_tokens(request: Request, _: str = Depends(require_admin)):
                 4. URL이 유출되었거나 사용자가 바뀌면 <b>🗑️ 폐기</b> 후 새로 발급하세요.
             </div>
 
+            <h2 style="color:#1a237e; margin:24px 0 8px 0; font-size:1.15em;">👤 개별 사용자 URL</h2>
             <table>
                 <thead>
                     <tr>
@@ -2495,7 +2836,42 @@ def admin_tokens(request: Request, _: str = Depends(require_admin)):
                 </thead>
                 <tbody>{rows_html}</tbody>
             </table>
+
+            <h2 style="color:#1a237e; margin:36px 0 8px 0; font-size:1.15em; padding-top:20px; border-top:2px solid #e8f0fe;">👥 그룹 보기 URL</h2>
+            <div class="info-box">
+                <b>💡 그룹 URL이란?</b><br>
+                여러 기기를 한 페이지에 모아 보여주는 URL입니다. 대상 기기 선택 후 URL 발급을 진행하면, 선택된 기기에 대해서만 대시보드가 생성됩니다.
+            </div>
+            {views_table_html}
+            {issue_view_form_html}
         </div>
+        <script>
+            // HTTPS 아닐 때 navigator.clipboard 가 안 돼서 execCommand fallback 추가
+            function copyText(text, btn) {{
+                function done(ok) {{
+                    btn.textContent = ok ? '✓' : '✗';
+                    setTimeout(function() {{ btn.textContent = '📋'; }}, 1500);
+                }}
+                if (navigator.clipboard && window.isSecureContext) {{
+                    navigator.clipboard.writeText(text).then(
+                        function() {{ done(true); }},
+                        function() {{ done(false); }}
+                    );
+                    return;
+                }}
+                var ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                var ok = false;
+                try {{ ok = document.execCommand('copy'); }} catch (e) {{}}
+                document.body.removeChild(ta);
+                done(ok);
+            }}
+        </script>
     </body>
     </html>
     """
@@ -2524,6 +2900,37 @@ async def admin_tokens_revoke(request: Request, _: str = Depends(require_admin))
     if target in tokens:
         del tokens[target]
         _save_tokens(tokens)
+    return RedirectResponse("/admin/tokens", status_code=303)
+
+
+@app.post("/admin/views/issue")
+async def admin_views_issue(request: Request, _: str = Depends(require_admin)):
+    """그룹(view) URL 발급. 폼: name + sns (체크박스 다중)."""
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    sns = [s for s in form.getlist("sns") if s in analyzer.DEVICE_INFO]
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    if not sns:
+        raise HTTPException(status_code=400, detail="at least one device required")
+    views = _load_view_tokens()
+    tokens = _load_tokens()
+    new_tok = secrets.token_urlsafe(16)
+    while new_tok in views or new_tok in tokens:
+        new_tok = secrets.token_urlsafe(16)
+    views[new_tok] = {"name": name, "sns": sns}
+    _save_view_tokens(views)
+    return RedirectResponse("/admin/tokens", status_code=303)
+
+
+@app.post("/admin/views/revoke")
+async def admin_views_revoke(request: Request, _: str = Depends(require_admin)):
+    form = await request.form()
+    target = (form.get("target") or "").strip()
+    views = _load_view_tokens()
+    if target in views:
+        del views[target]
+        _save_view_tokens(views)
     return RedirectResponse("/admin/tokens", status_code=303)
 
 
@@ -2589,7 +2996,8 @@ def view_one_device(token: str):
             f"<p style='font-family:sans-serif; padding:40px; text-align:center;'>이 URL에 연결된 기기({mapped})가 더 이상 등록되어 있지 않습니다. 관리자에게 문의해주세요.</p>",
             status_code=404,
         )
-    resp = RedirectResponse(f"/device/{mapped}", status_code=303)
+    # 쿠키 + URL 토큰 둘 다 — 일부 모바일 브라우저가 fetch(XHR)에 쿠키를 빠뜨리는 걸 대비.
+    resp = RedirectResponse(f"/device/{mapped}?token={token}", status_code=303)
     resp.set_cookie(ADMIN_COOKIE, token, max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
     return resp
 
