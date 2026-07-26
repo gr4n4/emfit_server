@@ -8,10 +8,14 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.2.2"
+VERSION = "3.3.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
+RADAR_LOG_FILE = "radar_data.jsonl"  # AI Radar 는 별도 파일에 쌓는다
+# 대시보드·리포트가 읽어야 할 로그 파일 전체. 기기 종류가 늘면 여기에 추가.
+# 원본을 나눠두면 한쪽 데이터가 커져도 다른 쪽 조회 속도에 영향을 주지 않는다.
+DATA_FILES = [LOG_FILE, RADAR_LOG_FILE]
 FEEDBACK_FILE = "feedback.jsonl"
 TOKENS_FILE = "device_tokens.json"
 VIEW_TOKENS_FILE = "view_tokens.json"  # 그룹(여러 기기 묶음) 보기 토큰
@@ -37,6 +41,11 @@ DEFAULT_BLOCK_ORDER = ["summary", "hr", "rr", "act"]
 # Emfit 데이터는 모두 KST 기준으로 저장됨 (analyzer가 UTC → Asia/Seoul 변환).
 # 프런트는 datetime-local로 KST 시각을 입력하고, 그대로 KST aware datetime으로 해석.
 KST = timezone(timedelta(hours=9))
+
+
+def _has_data():
+    """수집된 로그 파일이 하나라도 있는지."""
+    return any(os.path.exists(p) for p in DATA_FILES)
 
 
 def _parse_kst_dt(s):
@@ -306,8 +315,8 @@ def _warmup_then_ready():
     """백그라운드에서 로그 파싱(워밍업)을 끝낸 뒤 서버를 '준비됨' 상태로 전환."""
     global _SERVER_READY
     try:
-        if os.path.exists(LOG_FILE):
-            analyzer.warmup(LOG_FILE)
+        if _has_data():
+            analyzer.warmup(DATA_FILES)
     except Exception as e:
         print(f"[startup] 워밍업 실패: {e}", flush=True)
     finally:
@@ -322,9 +331,11 @@ threading.Thread(target=_warmup_then_ready, daemon=True).start()
 @app.middleware("http")
 async def _maintenance_gate(request: Request, call_next):
     """워밍업이 안 끝났으면 점검 페이지(503)로 응답한다.
-    단, Emfit 기기의 데이터 수신(POST /)은 점검 중에도 받아 데이터 유실을 막는다."""
+    단, Emfit(POST /)과 AI Radar(POST /radar)의 데이터 수신은
+    점검 중에도 받아 데이터 유실을 막는다."""
     if not _SERVER_READY:
-        if not (request.method == "POST" and request.url.path == "/"):
+        receive_paths = {"/", "/radar"}
+        if not (request.method == "POST" and request.url.path in receive_paths):
             return HTMLResponse(_maintenance_page_html(), status_code=503,
                                 headers={"Retry-After": "5"})
     return await call_next(request)
@@ -460,8 +471,20 @@ def _is_active(ds, now_ts):
     return (now_ts - last_seen) <= 7 * 24 * 3600
 
 
+def _is_radar_device(sn, state=None, ds=None):
+    """Radar 분석 기록, 상태 출처 또는 12자리 MAC으로 AI Radar를 판별."""
+    if isinstance(state, dict) and state.get("유형") == "Radar":
+        return True
+    if isinstance(ds, dict) and ds.get("source") == "ai_radar":
+        return True
+    compact = str(sn or "").replace(":", "").replace("-", "").upper()
+    return len(compact) == 12 and all(c in "0123456789ABCDEF" for c in compact)
+
+
 def _card_sort_key(sn, state, ds, now):
     """이상 상태일수록 위로. 같은 카테고리에서는 SN 순."""
+    if isinstance(state, dict) and state.get("낙상"):
+        return (-1, sn)
     if ds is not None and not ds.get("connected"):
         return (0, sn)
     if state is None:
@@ -477,7 +500,6 @@ def _card_sort_key(sn, state, ds, now):
     if isinstance(act, (int, float)) and act < 1:
         return (3, sn)
     return (4, sn)
-
 
 def _render_inactive_card(sn, info, ds, now, link_suffix=""):
     """비활성 기기용 minimal 카드. 측정값은 안 보여주고 위치/이름/마지막 통신만."""
@@ -509,6 +531,12 @@ def _render_inactive_card(sn, info, ds, now, link_suffix=""):
 
 def _render_card(sn, info, state, ds, now, link_suffix=""):
     location_text = info['location'] if info['location'] and info['location'] != '-' else '미지정'
+    is_radar = _is_radar_device(sn, state, ds)
+    source_badge = (
+        '<span style="display:inline-block; margin-left:6px; padding:2px 7px; border-radius:10px; '
+        'background:#6a1b9a; color:white; font-size:0.55em; vertical-align:middle;">AI Radar</span>'
+        if is_radar else ""
+    )
 
     if ds is None:
         conn_icon, conn_text, conn_color = "❓", "상태 없음", "#78909c"
@@ -535,7 +563,7 @@ def _render_card(sn, info, state, ds, now, link_suffix=""):
             <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                 <div>
                     <div style="font-size:0.85em; color:#5d4037;">{location_text}</div>
-                    <div style="font-size:1.3em; font-weight:bold; color:#263238;">{info['name']}</div>
+                    <div style="font-size:1.3em; font-weight:bold; color:#263238;">{info['name']}{source_badge}</div>
                 </div>
                 <div style="font-size:1.8em;">{conn_icon}</div>
             </div>
@@ -563,25 +591,53 @@ def _render_card(sn, info, state, ds, now, link_suffix=""):
     rr = state.get("호흡수(RR)")
     act = state.get("활동량(ACT)")
     act_num = act if isinstance(act, (int, float)) else None
-    act_str = f"{act_num:.0f}" if act_num is not None else "-"
 
-    # 상태는 3가지로 단순화: 끊김 / 부재 / 재실
-    # 부재 = 측정 대기(10분 이상 데이터 없음) + 활동량 0 (Emfit은 침대 위에서만 측정)
-    absent = act_num is not None and act_num < 1
-    if connected is False:
-        status_icon, status_label, bg, border, text_color = "🔴", "끊김", "#ffcdd2", "#e57373", "#b71c1c"
-    elif mins_ago > 10 or absent:
-        status_icon, status_label, bg, border, text_color = "🛏️", "부재", "#efebe9", "#bcaaa4", "#4e342e"
-    else:
-        status_icon, status_label, bg, border, text_color = "🛌", "재실", "#e3f2fd", "#64b5f6", "#0d47a1"
+    if is_radar:
+        pos = state.get("자세(POS)")
+        posture = str(state.get("자세") or "-")
+        metric_label = "🧭 자세"
+        metric_value = posture
+        metric_font_size = "1.25em"
 
-    if status_label != "재실":
-        hr_str = "-"
-        rr_str = "-"
-        act_str = "-"
+        if connected is False:
+            status_icon, status_label, bg, border, text_color = "🔴", "끊김", "#ffcdd2", "#e57373", "#b71c1c"
+        elif mins_ago > 10:
+            status_icon, status_label, bg, border, text_color = "⏱️", "수신 지연", "#fff3e0", "#ffb74d", "#e65100"
+        elif state.get("낙상") or pos == 4:
+            status_icon, status_label, bg, border, text_color = "🚨", "낙상", "#ffebee", "#e53935", "#b71c1c"
+        elif pos == 5:
+            status_icon, status_label, bg, border, text_color = "🚪", "자리비움", "#efebe9", "#bcaaa4", "#4e342e"
+        elif pos == -1:
+            status_icon, status_label, bg, border, text_color = "📡", "감지 대기", "#eceff1", "#b0bec5", "#455a64"
+        else:
+            status_icon, status_label, bg, border, text_color = "🛌", "재실", "#e8eaf6", "#7986cb", "#283593"
+
+        hide_vitals = status_label in ("끊김", "수신 지연", "자리비움", "감지 대기")
+        hr_str = "-" if hide_vitals else (f"{hr:.0f}" if isinstance(hr, (int, float)) else "-")
+        rr_str = "-" if hide_vitals else (f"{rr:.0f}" if isinstance(rr, (int, float)) else "-")
+        if status_label in ("끊김", "수신 지연"):
+            metric_value = "-"
     else:
-        hr_str = f"{hr:.0f}" if isinstance(hr, (int, float)) else "-"
-        rr_str = f"{rr:.0f}" if isinstance(rr, (int, float)) else "-"
+        metric_label = "🏃 ACT"
+        metric_value = f"{act_num:.0f}" if act_num is not None else "-"
+        metric_font_size = "2.4em"
+
+        # Emfit 상태는 기존 방식 유지: 끊김 / 부재 / 재실
+        absent = act_num is not None and act_num < 1
+        if connected is False:
+            status_icon, status_label, bg, border, text_color = "🔴", "끊김", "#ffcdd2", "#e57373", "#b71c1c"
+        elif mins_ago > 10 or absent:
+            status_icon, status_label, bg, border, text_color = "🛏️", "부재", "#efebe9", "#bcaaa4", "#4e342e"
+        else:
+            status_icon, status_label, bg, border, text_color = "🛌", "재실", "#e3f2fd", "#64b5f6", "#0d47a1"
+
+        if status_label != "재실":
+            hr_str = "-"
+            rr_str = "-"
+            metric_value = "-"
+        else:
+            hr_str = f"{hr:.0f}" if isinstance(hr, (int, float)) else "-"
+            rr_str = f"{rr:.0f}" if isinstance(rr, (int, float)) else "-"
 
     return f"""
     <a href="/device/{sn}{link_suffix}" style="display:block; text-decoration:none; color:inherit;">
@@ -589,7 +645,7 @@ def _render_card(sn, info, state, ds, now, link_suffix=""):
         <div style="display:flex; justify-content:space-between; align-items:flex-start;">
             <div>
                 <div style="font-size:0.85em; color:#455a64;">{location_text}</div>
-                <div style="font-size:1.3em; font-weight:bold; color:#1a237e;">{info['name']}</div>
+                <div style="font-size:1.3em; font-weight:bold; color:#1a237e;">{info['name']}{source_badge}</div>
             </div>
             <div style="font-size:1.8em;">{status_icon}</div>
         </div>
@@ -603,8 +659,8 @@ def _render_card(sn, info, state, ds, now, link_suffix=""):
                 <div style="font-weight:bold; font-size:2.4em; color:#212121; line-height:1.1;">{rr_str}</div>
             </div>
             <div style="text-align:center; flex:1;">
-                <div style="font-size:0.7em; color:#e67e22; font-weight:bold;">🏃 ACT</div>
-                <div style="font-weight:bold; font-size:2.4em; color:#212121; line-height:1.1;">{act_str}</div>
+                <div style="font-size:0.7em; color:#e67e22; font-weight:bold;">{metric_label}</div>
+                <div style="font-weight:bold; font-size:{metric_font_size}; color:#212121; line-height:1.1; min-height:1.1em; display:flex; align-items:center; justify-content:center;">{metric_value}</div>
             </div>
         </div>
         <div style="text-align:center; margin-top:12px; font-size:1.05em; font-weight:bold; color:{text_color};">
@@ -621,6 +677,51 @@ def _render_card(sn, info, state, ds, now, link_suffix=""):
     </a>
     """
 
+def _render_device_section(title, icon, description, active_sns, inactive_sns,
+                           latest, statuses, now, link_suffix="", accent="#1a73e8"):
+    """기기 종류별로 활성·비활성 카드를 한 구역에 묶어 표시."""
+    active_cards = "\n".join(
+        _render_card(sn, analyzer.DEVICE_INFO[sn], latest.get(sn), statuses.get(sn), now, link_suffix)
+        for sn in active_sns
+    )
+    if not active_cards:
+        active_cards = (
+            '<p style="grid-column:1/-1; text-align:center; color:#90a4ae; '
+            'padding:28px 10px; margin:0;">최근 7일간 활성 기기가 없습니다.</p>'
+        )
+
+    inactive_html = ""
+    if inactive_sns:
+        inactive_cards = "\n".join(
+            _render_inactive_card(sn, analyzer.DEVICE_INFO[sn], statuses.get(sn), now, link_suffix)
+            for sn in inactive_sns
+        )
+        inactive_html = f"""
+            <div style="margin-top:18px; color:#90a4ae; font-size:0.88em;">
+                💤 비활성 기기 ({len(inactive_sns)}대)
+                <span style="font-size:0.9em; color:#b0bec5;">— 7일 이상 통신 없음</span>
+            </div>
+            <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:10px; margin-top:10px;">
+                {inactive_cards}
+            </div>
+        """
+
+    total_count = len(active_sns) + len(inactive_sns)
+    return f"""
+        <section style="margin-top:26px; padding:20px; background:#ffffff; border-radius:16px; border-top:5px solid {accent}; box-shadow:0 2px 8px rgba(0,0,0,0.05);">
+            <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:8px; margin-bottom:15px;">
+                <div>
+                    <h2 style="margin:0; color:#263238; font-size:1.35em;">{icon} {title}</h2>
+                    <div style="margin-top:5px; color:#78909c; font-size:0.85em;">{description}</div>
+                </div>
+                <div style="color:#90a4ae; font-size:0.85em;">총 {total_count}대 · 활성 {len(active_sns)}대</div>
+            </div>
+            <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(240px, 1fr)); gap:15px;">
+                {active_cards}
+            </div>
+            {inactive_html}
+        </section>
+    """
 
 def _build_cards_payload(token="", sn_filter=None, view_token=""):
     """대시보드 카드 영역 + 헤더 요약을 HTML 조각으로 빌드.
@@ -633,9 +734,9 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
     now_ts = now.timestamp()
 
     latest = {}
-    if os.path.exists(LOG_FILE):
+    if _has_data():
         try:
-            latest = analyzer.get_latest_states(LOG_FILE)
+            latest = analyzer.get_latest_states(DATA_FILES)
         except Exception:
             latest = {}
 
@@ -659,39 +760,41 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
     active_sns.sort(key=lambda s: _card_sort_key(s, latest.get(s), statuses.get(s), now))
     inactive_sns.sort()
 
-    active_html = "\n".join(
-        _render_card(sn, analyzer.DEVICE_INFO[sn], latest.get(sn), statuses.get(sn), now, link_suffix)
-        for sn in active_sns
-    ) or '<p style="grid-column:1/-1; text-align:center; color:#90a4ae; padding:40px;">활성 기기가 없습니다.</p>'
+    emfit_active = [sn for sn in active_sns if not _is_radar_device(sn, latest.get(sn), statuses.get(sn))]
+    radar_active = [sn for sn in active_sns if _is_radar_device(sn, latest.get(sn), statuses.get(sn))]
+    emfit_inactive = [sn for sn in inactive_sns if not _is_radar_device(sn, latest.get(sn), statuses.get(sn))]
+    radar_inactive = [sn for sn in inactive_sns if _is_radar_device(sn, latest.get(sn), statuses.get(sn))]
 
-    inactive_html = ""
-    if inactive_sns:
-        cards = "\n".join(
-            _render_inactive_card(sn, analyzer.DEVICE_INFO[sn], statuses.get(sn), now, link_suffix)
-            for sn in inactive_sns
+    emfit_section = ""
+    if sn_filter is None or emfit_active or emfit_inactive:
+        emfit_section = _render_device_section(
+            "EMFIT QS", "❤️", "심박 · 호흡 · 움직임 등 생체정보 중심",
+            emfit_active, emfit_inactive, latest, statuses, now, link_suffix, "#1a73e8",
         )
-        inactive_html = f"""
-            <h2 style="color:#90a4ae; margin-top:40px; font-size:1em; font-weight:normal; border-top:1px solid #cfd8dc; padding-top:20px;">
-                💤 비활성 기기 ({len(inactive_sns)}대) <span style="font-size:0.85em; color:#b0bec5;">— 7일 이상 통신 없음</span>
-            </h2>
-            <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:10px; margin-top:15px;">
-                {cards}
-            </div>
-        """
+
+    radar_section = ""
+    if sn_filter is None or radar_active or radar_inactive:
+        radar_section = _render_device_section(
+            "AI Radar", "📡", "누움 · 앉음 · 걸터앉음 · 자리비움 · 낙상 등 자세정보 중심",
+            radar_active, radar_inactive, latest, statuses, now, link_suffix, "#7e57c2",
+        )
 
     total = len(visible_sns)
+    emfit_count = len(emfit_active) + len(emfit_inactive)
+    radar_count = len(radar_active) + len(radar_inactive)
     summary_parts = [f'<b style="color:#2e7d32;">{connected_count}</b> / {total} 연결됨']
-    if inactive_sns:
-        summary_parts.append(f'<span style="color:#90a4ae;">비활성 {len(inactive_sns)}</span>')
+    if sn_filter is None or emfit_count:
+        summary_parts.append(f'<span style="color:#546e7a;">EMFIT {emfit_count}대</span>')
+    if sn_filter is None or radar_count:
+        summary_parts.append(f'<span style="color:#6a1b9a;">Radar {radar_count}대</span>')
     summary_html = ' · '.join(summary_parts)
 
     return {
-        "active": active_html,
-        "inactive": inactive_html,
+        "emfit_section": emfit_section,
+        "radar_section": radar_section,
         "summary": summary_html,
         "now": now.strftime('%Y-%m-%d %H:%M:%S'),
     }
-
 
 # 관제 대시보드 (기기별 카드 그리드) — 관리자 전용
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -701,7 +804,7 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
     return f"""
     <html>
         <head>
-            <title>Emfit 관제 화면</title>
+            <title>통합 관제 화면</title>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
@@ -719,18 +822,16 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
         <body>
             <div style="max-width:1400px; margin:auto;">
                 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
-                    <h1 style="color:#1a73e8; margin:0;">📡 Emfit 실시간 관제</h1>
+                    <h1 style="color:#1a73e8; margin:0;">📡 통합 실시간 관제</h1>
                     <div style="color:#7f8c8d; font-size:0.9em;">
                         <span id="clock">{p['now']}</span> · <span id="header-summary">{p['summary']}</span>
                     </div>
                 </div>
-
-                <div id="active-cards" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(240px, 1fr)); gap:15px; margin-top:20px;">
-                    {p['active']}
+                <div id="emfit-section">
+                    {p['emfit_section']}
                 </div>
-
-                <div id="inactive-section">
-                    {p['inactive']}
+                <div id="radar-section">
+                    {p['radar_section']}
                 </div>
 
                 <p class="nav-buttons" style="text-align:center; margin-top:30px;">
@@ -756,8 +857,8 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                         const r = await fetch('/api/cards');
                         if (!r.ok) return;
                         const d = await r.json();
-                        document.getElementById('active-cards').innerHTML = d.active;
-                        document.getElementById('inactive-section').innerHTML = d.inactive;
+                        document.getElementById('emfit-section').innerHTML = d.emfit_section;
+                        document.getElementById('radar-section').innerHTML = d.radar_section;
                         document.getElementById('header-summary').innerHTML = d.summary;
                         document.getElementById('clock').textContent = d.now;
                     }} catch (e) {{}}
@@ -805,7 +906,7 @@ def view_group_dashboard(request: Request):
     return f"""
     <html>
         <head>
-            <title>{name_safe} · Emfit 관제</title>
+            <title>{name_safe} · 통합 관제</title>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
@@ -828,13 +929,11 @@ def view_group_dashboard(request: Request):
                         <span id="clock">{p['now']}</span> · <span id="header-summary">{p['summary']}</span>
                     </div>
                 </div>
-
-                <div id="active-cards" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(240px, 1fr)); gap:15px; margin-top:20px;">
-                    {p['active']}
+                <div id="emfit-section">
+                    {p['emfit_section']}
                 </div>
-
-                <div id="inactive-section">
-                    {p['inactive']}
+                <div id="radar-section">
+                    {p['radar_section']}
                 </div>
 
                 <p class="nav-buttons" style="text-align:center; margin-top:30px;">
@@ -855,8 +954,8 @@ def view_group_dashboard(request: Request):
                         const r = await fetch('/api/view/cards');
                         if (!r.ok) return;
                         const d = await r.json();
-                        document.getElementById('active-cards').innerHTML = d.active;
-                        document.getElementById('inactive-section').innerHTML = d.inactive;
+                        document.getElementById('emfit-section').innerHTML = d.emfit_section;
+                        document.getElementById('radar-section').innerHTML = d.radar_section;
                         document.getElementById('header-summary').innerHTML = d.summary;
                         document.getElementById('clock').textContent = d.now;
                     }} catch (e) {{}}
@@ -888,9 +987,9 @@ def _build_single_card(sn, token=""):
     now = datetime.now()
     now_ts = now.timestamp()
     latest = {}
-    if os.path.exists(LOG_FILE):
+    if _has_data():
         try:
-            latest = analyzer.get_latest_states(LOG_FILE)
+            latest = analyzer.get_latest_states(DATA_FILES)
         except Exception:
             pass
     statuses = analyzer.get_device_statuses()
@@ -1038,9 +1137,9 @@ def api_device_timeseries(
     hi = target["end"][:10] if target and target.get("end") else None
 
     available_for_sn = []
-    if os.path.exists(LOG_FILE):
+    if _has_data():
         try:
-            available = analyzer.list_available(LOG_FILE)
+            available = analyzer.list_available(DATA_FILES)
             available_for_sn = [d for s, d in available if s == sn
                                 and (not lo or d >= lo) and (not hi or d <= hi)]
         except Exception:
@@ -1072,10 +1171,10 @@ def api_device_timeseries(
 
     points = []
     summaries = []
-    if os.path.exists(LOG_FILE):
+    if _has_data():
         for d in dates_to_load:
             try:
-                df = analyzer.get_report_df(LOG_FILE, d, sn, assignment_id=target_id)
+                df = analyzer.get_report_df(DATA_FILES, d, sn, assignment_id=target_id)
             except Exception:
                 df = None
             if df is None or df.empty:
@@ -1169,9 +1268,9 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
     hi = target["end"][:10] if target and target.get("end") else None
 
     available_for_sn = []
-    if os.path.exists(LOG_FILE):
+    if _has_data():
         try:
-            available = analyzer.list_available(LOG_FILE)
+            available = analyzer.list_available(DATA_FILES)
             available_for_sn = [d for s, d in available if s == sn
                                 and (not lo or d >= lo) and (not hi or d <= hi)]
         except Exception:
@@ -1845,12 +1944,18 @@ async def view_dashboard_raw(request: Request, _: str = Depends(require_admin)):
     last_data = "아직 수신된 데이터가 없습니다."
     formatted_json = ""
 
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
+    # Emfit·Radar 로그를 모두 세고, 가장 최근에 갱신된 파일의 마지막 줄을 보여준다.
+    newest_mtime = None
+    for path in DATA_FILES:
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f.readlines() if l.strip()]
-            count = len(lines)
-            if count > 0:
-                last_data = lines[-1]
+        count += len(lines)
+        mtime = os.path.getmtime(path)
+        if lines and (newest_mtime is None or mtime > newest_mtime):
+            newest_mtime = mtime
+            last_data = lines[-1]
 
     try:
         parsed_json = json.loads(last_data)
@@ -1885,11 +1990,11 @@ async def view_dashboard_raw(request: Request, _: str = Depends(require_admin)):
 @app.get("/reports", response_class=HTMLResponse)
 def reports_ui(request: Request, _: str = Depends(require_admin)):
     admin_token = _get_token_from_request(request) or ""
-    if not os.path.exists(LOG_FILE):
+    if not _has_data():
         return HTMLResponse("<p>데이터 파일이 없습니다.</p>", status_code=404)
 
     try:
-        available = analyzer.list_available_assignments(LOG_FILE)
+        available = analyzer.list_available_assignments(DATA_FILES)
     except Exception as e:
         return HTMLResponse(f"<p>분석 로드 실패: {e}</p>", status_code=500)
 
@@ -1989,10 +2094,55 @@ def _resolve_report_target(device, assignment):
     return None, None, None, None, None
 
 
+# ── CSV 분리 규칙 ────────────────────────────────────────────────
+# EMFIT QS 와 AI Radar 는 측정하는 게 달라서 CSV 를 따로 뽑는다.
+# 레이더는 한 대가 BED(자세7종+생체) 와 FALL(자세3종+인원) 두 형식을 같이 보내는데,
+# 이것도 성격이 달라 파일을 나눈다. 분석할 때 섞여 있으면 오히려 다루기 어렵다.
+RADAR_CSV_KINDS = [("bed", "Radar-BED"), ("fall", "Radar-FALL")]
+
+
+def _report_frames(date_str, sn, aid, kind=None):
+    """그 날짜/기기의 CSV 목록을 [(파일명꼬리표, DataFrame), ...] 로 반환.
+
+    Emfit  → [("리포트", df)]  ← 기존 파일명 그대로 (이미 받아둔 파일들과 섞이지 않게)
+    Radar  → [("Radar-BED", df), ("Radar-FALL", df)]  (데이터 있는 것만)
+    kind ('bed'/'fall') 를 주면 레이더 중 그 하나만."""
+    try:
+        df = analyzer.get_report_df(DATA_FILES, date_str, sn, assignment_id=aid)
+    except Exception:
+        return []
+    if df is None or df.empty:
+        return []
+    if "Radar모델" not in df.columns:
+        return [("리포트", df)]
+
+    frames = []
+    for model, suffix in RADAR_CSV_KINDS:
+        if kind and kind != model:
+            continue
+        sub = df[df["Radar모델"] == model]
+        if sub.empty:
+            continue
+        # 그 형식이 채우지 않는 컬럼(BED 의 감지인원, FALL 의 심박 등)은 빼서 깔끔하게
+        sub = sub.dropna(axis=1, how="all")
+        frames.append((suffix, sub))
+    return frames
+
+
+def _csv_bytes(df):
+    """엑셀에서 한글이 깨지지 않도록 BOM 붙인 UTF-8 CSV."""
+    return ("﻿" + df.to_csv(index=False)).encode("utf-8")
+
+
+def _attachment_headers(filename):
+    return {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"}
+
+
 # 리포트 CSV 다운로드 (admin 또는 해당 기기 토큰)
 @app.get("/report")
 def download_report(request: Request, date: str = Query(...),
-                    device: str = Query(None), assignment: str = Query(None)):
+                    device: str = Query(None), assignment: str = Query(None),
+                    kind: str = Query(None)):
     sn, aid, label_user, label_loc, stint = _resolve_report_target(device, assignment)
     if sn is None:
         return PlainTextResponse("기기 또는 배정 정보가 올바르지 않습니다.", status_code=400)
@@ -2004,31 +2154,42 @@ def download_report(request: Request, date: str = Query(...),
             raise HTTPException(status_code=403, detail="현재 배정 데이터만 받을 수 있습니다")
         aid = _aa["id"]
         label_user, label_loc = _aa.get("user", sn), _aa.get("location", "Unknown")
-    if not os.path.exists(LOG_FILE):
+    if not _has_data():
         return PlainTextResponse("데이터 파일이 없습니다.", status_code=404)
 
+    if kind and kind not in {m for m, _ in RADAR_CSV_KINDS}:
+        return PlainTextResponse("kind 는 bed 또는 fall 이어야 합니다.", status_code=400)
+
     try:
-        df = analyzer.get_report_df(LOG_FILE, date, sn, assignment_id=aid)
+        frames = _report_frames(date, sn, aid, kind=kind)
     except Exception as e:
         return PlainTextResponse(f"분석 오류: {e}", status_code=500)
 
-    if df.empty:
+    if not frames:
         return PlainTextResponse(
             f"해당 조건의 데이터가 없습니다 (date={date})",
             status_code=404,
         )
 
-    filename = f"{date}_{label_loc}_{label_user}_리포트.csv"
+    # 파일이 하나면 CSV 그대로, 여러 개(레이더 BED+FALL)면 ZIP 으로 묶어 내려준다.
+    if len(frames) == 1:
+        suffix, df = frames[0]
+        filename = f"{date}_{label_loc}_{label_user}_{suffix}.csv"
+        return StreamingResponse(
+            iter([_csv_bytes(df)]),
+            media_type="text/csv; charset=utf-8",
+            headers=_attachment_headers(filename),
+        )
 
-    csv_bytes = ("﻿" + df.to_csv(index=False)).encode("utf-8")
-    encoded_filename = quote(filename)
-
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for suffix, df in frames:
+            zf.writestr(f"{date}_{label_loc}_{label_user}_{suffix}.csv", _csv_bytes(df))
+    zip_buf.seek(0)
     return StreamingResponse(
-        iter([csv_bytes]),
-        media_type="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition":  f"attachment; filename*=UTF-8''{encoded_filename}"
-        },
+        iter([zip_buf.getvalue()]),
+        media_type="application/zip",
+        headers=_attachment_headers(f"{date}_{label_loc}_{label_user}.zip"),
     )
 
 
@@ -2052,7 +2213,7 @@ def download_report_range(
             raise HTTPException(status_code=403, detail="현재 배정 데이터만 받을 수 있습니다")
         aid = _aa["id"]
         label_user, label_loc = _aa.get("user", sn), _aa.get("location", "Unknown")
-    if not os.path.exists(LOG_FILE):
+    if not _has_data():
         return PlainTextResponse("데이터 파일이 없습니다.", status_code=404)
 
     try:
@@ -2072,14 +2233,10 @@ def download_report_range(
         current = start_dt
         while current <= end_dt:
             date_str = current.strftime("%Y-%m-%d")
-            try:
-                df = analyzer.get_report_df(LOG_FILE, date_str, sn, assignment_id=aid)
-            except Exception:
-                df = None
-            if df is not None and not df.empty:
-                csv_bytes = ("﻿" + df.to_csv(index=False)).encode("utf-8")
-                inner_name = f"{date_str}_{info['location']}_{info['name']}_리포트.csv"
-                zf.writestr(inner_name, csv_bytes)
+            # 레이더는 하루에 BED/FALL 두 파일이 나온다.
+            for suffix, df in _report_frames(date_str, sn, aid):
+                inner_name = f"{date_str}_{info['location']}_{info['name']}_{suffix}.csv"
+                zf.writestr(inner_name, _csv_bytes(df))
                 added += 1
             current += timedelta(days=1)
 
@@ -3031,6 +3188,48 @@ async def receive_data(request: Request):
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+# AI Radar 전용 데이터 수신 경로.
+# 기존 Emfit POST / 처리와 분리하여 서로의 payload를 혼동하지 않게 한다.
+@app.post("/radar")
+async def receive_radar_data(request: Request):
+    try:
+        data = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {e}")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="JSON object required")
+
+    # RMR602A API 문서의 두 형식을 구분한다.
+    # BED: MAC/POS/BR/HR/ERR, FALL: macAddress/pose/pnum/좌표
+    is_bed = bool(data.get("MAC")) and "POS" in data
+    is_fall = bool(data.get("macAddress")) and "pose" in data
+    if not (is_bed or is_fall):
+        raise HTTPException(
+            status_code=400,
+            detail="unsupported radar payload: MAC+POS or macAddress+pose required",
+        )
+
+    record = dict(data)
+    # PDF 예시에는 ERR 키 앞에 공백이 있는 표기가 있어 둘 다 허용한다.
+    if "ERR" not in record and " ERR" in record:
+        record["ERR"] = record[" ERR"]
+    record["server_received_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    record["data_source"] = "ai_radar"
+    record["radar_model"] = "bed" if is_bed else "fall"
+
+    try:
+        with open(RADAR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"log write failed: {e}")
+
+    return {
+        "status": "success",
+        "source": "ai_radar",
+        "model": record["radar_model"],
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=80)

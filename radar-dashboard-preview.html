@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Radar 대시보드 더미데이터 미리보기</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 28px; font-family: "Malgun Gothic", sans-serif; background: #f0f2f5; color: #263238; }
+    main { max-width: 1400px; margin: auto; }
+    h1 { margin: 0 0 8px; color: #1a73e8; }
+    .note { margin: 0 0 22px; color: #607d8b; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(245px, 1fr)); gap: 16px; }
+    .card { min-height: 230px; padding: 17px; border-radius: 14px; background: #fff; border: 2px solid #90a4ae; box-shadow: 0 3px 10px rgba(0,0,0,.07); }
+    .radar { background: #f3f0ff; border-color: #7e57c2; }
+    .fall { background: #ffebee; border-color: #e53935; }
+    .disconnected { background: #eceff1; border-color: #78909c; }
+    .top { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
+    .name { margin: 0; font-size: 20px; }
+    .badge { padding: 4px 8px; border-radius: 999px; background: #7e57c2; color: #fff; font-size: 12px; }
+    .state { margin: 20px 0 16px; font-size: 29px; font-weight: 800; color: #2e7d32; }
+    .fall .state { color: #c62828; }
+    .disconnected .state { color: #c62828; }
+    .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+    .metric { padding: 10px 5px; text-align: center; border-radius: 9px; background: rgba(255,255,255,.8); }
+    .label { display: block; margin-bottom: 4px; color: #78909c; font-size: 12px; }
+    .value { font-size: 18px; font-weight: 700; }
+    .mac { margin-top: 17px; color: #78909c; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>AI Radar 대시보드 더미데이터 테스트</h1>
+    <p class="note">실제 기기 MAC: A1B2C3D4E5F6 · 아래 카드는 표시 상태를 미리 확인하기 위한 가짜 데이터입니다.</p>
+    <section class="grid">
+      <article class="card radar">
+        <div class="top"><h2 class="name">AI Radar</h2><span class="badge">AI Radar</span></div>
+        <div class="state">재실 · 누움</div>
+        <div class="metrics">
+          <div class="metric"><span class="label">심박</span><span class="value">72</span></div>
+          <div class="metric"><span class="label">호흡</span><span class="value">15</span></div>
+          <div class="metric"><span class="label">자세</span><span class="value">누움</span></div>
+        </div>
+        <div class="mac">A1B2C3D4E5F6 · 정상 수신</div>
+      </article>
+      <article class="card radar fall">
+        <div class="top"><h2 class="name">AI Radar</h2><span class="badge">AI Radar</span></div>
+        <div class="state">🚨 낙상</div>
+        <div class="metrics">
+          <div class="metric"><span class="label">심박</span><span class="value">78</span></div>
+          <div class="metric"><span class="label">호흡</span><span class="value">18</span></div>
+          <div class="metric"><span class="label">자세</span><span class="value">낙상</span></div>
+        </div>
+        <div class="mac">A1B2C3D4E5F6 · 긴급 상태</div>
+      </article>
+      <article class="card radar">
+        <div class="top"><h2 class="name">AI Radar</h2><span class="badge">AI Radar</span></div>
+        <div class="state">자리비움</div>
+        <div class="metrics">
+          <div class="metric"><span class="label">심박</span><span class="value">-</span></div>
+          <div class="metric"><span class="label">호흡</span><span class="value">-</span></div>
+          <div class="metric"><span class="label">자세</span><span class="value">자리비움</span></div>
+        </div>
+        <div class="mac">A1B2C3D4E5F6 · 정상 수신</div>
+      </article>
+      <article class="card radar disconnected">
+        <div class="top"><h2 class="name">AI Radar</h2><span class="badge">AI Radar</span></div>
+        <div class="state">끊김</div>
+        <div class="metrics">
+          <div class="metric"><span class="label">심박</span><span class="value">-</span></div>
+          <div class="metric"><span class="label">호흡</span><span class="value">-</span></div>
+          <div class="metric"><span class="label">자세</span><span class="value">-</span></div>
+        </div>
+        <div class="mac">A1B2C3D4E5F6 · 오류 또는 수신 중단</div>
+      </article>
+      <article class="card">
+        <div class="top"><h2 class="name">기존 EMFIT 사용자</h2><span class="badge" style="background:#1a73e8">EMFIT</span></div>
+        <div class="state">재실</div>
+        <div class="metrics">
+          <div class="metric"><span class="label">심박</span><span class="value">68</span></div>
+          <div class="metric"><span class="label">호흡</span><span class="value">14</span></div>
+          <div class="metric"><span class="label">ACT</span><span class="value">21</span></div>
+        </div>
+        <div class="mac">기존 EMFIT 화면 유지 확인</div>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

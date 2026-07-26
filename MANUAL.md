@@ -32,7 +32,8 @@ Emfit QS 센서에서 보내는 심박수·호흡수·활동량·수면 데이�
                           ├─ systemd 서비스 `emfit`
                           ├─ FastAPI (app.py)
                           ├─ 분석 로직 (analyzer.py)
-                          └─ 로그 파일 (emfit_data.jsonl)
+                          ├─ 로그 파일 (emfit_data.jsonl)   ← Emfit
+                          └─ 로그 파일 (radar_data.jsonl)   ← AI Radar
                                            │
                                            ▼
                          [웹 브라우저: 대시보드 / 리포트]
@@ -206,7 +207,8 @@ sudo journalctl -u emfit --since "10 min ago" | grep POST
 
 ```bash
 # 실시간 새 데이터 확인
-tail -f ~/emfit_server/emfit_data.jsonl
+tail -f ~/emfit_server/emfit_data.jsonl      # Emfit
+tail -f ~/emfit_server/radar_data.jsonl      # AI Radar
 
 # 특정 기기만 필터
 tail -f ~/emfit_server/emfit_data.jsonl | grep --line-buffered EMFIT-DEMO-04
@@ -224,7 +226,9 @@ du -h ~/emfit_server/emfit_data.jsonl
 /opt/monitoring_server/
 ├─ app.py                    # FastAPI 서버 (엔드포인트: /dashboard, /reports, /report, /report_range, /)
 ├─ analyzer.py               # 데이터 파싱 / 캐시 / 리포트 생성
-├─ emfit_data.jsonl          # 수집 로그 (append-only)
+├─ radar_parser.py           # AI Radar payload 해석 (BED/FALL 두 형식)
+├─ emfit_data.jsonl          # Emfit 수집 로그 (append-only)
+├─ radar_data.jsonl          # AI Radar 수집 로그 (append-only)
 ├─ MANUAL.md                 # 이 문서
 ├─ venv/                     # 파이썬 가상환경
 │   └─ bin/uvicorn           # 실제 실행 바이너리
@@ -300,7 +304,8 @@ sudo systemctl restart emfit
 ### 6.6 디스크 용량 부족
 
 - `df -h` 로 확인
-- `emfit_data.jsonl` 이 커지면 로테이션 고려 (예: 월별 분리)
+- `emfit_data.jsonl` / `radar_data.jsonl` 이 커지면 로테이션 고려 (예: 월별 분리)
+- 특히 `radar_data.jsonl` 은 AI Radar 가 1초 주기로 보내면 하루 20MB 이상 쌓인다
 
 ---
 
@@ -329,6 +334,7 @@ sudo systemctl status emfit
 ```bash
 # 젯슨에서
 cp ~/emfit_server/emfit_data.jsonl ~/backup/emfit_data_$(date +%Y%m%d).jsonl
+cp ~/emfit_server/radar_data.jsonl ~/backup/radar_data_$(date +%Y%m%d).jsonl
 ```
 
 또는 외부 NAS / 클라우드로 rsync/scp 주기적 전송 cron 설정.

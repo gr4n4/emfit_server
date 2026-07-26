@@ -8,9 +8,11 @@ venv/
 # 비밀 정보 — 절대 커밋 금지
 admin_password.txt
 device_tokens.json
+view_tokens.json
 
 # 런타임 데이터 (젯슨에 살아있고, 사용자 건강 데이터 포함)
 emfit_data.jsonl
+radar_data.jsonl
 feedback.jsonl
 assignments.json
 preferences.json
@@ -18,6 +20,8 @@ device_info.json
 
 # 일별 리포트 출력물 (재생성 가능)
 *_리포트.csv
+*_Radar-BED.csv
+*_Radar-FALL.csv
 
 # 로그
 logs/

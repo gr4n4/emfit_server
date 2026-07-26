@@ -4,6 +4,7 @@ import os
 import json
 import argparse
 from datetime import datetime
+from radar_parser import parse_radar_payload
 
 # [설정] 기기 정보 — device_info.json 파일에 저장. 대시보드 /devices 에서 편집 가능.
 import threading as _threading
@@ -16,7 +17,12 @@ _DEFAULT_DEVICE_INFO = {
     "EMFIT-DEMO-02": {"name": "돌봄B", "location": "테스트 공간", "group": "일반"},
     "EMFIT-DEMO-03": {"name": "사용자-C", "location": "A시설", "group": "일반"},
     "EMFIT-DEMO-04": {"name": "사용자-D", "location": "사용자-D님 가정", "group": "뇌성마비"},
-    "EMFIT-DEMO-05": {"name": "사용자E", "location": "301호", "group": "일반"}
+    "EMFIT-DEMO-05": {"name": "사용자E", "location": "301호", "group": "일반"},
+    "A1B2C3D4E5F6": {"name": "AI Radar", "location": "-", "group": "일반"},
+}
+
+_RADAR_DEVICE_DEFAULTS = {
+    "A1B2C3D4E5F6": _DEFAULT_DEVICE_INFO["A1B2C3D4E5F6"],
 }
 
 # 대상자 그룹 — 여기 리스트에만 추가하면 기기 정보·이전 폼의 선택지와 검증에 자동 반영된다.
@@ -252,16 +258,31 @@ def update_active_assignments(updates):
 def invalidate_cache():
     """파싱 캐시 무효화 — 배정 이력이 바뀌면 다음 조회 때 전체 재파싱하여
     과거 데이터까지 올바른 사용자로 다시 라벨링한다."""
-    _cache["mtime"] = None
-    _cache["path"] = None
-    _cache["storage"] = None
-    _cache["offset"] = 0
+    _caches.clear()
+    _merged_cache["key"] = None
+    _merged_cache["storage"] = None
     _latest_states_cache["key"] = None
     _latest_states_cache["result"] = None
 
 
 # ── 모듈 초기화: 배정 이력 로드 후 DEVICE_INFO 동기화 ──
 ASSIGNMENTS = _load_assignments()
+_assignments_changed = False
+_assigned_sns = {a.get("sn") for a in ASSIGNMENTS}
+for _sn, _info in _RADAR_DEVICE_DEFAULTS.items():
+    if _sn not in _assigned_sns:
+        ASSIGNMENTS.append({
+            "id": f"{_sn}-1",
+            "sn": _sn,
+            "user": _info.get("name", _sn),
+            "location": _info.get("location", "-"),
+            "group": _info.get("group", "일반"),
+            "start": None,
+            "end": None,
+        })
+        _assignments_changed = True
+if _assignments_changed:
+    _save_assignments()
 _rebuild_assign_index()
 _rebuild_device_info()
 
@@ -287,11 +308,18 @@ def add_to_storage(storage, sn, ts, dtype, extra):
             "배정ID": stint["id"],
             "유형": dtype
         }
-        # None 값인 컬럼들도 구조 유지를 위해 기본값 채움
-        default_fields = {
-            "심박수(HR)": None, "호흡수(RR)": None, "활동량(ACT)": None, 
-            "심박변이도(RMSSD)": None, "상태설명": ""
-        }
+        # None 값인 컬럼들도 구조 유지를 위해 기본값 채움.
+        # 단 Radar 는 활동량/심박변이도를 아예 측정하지 않으므로 그 두 칸을 만들지 않는다.
+        # (만들어두면 CSV 에 끝까지 빈 컬럼으로 남아 보기 어려워진다)
+        if dtype == "Radar":
+            default_fields = {
+                "심박수(HR)": None, "호흡수(RR)": None, "상태설명": ""
+            }
+        else:
+            default_fields = {
+                "심박수(HR)": None, "호흡수(RR)": None, "활동량(ACT)": None,
+                "심박변이도(RMSSD)": None, "상태설명": ""
+            }
         default_fields.update(extra)
         base.update(default_fields)
         
@@ -302,7 +330,11 @@ def add_to_storage(storage, sn, ts, dtype, extra):
     except Exception as e:
         print(f"[데이터 추가 오류] 기기: {sn}, 에러: {e}")
 
-_cache = {"mtime": None, "path": None, "storage": None, "offset": 0}
+# 로그 파일별 파싱 캐시: {경로: {"mtime":..., "storage":..., "offset":...}}
+# Emfit 과 Radar 를 다른 파일에 쌓으므로, 한쪽에 데이터가 들어와도
+# 다른 쪽은 다시 읽지 않도록 파일마다 슬롯을 따로 둔다.
+_caches = {}
+_merged_cache = {"key": None, "storage": None}  # 여러 파일을 합친 결과
 _cache_lock = None  # lazy init to avoid import-time threading
 
 # 장비별 최신 하트비트: {sn: {"connected": bool, "status_code": int, "last_seen_ts": int,
@@ -312,6 +344,31 @@ _device_status = {}
 
 def get_device_statuses():
     return dict(_device_status)
+
+
+def _store_radar_record(storage, radar):
+    """정규화된 AI Radar 1건을 공통 저장소와 연결상태에 반영."""
+    sn = radar["sn"]
+    ts = radar["ts"]
+    add_to_storage(storage, sn, ts, "Radar", {
+        "심박수(HR)": radar.get("hr"),
+        "호흡수(RR)": radar.get("rr"),
+        "자세(POS)": radar.get("pos"),
+        "자세": radar.get("posture"),
+        "낙상": bool(radar.get("fall")),
+        "Radar오류(ERR)": radar.get("err"),
+        "감지인원": radar.get("person_count"),
+        "Radar모델": radar.get("model"),
+        "상태설명": f"AI Radar {radar.get('model', '').upper()} - {radar.get('posture')}",
+    })
+    _device_status[sn] = {
+        "connected": bool(radar.get("connected")),
+        "status_code": radar.get("err"),
+        "last_seen_ts": int(ts),
+        "status_since_ts": int(ts),
+        "server_received_at": radar.get("server_received_at"),
+        "source": "ai_radar",
+    }
 
 
 def _process_line(line, storage):
@@ -338,6 +395,12 @@ def _process_line(line, storage):
                 "status_since_ts": item.get("statussince"),
                 "server_received_at": received_at,
             }
+        return
+
+    # AI Radar 데이터는 Emfit과 필드 이름이 완전히 다르므로 별도 해석기로 분리한다.
+    radar = parse_radar_payload(row)
+    if radar is not None:
+        _store_radar_record(storage, radar)
         return
 
     sn = row.get("device")
@@ -404,67 +467,110 @@ def _process_line(line, storage):
         pass
 
 
-def _load_storage(jsonl_path):
-    import time, threading
+def _normalize_paths(paths):
+    """단일 경로 문자열이든 경로 목록이든 → 리스트로 통일."""
+    if isinstance(paths, (str, bytes, os.PathLike)):
+        return [os.fspath(paths)]
+    return [os.fspath(p) for p in paths]
+
+
+def _load_storage_file(jsonl_path):
+    """파일 하나를 파싱해 storage 를 돌려준다. 파일마다 캐시 슬롯이 따로 있어서
+    Emfit 로그에 새 줄이 붙어도 Radar 로그를 다시 읽지 않는다."""
+    import time
+    slot = _caches.setdefault(jsonl_path,
+                              {"mtime": None, "storage": None, "offset": 0})
+
+    current_mtime = os.path.getmtime(jsonl_path)
+    current_size = os.path.getsize(jsonl_path)
+
+    if slot["mtime"] == current_mtime and slot["storage"] is not None:
+        return slot["storage"]
+
+    can_increment = slot["storage"] is not None and current_size >= slot["offset"]
+    if can_increment:
+        storage = slot["storage"]
+        start_offset = slot["offset"]
+        mode = "증분"
+    else:
+        storage = {}
+        start_offset = 0
+        mode = "전체"
+
+    t0 = time.time()
+    name = os.path.basename(jsonl_path)
+    print(f"[analyzer] {name} {mode} 파싱 시작: offset {start_offset} → {current_size} "
+          f"({(current_size-start_offset)/1024/1024:.1f}MB)", flush=True)
+
+    with open(jsonl_path, 'rb') as f:
+        f.seek(start_offset)
+        content = f.read()
+
+    last_newline = content.rfind(b'\n')
+    if last_newline == -1:
+        slot["mtime"] = current_mtime
+        slot["storage"] = storage
+        return storage
+
+    complete = content[:last_newline + 1]
+    final_offset = start_offset + last_newline + 1
+
+    lines_processed = 0
+    for raw in complete.split(b'\n'):
+        line = raw.decode('utf-8', errors='ignore').strip()
+        if line:
+            _process_line(line, storage)
+            lines_processed += 1
+
+    slot["mtime"] = current_mtime
+    slot["storage"] = storage
+    slot["offset"] = final_offset
+
+    elapsed = time.time() - t0
+    print(f"[analyzer] {name} {mode} 파싱 완료: +{lines_processed}줄, "
+          f"누적 {len(storage)}개 조합, {elapsed:.1f}초", flush=True)
+    return storage
+
+
+def _cache_signature(paths):
+    """현재 캐시 상태 지문 — 파일이 하나도 안 바뀌었으면 값이 같다."""
+    return tuple((p, (_caches.get(p) or {}).get("mtime"))
+                 for p in _normalize_paths(paths))
+
+
+def _load_storage(paths):
+    """Emfit·Radar 등 여러 로그 파일을 읽어 하나의 storage 로 합쳐 돌려준다.
+
+    기기(SN)가 서로 달라서 (SN, 날짜) 키가 겹치지 않지만,
+    혹시 겹쳐도 잃어버리지 않도록 리스트를 이어 붙인다."""
+    import threading
     global _cache_lock
     if _cache_lock is None:
         _cache_lock = threading.Lock()
 
     with _cache_lock:
-        current_mtime = os.path.getmtime(jsonl_path)
-        current_size = os.path.getsize(jsonl_path)
+        existing = [p for p in _normalize_paths(paths) if os.path.exists(p)]
+        if not existing:
+            return {}
 
-        if _cache["path"] == jsonl_path and _cache["mtime"] == current_mtime:
-            return _cache["storage"]
+        storages = [_load_storage_file(p) for p in existing]
+        if len(storages) == 1:
+            return storages[0]
 
-        same_file = _cache["path"] == jsonl_path
-        can_increment = (
-            same_file
-            and _cache["storage"] is not None
-            and current_size >= _cache["offset"]
-        )
+        key = _cache_signature(existing)
+        if _merged_cache["key"] == key and _merged_cache["storage"] is not None:
+            return _merged_cache["storage"]
 
-        if can_increment:
-            storage = _cache["storage"]
-            start_offset = _cache["offset"]
-            mode = "증분"
-        else:
-            storage = {}
-            start_offset = 0
-            mode = "전체"
-
-        t0 = time.time()
-        print(f"[analyzer] {mode} 파싱 시작: offset {start_offset} → {current_size} ({(current_size-start_offset)/1024/1024:.1f}MB)", flush=True)
-
-        with open(jsonl_path, 'rb') as f:
-            f.seek(start_offset)
-            content = f.read()
-
-        last_newline = content.rfind(b'\n')
-        if last_newline == -1:
-            _cache["mtime"] = current_mtime
-            _cache["path"] = jsonl_path
-            _cache["storage"] = storage
-            return storage
-
-        complete = content[:last_newline + 1]
-        final_offset = start_offset + last_newline + 1
-
-        lines_processed = 0
-        for raw in complete.split(b'\n'):
-            line = raw.decode('utf-8', errors='ignore').strip()
-            if line:
-                _process_line(line, storage)
-                lines_processed += 1
-
-        _cache["mtime"] = current_mtime
-        _cache["path"] = jsonl_path
-        _cache["storage"] = storage
-        _cache["offset"] = final_offset
-
-        elapsed = time.time() - t0
-        print(f"[analyzer] {mode} 파싱 완료: +{lines_processed}줄, 누적 {len(storage)}개 조합, {elapsed:.1f}초", flush=True)
-        return storage
+        merged = {}
+        for st in storages:
+            for k, records in st.items():
+                if k in merged:
+                    merged[k] = merged[k] + records
+                else:
+                    merged[k] = records
+        _merged_cache["key"] = key
+        _merged_cache["storage"] = merged
+        return merged
 
 
 def warmup(jsonl_path):
@@ -525,29 +631,114 @@ def list_available_assignments(jsonl_path):
 
 _latest_states_cache = {"key": None, "result": None}
 
+# BED/FALL 은 전송 주기가 달라서(BED 5~50초, FALL 1초) 한쪽만 보면 정보가 사라진다.
+# 아래 시간(초) 안에 들어온 기록끼리는 "같은 지금"으로 보고 합친다.
+# BED 가 자세 변화 없을 때 최대 50초 간격이므로 그보다 넉넉하게 잡는다.
+_RADAR_MERGE_WINDOW_SEC = 120
+
+
+def _record_dt(rec):
+    """레코드의 날짜/시간 문자열 → datetime. 실패 시 None."""
+    try:
+        return datetime.strptime(f"{rec['날짜']} {rec['시간(KST)']}", "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _merge_radar_states(bed, fall):
+    """같은 기기의 BED/FALL 최신 기록을 하나의 '현재 상태'로 합친다.
+
+    BED  = 자세 7종(누움/앉음/배회/걸터앉음/낙상/자리비움/뒤척임) + 심박·호흡
+    FALL = 자세 3종(재실/낙상/자리비움) + 감지인원, 1초마다
+
+    합치는 규칙:
+      - 시각은 둘 중 최신 기준 (카드의 '측정' 시각이 뒤처지지 않도록)
+      - 자세는 BED 우선 (더 세밀함). BED 가 오래됐으면 FALL 로 대체
+      - 낙상은 둘 중 하나라도 최근에 감지했으면 낙상 (안전 우선)
+      - 심박·호흡은 BED 에만 있으므로 BED 에서 가져옴
+    """
+    if bed is None:
+        return fall
+    if fall is None:
+        return bed
+
+    bed_dt, fall_dt = _record_dt(bed), _record_dt(fall)
+    if bed_dt is None or fall_dt is None:
+        return bed if fall_dt is None else fall
+
+    newest_dt = max(bed_dt, fall_dt)
+    base = dict(bed if bed_dt >= fall_dt else fall)
+    base["날짜"] = newest_dt.strftime("%Y-%m-%d")
+    base["시간(KST)"] = newest_dt.strftime("%H:%M:%S")
+
+    bed_fresh = (newest_dt - bed_dt).total_seconds() <= _RADAR_MERGE_WINDOW_SEC
+    fall_fresh = (newest_dt - fall_dt).total_seconds() <= _RADAR_MERGE_WINDOW_SEC
+
+    if bed_fresh:
+        # 자세·생체는 BED 가 원본. FALL 이 최신이라 base 가 FALL 이어도 BED 값으로 채운다.
+        base["자세"] = bed.get("자세")
+        base["자세(POS)"] = bed.get("자세(POS)")
+        base["심박수(HR)"] = bed.get("심박수(HR)")
+        base["호흡수(RR)"] = bed.get("호흡수(RR)")
+        base["Radar오류(ERR)"] = bed.get("Radar오류(ERR)")
+    if fall_fresh:
+        base["감지인원"] = fall.get("감지인원")
+
+    # 낙상은 둘 중 하나라도 잡으면 낙상으로 본다 (놓치는 것보다 오탐이 낫다).
+    # 낙상 플래그와 POS=4 를 둘 다 보는 이유: 한쪽만 채워져 들어와도 놓치지 않기 위해.
+    def _is_fall(r):
+        return bool(r.get("낙상")) or r.get("자세(POS)") == 4
+
+    fall_detected = ((bed_fresh and _is_fall(bed))
+                     or (fall_fresh and _is_fall(fall)))
+    base["낙상"] = fall_detected
+    if fall_detected:
+        base["자세"] = "낙상"
+        base["자세(POS)"] = 4
+
+    base["Radar모델"] = "bed+fall"
+    base["상태설명"] = f"AI Radar 통합 - {base.get('자세')}"
+    return base
+
 
 def get_latest_states(jsonl_path):
-    """기기별 가장 최근 HR 포함 레코드를 반환. {device_sn: record}
+    """기기별 가장 최근 실시간 레코드를 반환. {device_sn: record}
 
     카드 대시보드가 15초마다 호출하므로, 데이터(파일 mtime)가 그대로면
     전체 storage 풀스캔을 건너뛰고 이전 결과를 그대로 돌려준다."""
     storage = _load_storage(jsonl_path)
-    cache_key = (_cache.get("path"), _cache.get("mtime"))
+    cache_key = _cache_signature(jsonl_path)
     if (_latest_states_cache["key"] == cache_key
             and _latest_states_cache["result"] is not None):
         return _latest_states_cache["result"]
     latest = {}
+    radar_by_model = {}  # {sn: {"bed": 최신기록, "fall": 최신기록}}
     for (sn, _date), records in storage.items():
         for r in records:
-            if r.get("유형") not in ("Live", "SleepDetail"):
+            dtype = r.get("유형")
+            if dtype not in ("Live", "SleepDetail", "Radar"):
                 continue
-            if r.get("심박수(HR)") is None:
+            if dtype != "Radar" and r.get("심박수(HR)") is None:
                 continue
-            cur = latest.get(sn)
+            if dtype == "Radar" and r.get("심박수(HR)") is None and r.get("자세(POS)") is None:
+                continue
             this_key = (r["날짜"], r["시간(KST)"])
+            if dtype == "Radar":
+                # BED/FALL 을 따로 모아두고 아래에서 합친다.
+                # (안 그러면 1초마다 오는 FALL 이 BED 의 심박·호흡을 영영 덮어씀)
+                slot = radar_by_model.setdefault(sn, {})
+                model = r.get("Radar모델") or "bed"
+                cur_m = slot.get(model)
+                if cur_m is None or this_key > (cur_m["날짜"], cur_m["시간(KST)"]):
+                    slot[model] = r
+            cur = latest.get(sn)
             cur_key = (cur["날짜"], cur["시간(KST)"]) if cur else ("", "")
             if this_key > cur_key:
                 latest[sn] = r
+    for sn, slot in radar_by_model.items():
+        merged = _merge_radar_states(slot.get("bed"), slot.get("fall"))
+        if merged is not None:
+            latest[sn] = merged
     _latest_states_cache["key"] = cache_key
     _latest_states_cache["result"] = latest
     return latest
@@ -566,7 +757,7 @@ def start_analysis(target_date=None, target_device=None):
 
     storage = {}
     line_count = 0
-    extracted_types = {"Live": 0, "HRV": 0, "SleepDetail": 0, "Summary": 0}
+    extracted_types = {"Live": 0, "HRV": 0, "SleepDetail": 0, "Summary": 0, "Radar": 0}
 
     with open(latest_file, 'r', encoding='utf-8') as f:
         for line in f:
@@ -576,6 +767,11 @@ def start_analysis(target_date=None, target_device=None):
             
             try:
                 row = json.loads(line)
+                radar = parse_radar_payload(row)
+                if radar is not None:
+                    _store_radar_record(storage, radar)
+                    extracted_types["Radar"] += 1
+                    continue
                 sn = row.get("device")
                 
                 # 1. 실시간 데이터 (data)
