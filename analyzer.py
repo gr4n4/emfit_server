@@ -729,11 +729,14 @@ def get_latest_states(jsonl_path):
                 slot = radar_by_model.setdefault(sn, {})
                 model = r.get("Radar모델") or "bed"
                 cur_m = slot.get(model)
-                if cur_m is None or this_key > (cur_m["날짜"], cur_m["시간(KST)"]):
+                # '>=' 로 비교: 시각이 초 단위라 같은 초에 여러 건이 들어올 수 있는데,
+                # 그때는 저장 리스트가 도착순이므로 '나중에 온 것'을 최신으로 택한다.
+                # ('>' 였을 땐 같은 초의 맨 처음 건을 붙들어 자세가 갱신되지 않았음)
+                if cur_m is None or this_key >= (cur_m["날짜"], cur_m["시간(KST)"]):
                     slot[model] = r
             cur = latest.get(sn)
             cur_key = (cur["날짜"], cur["시간(KST)"]) if cur else ("", "")
-            if this_key > cur_key:
+            if this_key >= cur_key:
                 latest[sn] = r
     for sn, slot in radar_by_model.items():
         merged = _merge_radar_states(slot.get("bed"), slot.get("fall"))
