@@ -9,10 +9,12 @@ venv/
 admin_password.txt
 device_tokens.json
 view_tokens.json
+mckare_apikey.txt
 
 # 런타임 데이터 (젯슨에 살아있고, 사용자 건강 데이터 포함)
 emfit_data.jsonl
 radar_data.jsonl
+mckare_data.jsonl
 feedback.jsonl
 assignments.json
 preferences.json

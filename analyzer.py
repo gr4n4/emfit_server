@@ -5,6 +5,7 @@ import json
 import argparse
 from datetime import datetime, timezone, timedelta
 from radar_parser import parse_radar_payload
+from mckare_parser import parse_mckare_payload
 
 # KST 고정 오프셋(+09:00). 한국은 현재 서머타임이 없어 'Asia/Seoul' 과 동일하며,
 # 행마다 pandas Timestamp 를 만드는 것보다 표준 datetime 이 10배 이상 빠르다.
@@ -329,6 +330,11 @@ def add_to_storage(storage, sn, ts, dtype, extra):
             default_fields = {
                 "심박수(HR)": None, "호흡수(RR)": None, "상태설명": ""
             }
+        elif dtype == "McKare":
+            # McKare 는 체온·재실 코드가 고유. 심박변이도(HRV)는 측정 안 함.
+            default_fields = {
+                "심박수(HR)": None, "호흡수(RR)": None, "활동량(ACT)": None, "상태설명": ""
+            }
         else:
             default_fields = {
                 "심박수(HR)": None, "호흡수(RR)": None, "활동량(ACT)": None,
@@ -385,6 +391,32 @@ def _store_radar_record(storage, radar):
     }
 
 
+def _store_mckare_record(storage, mck):
+    """정규화된 McKare(VSR22) 1건을 공통 저장소와 연결상태에 반영."""
+    sn = mck["sn"]
+    ts = mck["ts"]
+    present = mck.get("present")
+    add_to_storage(storage, sn, ts, "McKare", {
+        "심박수(HR)": mck.get("hr"),
+        "호흡수(RR)": mck.get("rr"),
+        "활동량(ACT)": mck.get("act"),
+        "체온": mck.get("temp"),
+        "재실코드": mck.get("occupancy"),
+        "재실": "재실" if present else "부재",
+        "낙상": bool(mck.get("fall")),
+        "낙상코드": mck.get("fall_code"),
+        "상태설명": f"McKare {'재실' if present else '부재'}",
+    })
+    _device_status[sn] = {
+        "connected": True,   # McKare 는 전송 자체가 살아있음의 신호
+        "status_code": mck.get("fall_code"),
+        "last_seen_ts": int(ts),
+        "status_since_ts": int(ts),
+        "server_received_at": mck.get("server_received_at"),
+        "source": "mckare",
+    }
+
+
 def _process_line(line, storage):
     if not line:
         return
@@ -415,6 +447,12 @@ def _process_line(line, storage):
     radar = parse_radar_payload(row)
     if radar is not None:
         _store_radar_record(storage, radar)
+        return
+
+    # McKare(VSR22) 도 별도 해석기로 분리. (라닉스보다 뒤에 시도 — pose 있으면 라닉스로 감)
+    mck = parse_mckare_payload(row)
+    if mck is not None:
+        _store_mckare_record(storage, mck)
         return
 
     sn = row.get("device")
@@ -730,11 +768,13 @@ def get_latest_states(jsonl_path):
     for (sn, _date), records in storage.items():
         for r in records:
             dtype = r.get("유형")
-            if dtype not in ("Live", "SleepDetail", "Radar"):
+            if dtype not in ("Live", "SleepDetail", "Radar", "McKare"):
                 continue
-            if dtype != "Radar" and r.get("심박수(HR)") is None:
+            if dtype in ("Live", "SleepDetail") and r.get("심박수(HR)") is None:
                 continue
             if dtype == "Radar" and r.get("심박수(HR)") is None and r.get("자세(POS)") is None:
+                continue
+            if dtype == "McKare" and r.get("심박수(HR)") is None and r.get("재실코드") is None:
                 continue
             this_key = (r["날짜"], r["시간(KST)"])
             if dtype == "Radar":

@@ -8,6 +8,20 @@ Emfit 침대 센서 데이터 수집 서버의 버전 이력.
 
 ---
 
+## [3.4.0] - 2026-07-29
+- **McKare(JCFT VSR22) 연동 — 수신 경로 추가** (3번째 기기 유형)
+  - 전용 수신 경로 `POST /mckare` — Emfit(`/`)·라닉스(`/radar`)와 분리
+  - `mckare_parser.py` 신규 — VSR22 필드 정규화(macAddress/respirationDetection(재실 0~3)/
+    fallDetection(0~2)/heartRate/respirationRate/activityDetection/temperature)
+  - **체온(temperature)** 항목 신규 — Emfit·라닉스엔 없던 값
+  - ⚠️ 성공 응답을 **201 Created** + `{statusCode:201, message:"created"}` 로 반환 —
+    McKare 센서가 201 을 성공으로 판단하므로 200 을 주면 재전송을 유발함
+  - (선택) `mckare_apikey.txt` 가 있으면 ApiKey 헤더 검증, 없으면 미적용
+  - 원본 로그 `mckare_data.jsonl` 로 분리, `DATA_FILES`·`.gitignore` 에 추가
+  - 라닉스 FALL 과 안 섞이도록 파서에서 pose 있으면 제외 (교차 오탐 0 확인)
+  - 검증: /mckare 엔드포인트·파서·저장·최신상태 29개 테스트 통과, Emfit·라닉스 회귀 이상 없음
+  - ※ 대시보드 전용 섹션·카드(체온 표시 등)는 실데이터 수신 후 별도 작업 예정
+
 ## [3.3.2] - 2026-07-27
 - **로그 파싱 속도 8~14배 개선 (재시작 시 워밍업 시간 단축)**
   - 원인: `add_to_storage` 가 행마다 pandas Timestamp 를 만들고 tz 변환을 2번씩 함.

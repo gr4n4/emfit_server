@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, Query, HTTPException, Depends
-from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, RedirectResponse, JSONResponse
 import json, os, uvicorn, threading, io, zipfile, html, secrets, hmac, hashlib
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
@@ -8,14 +8,16 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.3.2"
+VERSION = "3.4.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
 RADAR_LOG_FILE = "radar_data.jsonl"  # AI Radar 는 별도 파일에 쌓는다
+MCKARE_LOG_FILE = "mckare_data.jsonl"  # McKare(VSR22) 도 별도 파일
+MCKARE_APIKEY_FILE = "mckare_apikey.txt"  # 있으면 그 값으로 ApiKey 검증, 없으면 미적용
 # 대시보드·리포트가 읽어야 할 로그 파일 전체. 기기 종류가 늘면 여기에 추가.
 # 원본을 나눠두면 한쪽 데이터가 커져도 다른 쪽 조회 속도에 영향을 주지 않는다.
-DATA_FILES = [LOG_FILE, RADAR_LOG_FILE]
+DATA_FILES = [LOG_FILE, RADAR_LOG_FILE, MCKARE_LOG_FILE]
 FEEDBACK_FILE = "feedback.jsonl"
 TOKENS_FILE = "device_tokens.json"
 VIEW_TOKENS_FILE = "view_tokens.json"  # 그룹(여러 기기 묶음) 보기 토큰
@@ -331,10 +333,10 @@ threading.Thread(target=_warmup_then_ready, daemon=True).start()
 @app.middleware("http")
 async def _maintenance_gate(request: Request, call_next):
     """워밍업이 안 끝났으면 점검 페이지(503)로 응답한다.
-    단, Emfit(POST /)과 AI Radar(POST /radar)의 데이터 수신은
+    단, Emfit(POST /)·AI Radar(POST /radar)·McKare(POST /mckare)의 데이터 수신은
     점검 중에도 받아 데이터 유실을 막는다."""
     if not _SERVER_READY:
-        receive_paths = {"/", "/radar"}
+        receive_paths = {"/", "/radar", "/mckare"}
         if not (request.method == "POST" and request.url.path in receive_paths):
             return HTMLResponse(_maintenance_page_html(), status_code=503,
                                 headers={"Retry-After": "5"})
@@ -3230,6 +3232,65 @@ async def receive_radar_data(request: Request):
         "source": "ai_radar",
         "model": record["radar_model"],
     }
+
+
+# ── McKare(JCFT VSR22) 전용 데이터 수신 경로 ───────────────────────────
+# Emfit(POST /)·라닉스(POST /radar)와 분리해 payload 혼동을 막는다.
+# ⚠️ 성공 시 반드시 201 Created 로 응답한다 — McKare 센서 펌웨어가 201 을 성공으로
+#    판단하므로, 200 을 주면 센서가 실패로 보고 재전송을 반복할 수 있다(문서 10장).
+_MCKARE_REQUIRED = ["macAddress", "wifiRssi", "respirationDetection", "activityDetection",
+                    "respirationRate", "heartRate", "fallDetection", "temperature"]
+
+
+def _load_mckare_apikey():
+    """mckare_apikey.txt 가 있고 비어있지 않으면 그 값을 반환(ApiKey 검증에 사용).
+    파일이 없으면 None → ApiKey 미검증(라닉스처럼 열어서 수신)."""
+    if not os.path.exists(MCKARE_APIKEY_FILE):
+        return None
+    try:
+        with open(MCKARE_APIKEY_FILE, encoding="utf-8") as f:
+            key = f.read().strip()
+        return key or None
+    except Exception:
+        return None
+
+
+@app.post("/mckare")
+async def receive_mckare_data(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"statusCode": 400, "message": "invalid JSON", "error": "Bad Request"},
+                            status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({"statusCode": 400, "message": "JSON object required", "error": "Bad Request"},
+                            status_code=400)
+
+    # (선택) ApiKey 검증 — 키 파일이 설정돼 있을 때만. JCFT 가 센서에 키를 넣을 수 있으면 활성화.
+    expected = _load_mckare_apikey()
+    if expected and request.headers.get("ApiKey") != expected:
+        return JSONResponse({"statusCode": 401, "message": "API key is missing or invalid."},
+                            status_code=401)
+
+    missing = [k for k in _MCKARE_REQUIRED if k not in data]
+    if missing:
+        return JSONResponse({"statusCode": 400,
+                             "message": [f"{k} is required." for k in missing],
+                             "error": "Bad Request"}, status_code=400)
+
+    record = dict(data)
+    record["server_received_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    record["data_source"] = "mckare"
+
+    try:
+        with open(MCKARE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        return JSONResponse({"statusCode": 500, "message": f"log write failed: {e}"}, status_code=500)
+
+    # McKare 규격에 맞춘 201 Created 응답 (statusCode/message 형식도 문서와 동일하게)
+    return JSONResponse({"statusCode": 201, "message": "created"}, status_code=201)
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=80)
