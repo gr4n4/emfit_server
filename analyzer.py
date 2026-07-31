@@ -276,6 +276,8 @@ def invalidate_cache():
     _merged_cache["storage"] = None
     _latest_states_cache["key"] = None
     _latest_states_cache["result"] = None
+    _avail_assign_cache["key"] = None
+    _avail_assign_cache["result"] = None
 
 
 # ── 모듈 초기화: 배정 이력 로드 후 DEVICE_INFO 동기화 ──
@@ -669,16 +671,27 @@ def list_available(jsonl_path):
     return sorted(storage.keys(), key=lambda k: (k[1], k[0]), reverse=True)
 
 
+_avail_assign_cache = {"key": None, "result": None}
+
+
 def list_available_assignments(jsonl_path):
-    """데이터가 실제로 존재하는 (배정ID, 날짜) 조합 목록. 최신 날짜순."""
+    """데이터가 실제로 존재하는 (배정ID, 날짜) 조합 목록. 최신 날짜순.
+    전체 레코드를 훑으므로 파일 mtime 기준 캐시 — 데이터가 바뀔 때만 재계산."""
     storage = _load_storage(jsonl_path)
+    cache_key = _cache_signature(jsonl_path)
+    if (_avail_assign_cache["key"] == cache_key
+            and _avail_assign_cache["result"] is not None):
+        return _avail_assign_cache["result"]
     combos = set()
     for records in storage.values():
         for r in records:
             aid = r.get("배정ID")
             if aid and r.get("날짜"):
                 combos.add((aid, r.get("날짜")))
-    return sorted(combos, key=lambda k: k[1], reverse=True)
+    result = sorted(combos, key=lambda k: k[1], reverse=True)
+    _avail_assign_cache["key"] = cache_key
+    _avail_assign_cache["result"] = result
+    return result
 
 
 _latest_states_cache = {"key": None, "result": None}
@@ -765,33 +778,41 @@ def get_latest_states(jsonl_path):
         return _latest_states_cache["result"]
     latest = {}
     radar_by_model = {}  # {sn: {"bed": 최신기록, "fall": 최신기록}}
-    for (sn, _date), records in storage.items():
-        for r in records:
-            dtype = r.get("유형")
-            if dtype not in ("Live", "SleepDetail", "Radar", "McKare"):
-                continue
-            if dtype in ("Live", "SleepDetail") and r.get("심박수(HR)") is None:
-                continue
-            if dtype == "Radar" and r.get("심박수(HR)") is None and r.get("자세(POS)") is None:
-                continue
-            if dtype == "McKare" and r.get("심박수(HR)") is None and r.get("재실코드") is None:
-                continue
-            this_key = (r["날짜"], r["시간(KST)"])
-            if dtype == "Radar":
-                # BED/FALL 을 따로 모아두고 아래에서 합친다.
-                # (안 그러면 1초마다 오는 FALL 이 BED 의 심박·호흡을 영영 덮어씀)
-                slot = radar_by_model.setdefault(sn, {})
-                model = r.get("Radar모델") or "bed"
-                cur_m = slot.get(model)
-                # '>=' 로 비교: 시각이 초 단위라 같은 초에 여러 건이 들어올 수 있는데,
-                # 그때는 저장 리스트가 도착순이므로 '나중에 온 것'을 최신으로 택한다.
-                # ('>' 였을 땐 같은 초의 맨 처음 건을 붙들어 자세가 갱신되지 않았음)
-                if cur_m is None or this_key >= (cur_m["날짜"], cur_m["시간(KST)"]):
-                    slot[model] = r
-            cur = latest.get(sn)
-            cur_key = (cur["날짜"], cur["시간(KST)"]) if cur else ("", "")
-            if this_key >= cur_key:
-                latest[sn] = r
+    # 최신 상태는 각 기기의 '최근 날짜'에만 있으므로, 전체(수십만 레코드)를 훑지 않고
+    # 기기별 최근 며칠 버킷만 스캔한다. (몇 달치 과거는 최신 상태 계산에 무의미)
+    # 오래 쉰 기기는 어차피 _device_status(마지막 통신)로 비활성 처리되므로 안전.
+    dates_by_sn = {}
+    for (sn, date) in storage.keys():
+        dates_by_sn.setdefault(sn, []).append(date)
+    RECENT_DAYS = 2
+    for sn, dates in dates_by_sn.items():
+        for date in sorted(dates, reverse=True)[:RECENT_DAYS]:
+            for r in storage[(sn, date)]:
+                dtype = r.get("유형")
+                if dtype not in ("Live", "SleepDetail", "Radar", "McKare"):
+                    continue
+                if dtype in ("Live", "SleepDetail") and r.get("심박수(HR)") is None:
+                    continue
+                if dtype == "Radar" and r.get("심박수(HR)") is None and r.get("자세(POS)") is None:
+                    continue
+                if dtype == "McKare" and r.get("심박수(HR)") is None and r.get("재실코드") is None:
+                    continue
+                this_key = (r["날짜"], r["시간(KST)"])
+                if dtype == "Radar":
+                    # BED/FALL 을 따로 모아두고 아래에서 합친다.
+                    # (안 그러면 1초마다 오는 FALL 이 BED 의 심박·호흡을 영영 덮어씀)
+                    slot = radar_by_model.setdefault(sn, {})
+                    model = r.get("Radar모델") or "bed"
+                    cur_m = slot.get(model)
+                    # '>=' 로 비교: 시각이 초 단위라 같은 초에 여러 건이 들어올 수 있는데,
+                    # 그때는 저장 리스트가 도착순이므로 '나중에 온 것'을 최신으로 택한다.
+                    # ('>' 였을 땐 같은 초의 맨 처음 건을 붙들어 자세가 갱신되지 않았음)
+                    if cur_m is None or this_key >= (cur_m["날짜"], cur_m["시간(KST)"]):
+                        slot[model] = r
+                cur = latest.get(sn)
+                cur_key = (cur["날짜"], cur["시간(KST)"]) if cur else ("", "")
+                if this_key >= cur_key:
+                    latest[sn] = r
     for sn, slot in radar_by_model.items():
         merged = _merge_radar_states(slot.get("bed"), slot.get("fall"))
         if merged is not None:
