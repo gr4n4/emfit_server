@@ -39,8 +39,15 @@ RELEASE_EVENTS = {"release", "released", "up", "off", "0", "false"}
 # 화면의 사용 상태가 초기화되거나 'boot' 같은 날 문자열이 그대로 표시된다.
 KEEPALIVE_EVENTS = {"heartbeat", "alive", "ping", "status", "boot", "hello", "init"}
 
+# 센서 이상 — 펌웨어가 '압력선이 빠졌다/센서를 못 읽겠다'를 직접 알려주는 이벤트.
+# 서버는 침묵만으로는 고장을 알 수 없으므로(안 쓰는 것과 구분 불가),
+# 보드가 이렇게 알려주면 그게 가장 확실한 근거가 된다.
+FAULT_EVENTS = {"error", "fault", "disconnect", "disconnected", "unplugged",
+                "sensor_error", "sensorfault", "open", "opencircuit", "nc"}
+
 # 화면에 그대로 나가는 문구라 센서 용어(눌림/해제)가 아니라 의미(사용/미사용)로 적는다.
-EVENT_LABEL = {"press": "사용 중", "release": "미사용", "keepalive": "생존신고"}
+EVENT_LABEL = {"press": "사용 중", "release": "미사용",
+               "keepalive": "생존신고", "fault": "센서 이상"}
 
 # 절대 시각(epoch)으로 인정하는 필드 이름 후보. uptime_ms 는 의도적으로 제외.
 _TS_FIELDS = ("ts", "timestamp", "time", "epoch", "date_occurred", "measured_at", "epoch_ms")
@@ -84,7 +91,7 @@ def _device_id(value):
 
 
 def _event_kind(raw):
-    """event 문자열 → 'press' | 'release' | 'keepalive' | None(알 수 없음)."""
+    """event 문자열 → 'press' | 'release' | 'keepalive' | 'fault' | None(알 수 없음)."""
     if raw is None:
         return None
     e = str(raw).strip().lower()
@@ -94,6 +101,8 @@ def _event_kind(raw):
         return "release"
     if e in KEEPALIVE_EVENTS:
         return "keepalive"
+    if e in FAULT_EVENTS:
+        return "fault"
     return None
 
 
@@ -148,8 +157,10 @@ def parse_fsr_payload(row):
         "server_received_at": row.get("server_received_at"),
         "event": kind or (str(raw_event).strip().lower() if raw_event is not None else None),
         "event_label": label,
-        # 사용 여부. 생존신고/미상 이벤트는 사용 상태를 바꾸지 않으므로 None 으로 둔다.
+        # 사용 여부. 생존신고/이상/미상 이벤트는 사용 상태를 바꾸지 않으므로 None 으로 둔다.
         "in_use": True if kind == "press" else (False if kind == "release" else None),
+        # 센서 이상 여부 — 펌웨어가 직접 알려준 경우만 True.
+        "fault": kind == "fault",
         "duration_ms": _integer(row.get("duration_ms")),
         "battery_pct": _integer(row.get("battery_pct")),
         "battery_mv": _integer(row.get("battery_mv")),

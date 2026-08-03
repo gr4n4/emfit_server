@@ -39,7 +39,7 @@ _RADAR_DEVICE_DEFAULTS = {
 # SN 은 보드가 보내는 deviceId 와 같아야 한다. MAC 을 쓸 경우 구분자 없는 대문자
 # (fsr_parser._device_id 가 그렇게 정규화한다).
 _FSR_DEVICE_DEFAULTS = {
-    "ECE334450058": {"name": "돌봄기기 1", "location": "-", "group": "일반"},
+    "B1C2D3E4F5A6": {"name": "돌봄기기 1", "location": "-", "group": "일반"},
 }
 
 # 기기 종류(kind) — 대시보드가 어느 섹션에 넣을지 판단하는 값.
@@ -513,16 +513,29 @@ def _store_fsr_record(storage, fsr):
         return
 
     _ensure_fsr_device(sn)   # 배정을 먼저 만들어야 add_to_storage 가 이름/위치를 제대로 붙인다
+    is_fault = bool(fsr.get("fault"))
     add_to_storage(storage, sn, ts, "FSR", {
         "이벤트": fsr.get("event"),
         "이벤트설명": fsr.get("event_label"),
         "사용중": fsr.get("in_use"),
+        "센서이상": is_fault,
         "사용시간(ms)": fsr.get("duration_ms"),
         "배터리(%)": fsr.get("battery_pct"),
         "배터리(mV)": fsr.get("battery_mv"),
         "가동시간(ms)": fsr.get("uptime_ms"),
         "상태설명": f"돌봄기기 {fsr.get('event_label')}",
     })
+
+    prev = _device_status.get(sn) or {}
+    # 이상 상태는 걸어둔다(latch) — 정상 이벤트(press/release)가 와야 풀린다.
+    # 이상 알림 한 번 오고 조용해지면 그게 바로 '확인 필요'한 상황이기 때문.
+    if is_fault:
+        fault = True
+    elif fsr.get("in_use") is not None:
+        fault = False
+    else:
+        fault = bool(prev.get("fault"))
+
     _device_status[sn] = {
         # 이벤트 기반이라 '조용함'이 정상이다. 전송이 왔다는 것 자체가 살아있다는 뜻.
         "connected": True,
@@ -532,6 +545,11 @@ def _store_fsr_record(storage, fsr):
         "server_received_at": fsr.get("server_received_at"),
         "source": "fsr",
         "battery_pct": fsr.get("battery_pct"),
+        "fault": fault,
+        # 이 보드가 생존신고를 보내는 펌웨어인지 기억한다.
+        # 보내는 보드라면 '조용함 = 이상'이 성립하지만, 안 보내는 보드는
+        # 하루 종일 안 쓴 것과 고장을 구분할 수 없으므로 시간 기준을 적용하면 안 된다.
+        "keepalive_seen": bool(prev.get("keepalive_seen")) or fsr.get("event") == "keepalive",
     }
 
 

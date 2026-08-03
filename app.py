@@ -484,12 +484,25 @@ def _is_radar_device(sn, state=None, ds=None):
     return len(compact) == 12 and all(c in "0123456789ABCDEF" for c in compact)
 
 
-# 사용감지 센서는 이벤트 기반이라 '조용한 게 정상'이다. 다른 센서처럼 10분 무소식을
-# 이상으로 보면 안 쓰는 시간 내내 경고가 뜬다. 이 시간(초)을 넘겨야 '센서 무응답'으로 본다.
-# 보드가 주기적 생존신고를 보내도록 바뀌면 이 값을 그 주기의 2~3배로 줄이면 된다.
-FSR_STALE_SEC = 6 * 3600
-# 배터리 경고 기준(%)
-FSR_BATT_LOW, FSR_BATT_WARN = 15, 30
+# ── 사용감지 센서 상태 판정 기준 ─────────────────────────────────────
+# 원칙: '센서 확인 필요'는 **근거가 있을 때만** 띄운다.
+#
+# 조용한 것은 근거가 아니다. 하루 종일 기기를 안 쓸 수도 있고, 서버는
+# '신호가 없다'만 알 뿐 그게 고장 때문인지 미사용 때문인지 구분하지 못한다.
+# 침묵으로 경고를 띄우면 거짓 경보가 반복되어 진짜 고장도 무시하게 된다.
+#
+# 그래서 아래 세 가지 '확실한 근거'로만 판정한다:
+#   1. 펌웨어가 센서 이상을 직접 알림 (event: error/disconnect/... → fault)
+#   2. 배터리 잔량이 바닥 (아래 임계 이하)
+#   3. 생존신고를 보내는 보드인데 그마저 끊김 (보내는 보드일 때만 적용)
+#
+# 3번은 보드가 실제로 생존신고를 보낸 적이 있어야만 작동한다(keepalive_seen).
+# 이벤트만 보내는 보드에는 시간 기준을 아예 적용하지 않는다.
+#
+# 오래 죽어 있는 기기는 기존 7일 규칙이 '비활성 기기'로 따로 걸러준다.
+FSR_KEEPALIVE_STALE_SEC = 3600      # 생존신고 보내는 보드 기준: 1시간 침묵이면 이상
+FSR_BATT_CRITICAL = 5               # 이 이하면 '확인 필요' (사실상 방전)
+FSR_BATT_LOW, FSR_BATT_WARN = 15, 30   # 카드 색 경고 기준(주의 표시용, 상태는 안 바꿈)
 
 
 def _is_fsr_device(sn, state=None, ds=None):
@@ -505,24 +518,42 @@ def _is_fsr_device(sn, state=None, ds=None):
     return isinstance(ds, dict) and ds.get("source") == "fsr"
 
 
-def _fsr_status(state, ds, now_ts):
-    """돌봄기기 사용 상태 판정 → (라벨, 아이콘, 배경, 테두리, 글자색).
+_FSR_CHECK = ("센서 확인 필요", "🔧", "#ffcdd2", "#e57373", "#b71c1c")
 
-    경과 판정은 문자열 시각이 아니라 epoch(last_seen_ts)로 한다.
-    서버 시간대가 KST 가 아니어도 어긋나지 않게 하기 위함."""
-    last_seen = ds.get("last_seen_ts") if isinstance(ds, dict) else None
-    if isinstance(last_seen, (int, float)) and (now_ts - last_seen) > FSR_STALE_SEC:
-        # 센서 자체가 응답이 없는 상태 — '미사용'과 구분해야 한다.
-        # (배터리가 다 됐는데 '미사용'으로 보이면 안 쓰는 건지 고장인지 알 수 없다)
-        return "센서 무응답", "🔌", "#ffcdd2", "#e57373", "#b71c1c"
-    in_use = state.get("사용중") if isinstance(state, dict) else None
+
+def _fsr_status(state, ds, now_ts):
+    """돌봄기기 사용 상태 판정 → (라벨, 아이콘, 배경, 테두리, 글자색, 사유).
+
+    사유는 '센서 확인 필요'일 때만 채워지고, 카드에 왜 그런지 한 줄로 보여준다.
+    경과 판정은 문자열 시각이 아니라 epoch(last_seen_ts)로 해서
+    서버 시간대가 KST 가 아니어도 어긋나지 않게 한다."""
+    st = state if isinstance(state, dict) else {}
+    d = ds if isinstance(ds, dict) else {}
+
+    # 근거 1 — 펌웨어가 센서 이상을 직접 알려준 경우 (선 빠짐 등)
+    if st.get("센서이상") or d.get("fault"):
+        return _FSR_CHECK + ("압력 센서 연결 확인",)
+
+    # 근거 2 — 배터리가 바닥
+    batt = st.get("배터리(%)")
+    if isinstance(batt, (int, float)) and batt <= FSR_BATT_CRITICAL:
+        return _FSR_CHECK + (f"배터리 소진 ({int(batt)}%)",)
+
+    # 근거 3 — 생존신고를 보내는 보드인데 그마저 끊긴 경우.
+    # 생존신고를 안 보내는 보드에는 적용하지 않는다 (조용함 ≠ 고장).
+    if d.get("keepalive_seen"):
+        last_seen = d.get("last_seen_ts")
+        if isinstance(last_seen, (int, float)) and (now_ts - last_seen) > FSR_KEEPALIVE_STALE_SEC:
+            return _FSR_CHECK + ("전원·통신 확인",)
+
+    in_use = st.get("사용중")
     if in_use is True:
-        return "사용 중", "🟢", "#e8f5e9", "#66bb6a", "#1b5e20"
+        return "사용 중", "🟢", "#e8f5e9", "#66bb6a", "#1b5e20", ""
     if in_use is False:
-        return "미사용", "⚪", "#eceff1", "#b0bec5", "#455a64"
+        return "미사용", "⚪", "#eceff1", "#b0bec5", "#455a64", ""
     # 사용 여부를 알 수 없는 이벤트(생존신고, 새 펌웨어 이벤트 등)
-    label = str((state or {}).get("이벤트설명") or "판정 대기")
-    return label, "📻", "#e3f2fd", "#64b5f6", "#0d47a1"
+    label = str(st.get("이벤트설명") or "판정 대기")
+    return label, "📻", "#e3f2fd", "#64b5f6", "#0d47a1", ""
 
 
 def _fsr_battery_html(state):
@@ -567,7 +598,12 @@ def _render_fsr_card(sn, info, state, ds, now, link_suffix=""):
         </a>
         """
 
-    status_label, status_icon, bg, border, text_color = _fsr_status(state, ds, now_ts)
+    status_label, status_icon, bg, border, text_color, reason = _fsr_status(state, ds, now_ts)
+    reason_html = (
+        f'<div style="text-align:center; margin-top:4px; font-size:0.82em; '
+        f'font-weight:bold; color:{text_color};">→ {html.escape(reason)}</div>'
+        if reason else ""
+    )
 
     last_seen = ds.get("last_seen_ts") if isinstance(ds, dict) else None
     if isinstance(last_seen, (int, float)):
@@ -603,6 +639,7 @@ def _render_fsr_card(sn, info, state, ds, now, link_suffix=""):
             <div style="font-size:0.72em; color:#00695c; font-weight:bold;">기기 사용 상태</div>
             <div style="font-weight:bold; font-size:2em; color:{text_color}; line-height:1.2; margin-top:2px;">{html.escape(status_label)}</div>
         </div>
+        {reason_html}
         {dur_html}
         {_fsr_battery_html(state)}
         <div style="text-align:center; margin-top:6px; font-size:0.8em; color:#455a64;">
@@ -998,13 +1035,14 @@ def _render_fsr_card_v2(sn, info, state, ds, now, link_suffix=""):
           <div class="v2-foot"><span>{sn}</span><span class="conn off">{last_txt}</span></div>
         </a>"""
 
-    status_label, _icon, _bg, _bd, _fg = _fsr_status(state, ds, now_ts)
+    status_label, _icon, _bg, _bd, _fg, reason = _fsr_status(state, ds, now_ts)
     tint = {"사용 중": "st-live", "미사용": "st-absent",
-            "센서 무응답": "st-off"}.get(status_label, "st-live")
+            "센서 확인 필요": "st-danger"}.get(status_label, "st-live")
     tag_icon = {"사용 중": "i-act", "미사용": "i-bed",
-                "센서 무응답": "i-wifi-off"}.get(status_label, "i-pulse")
+                "센서 확인 필요": "i-alert"}.get(status_label, "i-pulse")
     hero_color = {"사용 중": "#00897b", "미사용": "#90a4ae",
-                  "센서 무응답": "#e57373"}.get(status_label, "#00897b")
+                  "센서 확인 필요": "#e57373"}.get(status_label, "#00897b")
+    hero_sub = html.escape(reason) if reason else "돌봄기기 사용 감지"
 
     pct = state.get("배터리(%)")
     batt_cell = ""
@@ -1018,7 +1056,7 @@ def _render_fsr_card_v2(sn, info, state, ds, now, link_suffix=""):
       <div class="v2-top"><div><div class="v2-loc">{loc}</div><div class="v2-who">{name}</div></div>
         <span class="v2-tag"><svg class="pic"><use href="#{tag_icon}"/></svg>{html.escape(status_label)}</span></div>
       <div class="v2-hero"><div class="v2-big" style="background:{hero_color}"><svg class="pic"><use href="#i-act"/></svg></div>
-        <div><div class="v2-hlabel">{html.escape(status_label)}</div><div class="v2-hsub">돌봄기기 사용 감지</div></div></div>
+        <div><div class="v2-hlabel">{html.escape(status_label)}</div><div class="v2-hsub">{hero_sub}</div></div></div>
       <div class="v2-vitals">{batt_cell}</div>
       <div class="v2-foot"><span>{last_txt}</span><span>{sn}</span></div>
     </a>"""
