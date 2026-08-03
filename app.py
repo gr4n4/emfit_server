@@ -8,7 +8,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.5.0"
+VERSION = "3.5.1"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -1257,8 +1257,9 @@ def _build_cards_payload_v2(sn_filter=None, view_token=""):
             continue
         if not act_l and not inact_l:
             continue
+        render_fn = _render_fsr_card_v2 if key == "fsr" else _render_card_v2
         cards = "\n".join(
-            _render_card_v2(sn, analyzer.DEVICE_INFO[sn], latest.get(sn), statuses.get(sn), now, link_suffix)
+            render_fn(sn, analyzer.DEVICE_INFO[sn], latest.get(sn), statuses.get(sn), now, link_suffix)
             for sn in act_l) or '<p class="v2-none">활성 기기가 없습니다.</p>'
         inact_html = ""
         if inact_l:
