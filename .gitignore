@@ -15,6 +15,7 @@ mckare_apikey.txt
 emfit_data.jsonl
 radar_data.jsonl
 mckare_data.jsonl
+fsr_data.jsonl
 feedback.jsonl
 assignments.json
 preferences.json

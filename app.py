@@ -8,16 +8,17 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.4.1"
+VERSION = "3.5.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
 RADAR_LOG_FILE = "radar_data.jsonl"  # AI Radar 는 별도 파일에 쌓는다
 MCKARE_LOG_FILE = "mckare_data.jsonl"  # McKare(VSR22) 도 별도 파일
 MCKARE_APIKEY_FILE = "mckare_apikey.txt"  # 있으면 그 값으로 ApiKey 검증, 없으면 미적용
+FSR_LOG_FILE = "fsr_data.jsonl"  # ESP32 압력 사용감지 센서(돌봄기기 부착) 이벤트
 # 대시보드·리포트가 읽어야 할 로그 파일 전체. 기기 종류가 늘면 여기에 추가.
 # 원본을 나눠두면 한쪽 데이터가 커져도 다른 쪽 조회 속도에 영향을 주지 않는다.
-DATA_FILES = [LOG_FILE, RADAR_LOG_FILE, MCKARE_LOG_FILE]
+DATA_FILES = [LOG_FILE, RADAR_LOG_FILE, MCKARE_LOG_FILE, FSR_LOG_FILE]
 FEEDBACK_FILE = "feedback.jsonl"
 TOKENS_FILE = "device_tokens.json"
 VIEW_TOKENS_FILE = "view_tokens.json"  # 그룹(여러 기기 묶음) 보기 토큰
@@ -333,10 +334,10 @@ threading.Thread(target=_warmup_then_ready, daemon=True).start()
 @app.middleware("http")
 async def _maintenance_gate(request: Request, call_next):
     """워밍업이 안 끝났으면 점검 페이지(503)로 응답한다.
-    단, Emfit(POST /)·AI Radar(POST /radar)·McKare(POST /mckare)의 데이터 수신은
-    점검 중에도 받아 데이터 유실을 막는다."""
+    단, Emfit(POST /)·AI Radar(POST /radar)·McKare(POST /mckare)·FSR(POST /jy01)의
+    데이터 수신은 점검 중에도 받아 데이터 유실을 막는다."""
     if not _SERVER_READY:
-        receive_paths = {"/", "/radar", "/mckare"}
+        receive_paths = {"/", "/radar", "/mckare", "/jy01"}
         if not (request.method == "POST" and request.url.path in receive_paths):
             return HTMLResponse(_maintenance_page_html(), status_code=503,
                                 headers={"Retry-After": "5"})
@@ -481,6 +482,136 @@ def _is_radar_device(sn, state=None, ds=None):
         return True
     compact = str(sn or "").replace(":", "").replace("-", "").upper()
     return len(compact) == 12 and all(c in "0123456789ABCDEF" for c in compact)
+
+
+# 사용감지 센서는 이벤트 기반이라 '조용한 게 정상'이다. 다른 센서처럼 10분 무소식을
+# 이상으로 보면 안 쓰는 시간 내내 경고가 뜬다. 이 시간(초)을 넘겨야 '센서 무응답'으로 본다.
+# 보드가 주기적 생존신고를 보내도록 바뀌면 이 값을 그 주기의 2~3배로 줄이면 된다.
+FSR_STALE_SEC = 6 * 3600
+# 배터리 경고 기준(%)
+FSR_BATT_LOW, FSR_BATT_WARN = 15, 30
+
+
+def _is_fsr_device(sn, state=None, ds=None):
+    """사용감지 센서 판별. ⚠️ _is_radar_device 보다 먼저 확인해야 한다.
+
+    ESP32 의 MAC(예: ECE334450058)도 12자리 16진수라 레이더와 생김새가 같다.
+    그래서 SN 모양이 아니라 등록 정보의 kind 를 먼저 본다 —
+    이래야 데이터가 아직 안 들어온 기기도 올바른 섹션에 뜬다."""
+    if (analyzer.DEVICE_INFO.get(sn) or {}).get("kind") == analyzer.KIND_FSR:
+        return True
+    if isinstance(state, dict) and state.get("유형") == "FSR":
+        return True
+    return isinstance(ds, dict) and ds.get("source") == "fsr"
+
+
+def _fsr_status(state, ds, now_ts):
+    """돌봄기기 사용 상태 판정 → (라벨, 아이콘, 배경, 테두리, 글자색).
+
+    경과 판정은 문자열 시각이 아니라 epoch(last_seen_ts)로 한다.
+    서버 시간대가 KST 가 아니어도 어긋나지 않게 하기 위함."""
+    last_seen = ds.get("last_seen_ts") if isinstance(ds, dict) else None
+    if isinstance(last_seen, (int, float)) and (now_ts - last_seen) > FSR_STALE_SEC:
+        # 센서 자체가 응답이 없는 상태 — '미사용'과 구분해야 한다.
+        # (배터리가 다 됐는데 '미사용'으로 보이면 안 쓰는 건지 고장인지 알 수 없다)
+        return "센서 무응답", "🔌", "#ffcdd2", "#e57373", "#b71c1c"
+    in_use = state.get("사용중") if isinstance(state, dict) else None
+    if in_use is True:
+        return "사용 중", "🟢", "#e8f5e9", "#66bb6a", "#1b5e20"
+    if in_use is False:
+        return "미사용", "⚪", "#eceff1", "#b0bec5", "#455a64"
+    # 사용 여부를 알 수 없는 이벤트(생존신고, 새 펌웨어 이벤트 등)
+    label = str((state or {}).get("이벤트설명") or "판정 대기")
+    return label, "📻", "#e3f2fd", "#64b5f6", "#0d47a1"
+
+
+def _fsr_battery_html(state):
+    """배터리 잔량 표시. 값이 없으면 빈 문자열."""
+    pct = (state or {}).get("배터리(%)")
+    if not isinstance(pct, (int, float)):
+        return ""
+    pct = int(pct)
+    if pct <= FSR_BATT_LOW:
+        icon, color = "🪫", "#c62828"
+    elif pct <= FSR_BATT_WARN:
+        icon, color = "🔋", "#ef6c00"
+    else:
+        icon, color = "🔋", "#2e7d32"
+    mv = (state or {}).get("배터리(mV)")
+    mv_txt = f" · {int(mv)}mV" if isinstance(mv, (int, float)) else ""
+    return (f'<div style="text-align:center; margin-top:6px; font-size:0.8em; '
+            f'font-weight:bold; color:{color};">{icon} 배터리 {pct}%{mv_txt}</div>')
+
+
+def _render_fsr_card(sn, info, state, ds, now, link_suffix=""):
+    """돌봄기기 사용감지 카드 — 사용자·설치장소·사용상태·배터리 네 가지만 보여준다.
+    (생체신호를 재지 않으므로 HR/RR/ACT 칸을 만들지 않는다)"""
+    location_text = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
+    name = html.escape(str(info['name']))
+    now_ts = now.timestamp()
+
+    if state is None:
+        return f"""
+        <a href="/device/{sn}{link_suffix}" style="display:block; text-decoration:none; color:inherit;">
+        <div style="background:#fff8e1; padding:16px; border-radius:14px; border:2px solid #ffd54f;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                <div>
+                    <div style="font-size:0.85em; color:#5d4037;">{location_text}</div>
+                    <div style="font-size:1.3em; font-weight:bold; color:#263238;">{name}</div>
+                </div>
+                <div style="font-size:1.8em;">❓</div>
+            </div>
+            <div style="text-align:center; margin-top:20px; color:#5d4037; font-weight:bold;">수신 기록 없음</div>
+            <div style="text-align:center; margin-top:6px; color:#90a4ae; font-size:0.65em;">{sn}</div>
+        </div>
+        </a>
+        """
+
+    status_label, status_icon, bg, border, text_color = _fsr_status(state, ds, now_ts)
+
+    last_seen = ds.get("last_seen_ts") if isinstance(ds, dict) else None
+    if isinstance(last_seen, (int, float)):
+        last_txt = _format_ago(max(0, int(now_ts - last_seen)))
+    else:
+        last_txt = "?"
+
+    # 직전에 얼마나 오래 쓰였는지 (사용 종료 이벤트에 실려 온다)
+    dur = state.get("사용시간(ms)")
+    dur_html = ""
+    if isinstance(dur, (int, float)) and dur > 0:
+        secs = dur / 1000
+        if secs < 60:
+            dur_txt = f"{secs:.0f}초"
+        elif secs < 3600:
+            dur_txt = f"{int(secs // 60)}분"
+        else:
+            dur_txt = f"{int(secs // 3600)}시간 {int((secs % 3600) // 60)}분"
+        dur_html = (f'<div style="text-align:center; margin-top:8px; font-size:0.8em; '
+                    f'color:#546e7a;">직전 사용 시간 <b>{dur_txt}</b></div>')
+
+    return f"""
+    <a href="/device/{sn}{link_suffix}" style="display:block; text-decoration:none; color:inherit;">
+    <div style="background:{bg}; padding:16px; border-radius:14px; border:2px solid {border}; transition:transform 0.1s;" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+            <div>
+                <div style="font-size:0.85em; color:#455a64;">{location_text}</div>
+                <div style="font-size:1.3em; font-weight:bold; color:#1a237e;">{name}<span style="display:inline-block; margin-left:6px; padding:2px 7px; border-radius:10px; background:#00695c; color:white; font-size:0.55em; vertical-align:middle;">사용감지</span></div>
+            </div>
+            <div style="font-size:1.8em;">{status_icon}</div>
+        </div>
+        <div style="margin-top:14px; padding:20px 4px; background:rgba(255,255,255,0.85); border-radius:10px; text-align:center;">
+            <div style="font-size:0.72em; color:#00695c; font-weight:bold;">기기 사용 상태</div>
+            <div style="font-weight:bold; font-size:2em; color:{text_color}; line-height:1.2; margin-top:2px;">{html.escape(status_label)}</div>
+        </div>
+        {dur_html}
+        {_fsr_battery_html(state)}
+        <div style="text-align:center; margin-top:6px; font-size:0.8em; color:#455a64;">
+            마지막 신호: {last_txt}
+        </div>
+        <div style="text-align:center; margin-top:6px; color:#90a4ae; font-size:0.65em;">{sn}</div>
+    </div>
+    </a>
+    """
 
 
 def _card_sort_key(sn, state, ds, now):
@@ -680,10 +811,13 @@ def _render_card(sn, info, state, ds, now, link_suffix=""):
     """
 
 def _render_device_section(title, icon, description, active_sns, inactive_sns,
-                           latest, statuses, now, link_suffix="", accent="#1a73e8"):
-    """기기 종류별로 활성·비활성 카드를 한 구역에 묶어 표시."""
+                           latest, statuses, now, link_suffix="", accent="#1a73e8",
+                           render=None):
+    """기기 종류별로 활성·비활성 카드를 한 구역에 묶어 표시.
+    render 를 주면 그 함수로 활성 카드를 그린다 (FSR 처럼 표시 항목이 다른 기기용)."""
+    render = render or _render_card
     active_cards = "\n".join(
-        _render_card(sn, analyzer.DEVICE_INFO[sn], latest.get(sn), statuses.get(sn), now, link_suffix)
+        render(sn, analyzer.DEVICE_INFO[sn], latest.get(sn), statuses.get(sn), now, link_suffix)
         for sn in active_sns
     )
     if not active_cards:
@@ -762,10 +896,20 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
     active_sns.sort(key=lambda s: _card_sort_key(s, latest.get(s), statuses.get(s), now))
     inactive_sns.sort()
 
-    emfit_active = [sn for sn in active_sns if not _is_radar_device(sn, latest.get(sn), statuses.get(sn))]
-    radar_active = [sn for sn in active_sns if _is_radar_device(sn, latest.get(sn), statuses.get(sn))]
-    emfit_inactive = [sn for sn in inactive_sns if not _is_radar_device(sn, latest.get(sn), statuses.get(sn))]
-    radar_inactive = [sn for sn in inactive_sns if _is_radar_device(sn, latest.get(sn), statuses.get(sn))]
+    # 기기 종류 분류 — FSR 을 먼저 걸러낸다. deviceId 가 12자리 16진수면
+    # _is_radar_device 가 레이더로 오인할 수 있어서 순서가 중요하다.
+    def _kind(sn):
+        state, ds = latest.get(sn), statuses.get(sn)
+        if _is_fsr_device(sn, state, ds):
+            return "fsr"
+        return "radar" if _is_radar_device(sn, state, ds) else "emfit"
+
+    emfit_active = [sn for sn in active_sns if _kind(sn) == "emfit"]
+    radar_active = [sn for sn in active_sns if _kind(sn) == "radar"]
+    fsr_active = [sn for sn in active_sns if _kind(sn) == "fsr"]
+    emfit_inactive = [sn for sn in inactive_sns if _kind(sn) == "emfit"]
+    radar_inactive = [sn for sn in inactive_sns if _kind(sn) == "radar"]
+    fsr_inactive = [sn for sn in inactive_sns if _kind(sn) == "fsr"]
 
     emfit_section = ""
     if sn_filter is None or emfit_active or emfit_inactive:
@@ -781,22 +925,499 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
             radar_active, radar_inactive, latest, statuses, now, link_suffix, "#7e57c2",
         )
 
+    fsr_section = ""
+    if fsr_active or fsr_inactive:
+        fsr_section = _render_device_section(
+            "돌봄기기 사용 감지", "🔘", "압력 센서 · 사용 중/미사용 · 배터리 잔량",
+            fsr_active, fsr_inactive, latest, statuses, now, link_suffix, "#00897b",
+            render=_render_fsr_card,
+        )
+
     total = len(visible_sns)
     emfit_count = len(emfit_active) + len(emfit_inactive)
     radar_count = len(radar_active) + len(radar_inactive)
+    fsr_count = len(fsr_active) + len(fsr_inactive)
     summary_parts = [f'<b style="color:#2e7d32;">{connected_count}</b> / {total} 연결됨']
     if sn_filter is None or emfit_count:
         summary_parts.append(f'<span style="color:#546e7a;">EMFIT {emfit_count}대</span>')
     if sn_filter is None or radar_count:
         summary_parts.append(f'<span style="color:#6a1b9a;">Radar {radar_count}대</span>')
+    if fsr_count:
+        summary_parts.append(f'<span style="color:#00695c;">사용감지 {fsr_count}대</span>')
     summary_html = ' · '.join(summary_parts)
 
     return {
         "emfit_section": emfit_section,
         "radar_section": radar_section,
+        "fsr_section": fsr_section,
         "summary": summary_html,
         "now": now.strftime('%Y-%m-%d %H:%M:%S'),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  대시보드 V2 (신규 디자인) — 기존 /dashboard·/view 는 그대로 두고 별도 주소로.
+#  기존 상태 판정·데이터 로직은 재사용하고, 화면(HTML/CSS)만 새로 그린다.
+#  A시설는 기존 /view 를 계속 쓰므로 영향 없음.
+# ══════════════════════════════════════════════════════════════════════════
+
+# 자세 라벨 → (SVG 심볼 id, 위험도 색 변수)
+_V2_POSTURE = {
+    "누움": ("s-lie", "--p-lie"), "오래누움": ("s-longlie", "--p-lie"),
+    "뒤척임": ("s-turn", "--p-turn"), "앉음": ("s-sit", "--p-sit"),
+    "배회": ("s-walk", "--p-wander"), "걸터앉음": ("s-edge", "--p-edge"),
+    "낙상": ("s-fall", "--p-fall"), "자리비움": ("s-absent", "--p-absent"),
+    "감지 대기": ("s-absent", "--p-absent"), "재실": ("s-lie", "--p-lie"),
+}
+
+
+def _v2_tint(status_label):
+    """상태 라벨 → 카드 틴트 class."""
+    return {
+        "재실": "st-live", "부재": "st-absent", "자리비움": "st-absent",
+        "감지 대기": "st-absent", "수신 지연": "st-off", "끊김": "st-off",
+        "낙상": "st-danger",
+    }.get(status_label, "st-live")
+
+
+def _render_fsr_card_v2(sn, info, state, ds, now, link_suffix=""):
+    """신규 디자인 사용감지 카드 — 생체 셀 대신 사용 상태 + 배터리."""
+    loc = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
+    name = html.escape(str(info['name']))
+    now_ts = now.timestamp()
+    last_seen = ds.get("last_seen_ts") if isinstance(ds, dict) else None
+    last_txt = (f"마지막 신호 {_format_ago(max(0, int(now_ts - last_seen)))}"
+                if isinstance(last_seen, (int, float)) else "신호 없음")
+
+    if state is None:
+        return f"""
+        <a href="/device/{sn}{link_suffix}" class="v2card st-inact">
+          <div class="v2-top"><div><div class="v2-loc">{loc}</div><div class="v2-who">{name}</div></div>
+            <span class="v2-tag"><svg><use href="#i-clock"/></svg>데이터 없음</span></div>
+          <div class="v2-empty">수신 기록 없음</div>
+          <div class="v2-foot"><span>{sn}</span><span class="conn off">{last_txt}</span></div>
+        </a>"""
+
+    status_label, _icon, _bg, _bd, _fg = _fsr_status(state, ds, now_ts)
+    tint = {"사용 중": "st-live", "미사용": "st-absent",
+            "센서 무응답": "st-off"}.get(status_label, "st-live")
+    tag_icon = {"사용 중": "i-act", "미사용": "i-bed",
+                "센서 무응답": "i-wifi-off"}.get(status_label, "i-pulse")
+    hero_color = {"사용 중": "#00897b", "미사용": "#90a4ae",
+                  "센서 무응답": "#e57373"}.get(status_label, "#00897b")
+
+    pct = state.get("배터리(%)")
+    batt_cell = ""
+    if isinstance(pct, (int, float)):
+        muted = " muted" if int(pct) > FSR_BATT_WARN else ""
+        batt_cell = (f'<div class="v2-vital v-temp{muted}"><div class="vic"><svg class="pic"><use href="#i-cog"/></svg></div>'
+                     f'<div class="vnum num">{int(pct)}</div><div class="vunit">배터리(%)</div></div>')
+
+    return f"""
+    <a href="/device/{sn}{link_suffix}" class="v2card {tint}">
+      <div class="v2-top"><div><div class="v2-loc">{loc}</div><div class="v2-who">{name}</div></div>
+        <span class="v2-tag"><svg class="pic"><use href="#{tag_icon}"/></svg>{html.escape(status_label)}</span></div>
+      <div class="v2-hero"><div class="v2-big" style="background:{hero_color}"><svg class="pic"><use href="#i-act"/></svg></div>
+        <div><div class="v2-hlabel">{html.escape(status_label)}</div><div class="v2-hsub">돌봄기기 사용 감지</div></div></div>
+      <div class="v2-vitals">{batt_cell}</div>
+      <div class="v2-foot"><span>{last_txt}</span><span>{sn}</span></div>
+    </a>"""
+
+
+def _render_card_v2(sn, info, state, ds, now, link_suffix=""):
+    """신규 디자인 카드 1개. 상태 판정은 기존 _render_card 와 동일 규칙."""
+    if _is_fsr_device(sn, state, ds):
+        return _render_fsr_card_v2(sn, info, state, ds, now, link_suffix)
+    is_radar = _is_radar_device(sn, state, ds)
+    loc = info['location'] if info['location'] and info['location'] != '-' else '미지정'
+    name = html.escape(str(info['name']))
+
+    # 연결 상태
+    if ds is None:
+        connected = None
+    elif ds.get("connected"):
+        connected = True
+    else:
+        connected = False
+    seen_ago = None
+    if ds and isinstance(ds.get("last_seen_ts"), (int, float)):
+        seen_ago = _format_ago(max(0, int(now.timestamp() - ds["last_seen_ts"])))
+    conn_ok = connected is True
+    conn_txt = ("연결됨" + (f" ({seen_ago})" if seen_ago else "")) if conn_ok \
+        else ("끊김" + (f" ({seen_ago})" if seen_ago else "")) if connected is False else "상태 없음"
+
+    # 측정 데이터 없음
+    if state is None:
+        return f"""
+        <a href="/device/{sn}{link_suffix}" class="v2card {'st-off' if connected is False else 'st-inact'}">
+          <div class="v2-top"><div><div class="v2-loc">{loc}</div><div class="v2-who">{name}</div></div>
+            <span class="v2-tag"><svg><use href="#i-clock"/></svg>데이터 없음</span></div>
+          <div class="v2-empty">측정 데이터 없음</div>
+          <div class="v2-foot"><span>{sn}</span><span class="conn {'ok' if conn_ok else 'off'}">{conn_txt}</span></div>
+        </a>"""
+
+    # 측정 시각
+    try:
+        last_dt = datetime.strptime(f"{state['날짜']} {state['시간(KST)']}", "%Y-%m-%d %H:%M:%S")
+        delta_sec = max(0, int((now - last_dt).total_seconds()))
+        mins_ago = delta_sec // 60
+        tp = last_dt.strftime("%m-%d %H:%M") if delta_sec >= 3600 else last_dt.strftime("%H:%M")
+        time_str = f"{tp} ({_format_ago(delta_sec)})"
+    except Exception:
+        mins_ago, time_str = 10 ** 9, "?"
+
+    hr, rr = state.get("심박수(HR)"), state.get("호흡수(RR)")
+    act = state.get("활동량(ACT)")
+    act_num = act if isinstance(act, (int, float)) else None
+
+    # 상태 판정 (기존 규칙 그대로)
+    if is_radar:
+        pos = state.get("자세(POS)")
+        posture = str(state.get("자세") or "-")
+        if connected is False:
+            status = "끊김"
+        elif mins_ago > 10:
+            status = "수신 지연"
+        elif state.get("낙상") or pos == 4:
+            status = "낙상"
+        elif pos == 5:
+            status = "자리비움"
+        elif pos == -1:
+            status = "감지 대기"
+        else:
+            status = "재실"
+    else:
+        absent = act_num is not None and act_num < 1
+        if connected is False:
+            status = "끊김"
+        elif mins_ago > 10 or absent:
+            status = "부재"
+        else:
+            status = "재실"
+
+    tint = _v2_tint(status)
+    show_vitals = status == "재실"
+    hr_s = f"{hr:.0f}" if (show_vitals and isinstance(hr, (int, float))) else "–"
+    rr_s = f"{rr:.0f}" if (show_vitals and isinstance(rr, (int, float))) else "–"
+    act_s = f"{act_num:.0f}" if (show_vitals and act_num is not None) else "–"
+    mut = "" if show_vitals else " muted"
+
+    # 상태 태그 아이콘
+    tag_icon = {"낙상": "i-alert", "끊김": "i-wifi-off", "수신 지연": "i-clock",
+                "부재": "i-bed", "자리비움": "s-absent", "감지 대기": "i-radar",
+                "재실": "i-pulse"}.get(status, "i-pulse")
+
+    # 레이더는 자세 픽토그램 히어로
+    hero = ""
+    if is_radar:
+        sym, color = _V2_POSTURE.get(posture if status not in ("낙상",) else "낙상",
+                                     ("s-lie", "--p-lie"))
+        if status == "낙상":
+            sym, color = "s-fall", "--p-fall"
+        disp = "낙상 감지" if status == "낙상" else posture
+        sub = (f'<span class="v2-fall"><svg><use href="#i-alert"/></svg>낙상</span>'
+               if status == "낙상" else f'{status}')
+        hero = f"""<div class="v2-hero"><div class="v2-big" style="background:var({color})"><svg class="pic"><use href="#{sym}"/></svg></div>
+          <div><div class="v2-hlabel">{disp}</div><div class="v2-hsub">{sub}</div></div></div>"""
+
+    # 생체 셀 (레이더는 심박·호흡만, Emfit·McKare는 움직임/체온까지)
+    temp = state.get("체온")
+    vit_cells = f"""
+      <div class="v2-vital v-hr{mut}"><div class="vic"><svg class="pic"><use href="#i-heart"/></svg></div><div class="vnum num">{hr_s}</div><div class="vunit">심박(HR)</div></div>
+      <div class="v2-vital v-rr{mut}"><div class="vic"><svg class="pic"><use href="#i-lung"/></svg></div><div class="vnum num">{rr_s}</div><div class="vunit">호흡(RR)</div></div>"""
+    if not is_radar:
+        vit_cells += f"""
+      <div class="v2-vital v-act{mut}"><div class="vic"><svg class="pic"><use href="#i-act"/></svg></div><div class="vnum num">{act_s}</div><div class="vunit">움직임(ACT)</div></div>"""
+    if isinstance(temp, (int, float)) and show_vitals:
+        vit_cells += f"""
+      <div class="v2-vital v-temp"><div class="vic"><svg class="pic"><use href="#i-temp"/></svg></div><div class="vnum num">{temp:.1f}</div><div class="vunit">체온(℃)</div></div>"""
+
+    return f"""
+    <a href="/device/{sn}{link_suffix}" class="v2card {tint}">
+      <div class="v2-top"><div><div class="v2-loc">{loc}</div><div class="v2-who">{name}</div></div>
+        <span class="v2-tag"><svg class="pic"><use href="#{tag_icon}"/></svg>{status}</span></div>
+      {hero}
+      <div class="v2-vitals">{vit_cells}</div>
+      <div class="v2-foot"><span>측정 {time_str}</span><span class="conn {'ok' if conn_ok else 'off'}">{conn_txt}</span></div>
+    </a>"""
+
+
+def _render_inactive_card_v2(sn, info, ds, now, link_suffix=""):
+    """비활성(7일+) 미니 카드."""
+    loc = info['location'] if info['location'] and info['location'] != '-' else '미지정'
+    name = html.escape(str(info['name']))
+    last = "통신 이력 없음"
+    if ds and isinstance(ds.get("last_seen_ts"), (int, float)):
+        last = f"마지막 통신 {_format_ago(max(0, int(now.timestamp() - ds['last_seen_ts'])))}"
+    return f"""<a href="/device/{sn}{link_suffix}" class="v2card st-inact v2-mini">
+      <div class="v2-top"><div><div class="v2-loc">{loc}</div><div class="v2-who">{name}</div></div>
+        <span class="v2-tag"><svg><use href="#i-clock"/></svg>비활성</span></div>
+      <div class="v2-empty">측정 데이터 없음</div>
+      <div class="v2-foot"><span>{last}</span><span>{sn}</span></div></a>"""
+
+
+def _v2_kind(sn, state, ds):
+    if isinstance(state, dict) and state.get("유형") == "McKare":
+        return "mckare"
+    if isinstance(ds, dict) and ds.get("source") == "mckare":
+        return "mckare"
+    # FSR 을 레이더보다 먼저 — deviceId 가 12자리 16진수면 레이더로 오인될 수 있다.
+    if _is_fsr_device(sn, state, ds):
+        return "fsr"
+    if _is_radar_device(sn, state, ds):
+        return "radar"
+    return "emfit"
+
+
+_V2_SECTIONS = [
+    ("emfit", "EMFIT QS", "침대 매트 · 심박 · 호흡 · 움직임", "#e05575", "i-heart"),
+    ("radar", "AI Radar", "침대 위 레이더 · 자세 · 낙상 감지", "#7c5cd6", "i-radar"),
+    ("mckare", "McKare", "천장·벽 레이더 · 구간 재실 · 체온", "#1fa39c", "i-temp"),
+    ("fsr", "돌봄기기 사용 감지", "압력 센서 · 사용 중/미사용 · 배터리 잔량", "#00897b", "i-act"),
+]
+
+
+def _build_cards_payload_v2(sn_filter=None, view_token=""):
+    """신규 대시보드 카드 섹션 HTML + 요약."""
+    link_suffix = f"?view={view_token}" if view_token else ""
+    now = datetime.now()
+    now_ts = now.timestamp()
+    latest = {}
+    if _has_data():
+        try:
+            latest = analyzer.get_latest_states(DATA_FILES)
+        except Exception:
+            latest = {}
+    statuses = analyzer.get_device_statuses()
+    sn_set = set(sn_filter) if sn_filter else None
+    visible = [sn for sn in analyzer.DEVICE_INFO.keys() if sn_set is None or sn in sn_set]
+
+    active, inactive, connected_count = [], [], 0
+    for sn in visible:
+        ds = statuses.get(sn)
+        if _is_active(ds, now_ts):
+            active.append(sn)
+            if ds and ds.get("connected"):
+                connected_count += 1
+        else:
+            inactive.append(sn)
+    active.sort(key=lambda s: _card_sort_key(s, latest.get(s), statuses.get(s), now))
+    inactive.sort()
+
+    groups = {key: ([], []) for key, *_ in _V2_SECTIONS}
+    for sn in active:
+        groups[_v2_kind(sn, latest.get(sn), statuses.get(sn))][0].append(sn)
+    for sn in inactive:
+        groups[_v2_kind(sn, latest.get(sn), statuses.get(sn))][1].append(sn)
+
+    sections_html = ""
+    for key, title, sub, accent, icon in _V2_SECTIONS:
+        act_l, inact_l = groups[key]
+        if sn_filter is not None and not act_l and not inact_l:
+            continue
+        if not act_l and not inact_l:
+            continue
+        cards = "\n".join(
+            _render_card_v2(sn, analyzer.DEVICE_INFO[sn], latest.get(sn), statuses.get(sn), now, link_suffix)
+            for sn in act_l) or '<p class="v2-none">활성 기기가 없습니다.</p>'
+        inact_html = ""
+        if inact_l:
+            ic = "\n".join(
+                _render_inactive_card_v2(sn, analyzer.DEVICE_INFO[sn], statuses.get(sn), now, link_suffix)
+                for sn in inact_l)
+            inact_html = (f'<div class="v2-inact-h">비활성 {len(inact_l)}대 · 7일 이상 통신 없음</div>'
+                          f'<div class="v2-grid mini">{ic}</div>')
+        sections_html += f"""
+        <section class="v2-sec">
+          <div class="v2-sechead"><div class="v2-badge" style="background:{accent}"><svg class="pic"><use href="#{icon}"/></svg></div>
+            <div><h2>{title}</h2><p>{sub}</p></div>
+            <div class="v2-count">총 {len(act_l)+len(inact_l)}대 · 활성 {len(act_l)}</div></div>
+          <div class="v2-grid">{cards}</div>{inact_html}
+        </section>"""
+
+    total = len(visible)
+    summary = f'<b style="color:var(--ok)">{connected_count}</b> / {total} 연결됨'
+    return {"sections": sections_html, "summary": summary,
+            "now": now.strftime('%Y-%m-%d %H:%M:%S')}
+
+
+# ── V2 정적 자원: CSS + SVG 심볼 (문자열 상수, f-string 아님) ──
+_V2_STYLE = """
+:root{--bg:#eef1f6;--surface:#fff;--surface-2:#f5f8fc;--border:#e3e8f1;--ink:#1b2434;--ink-2:#59637a;--ink-3:#8b94a8;
+--accent:#3b5bdb;--accent-soft:#eaeefb;--ok:#1f9d6b;--off:#79839a;
+--hr:#e0556f;--rr:#3b82d6;--act:#e08a3c;--temp:#e2703f;
+--p-lie:#3f7fd6;--p-turn:#3fa88f;--p-sit:#e2b52f;--p-wander:#e8933c;--p-edge:#df6b3b;--p-fall:#d6455a;--p-absent:#8b98ad;
+--st-live-bg:#e9f1fd;--st-live-bd:#bcd6f7;--st-live-fg:#1a5fd0;
+--st-absent-bg:#f1ebe2;--st-absent-bd:#dccdb7;--st-absent-fg:#8a6d43;
+--st-off-bg:#fdeaee;--st-off-bd:#f3bac5;--st-off-fg:#c23a52;
+--st-inact-bg:#fdf5dd;--st-inact-bd:#eedd9c;--st-inact-fg:#a2841f;
+--st-danger-bg:#fbdce1;--st-danger-bd:#ec8998;--st-danger-fg:#c62f45;
+--r:14px;--font:'Pretendard',-apple-system,BlinkMacSystemFont,'Malgun Gothic','Apple SD Gothic Neo',sans-serif;
+--shadow:0 1px 2px rgba(20,30,50,.05),0 6px 20px rgba(20,30,50,.07);}
+:root[data-theme="dark"]{--bg:#0e1218;--surface:#161c26;--surface-2:#1c2430;--border:#2a3341;--ink:#e9edf4;--ink-2:#a6b0c2;--ink-3:#6e7889;
+--accent:#6d84f0;--accent-soft:#1e2740;--ok:#3ac088;--off:#8792a4;
+--hr:#f0728a;--rr:#5c9be8;--act:#eaa05a;--temp:#ef8a5f;
+--p-lie:#5a93e6;--p-turn:#4fbca3;--p-sit:#eac04a;--p-wander:#f0a453;--p-edge:#ec8256;--p-fall:#ec6274;--p-absent:#7d879a;
+--st-live-bg:#15233b;--st-live-bd:#2f4a72;--st-live-fg:#7ba6f0;
+--st-absent-bg:#25211a;--st-absent-bd:#463d2c;--st-absent-fg:#c9a978;
+--st-off-bg:#2c1620;--st-off-bd:#5a2e3a;--st-off-fg:#ef8798;
+--st-inact-bg:#272108;--st-inact-bd:#4a3f16;--st-inact-fg:#dcc067;
+--st-danger-bg:#331419;--st-danger-bd:#6e2e39;--st-danger-fg:#ef8798;
+--shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.3);}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+svg{display:block}.pic{fill:currentColor}.num{font-variant-numeric:tabular-nums}
+.v2app{display:grid;grid-template-columns:232px 1fr;min-height:100vh}
+.v2side{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+.v2brand{padding:20px 18px;display:flex;gap:11px;align-items:center;border-bottom:1px solid var(--border)}
+.v2brand .mk{width:36px;height:36px;border-radius:9px;flex:none;background:linear-gradient(140deg,var(--accent),var(--p-turn));color:#fff;display:grid;place-items:center}
+.v2brand .mk svg{width:21px;height:21px}
+.v2brand b{font-size:14px;font-weight:700;letter-spacing:-.2px;line-height:1.3}.v2brand span{display:block;font-size:11px;color:var(--ink-3);font-weight:500}
+.v2nav{padding:10px;display:flex;flex-direction:column;gap:2px}
+.v2nl{font-size:10.5px;font-weight:700;letter-spacing:.09em;color:var(--ink-3);padding:14px 10px 6px;text-transform:uppercase}
+.v2ni{display:flex;align-items:center;gap:11px;padding:10px 11px;border-radius:9px;color:var(--ink-2);font-weight:500;font-size:13.5px;cursor:pointer;text-decoration:none}
+.v2ni svg{width:19px;height:19px;color:var(--ink-3)}
+.v2ni:hover{background:var(--surface-2);color:var(--ink)}
+.v2ni.on{background:var(--accent-soft);color:var(--accent);font-weight:600}.v2ni.on svg{color:var(--accent)}
+.v2foot{margin-top:auto;padding:14px 18px;border-top:1px solid var(--border);font-size:11px;color:var(--ink-3);display:flex;justify-content:space-between}
+.v2main{min-width:0}
+.v2top{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--border);padding:16px 26px;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.v2top h1{margin:0;font-size:17px;font-weight:700;letter-spacing:-.3px}.v2top .sub{color:var(--ink-3);font-size:12px;margin-top:2px}
+.v2sp{flex:1}.v2chip{display:inline-flex;align-items:center;gap:6px;padding:6px 11px;border-radius:999px;background:var(--surface);border:1px solid var(--border);font-size:12.5px;font-weight:600}
+.v2clock{font-variant-numeric:tabular-nums;color:var(--ink-2);font-size:12.5px;font-weight:600}
+.v2wrap{padding:22px 26px 60px;max-width:1240px}
+.v2leg{display:flex;gap:8px 16px;flex-wrap:wrap;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 16px;margin-bottom:22px;font-size:12.5px}
+.v2leg .t{font-weight:700;color:var(--ink)}.v2leg .l{display:flex;align-items:center;gap:7px;font-weight:600;color:var(--ink-2)}
+.v2leg .cs{width:22px;height:14px;border-radius:4px;border:1px solid var(--border);flex:none}
+.v2sec{margin-bottom:30px}
+.v2sechead{display:flex;align-items:center;gap:11px;margin:0 2px 13px}
+.v2-badge{width:32px;height:32px;border-radius:8px;display:grid;place-items:center;flex:none;color:#fff}.v2-badge svg{width:19px;height:19px}
+.v2sechead h2{margin:0;font-size:15px;font-weight:700}.v2sechead p{margin:1px 0 0;font-size:12px;color:var(--ink-3)}
+.v2count{margin-left:auto;font-size:12px;color:var(--ink-3);font-weight:600}
+.v2-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(266px,1fr));gap:14px}
+.v2-grid.mini{grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px;margin-top:12px}
+.v2-inact-h{margin-top:18px;font-size:12.5px;color:var(--ink-3);font-weight:600}
+.v2card{display:block;text-decoration:none;color:inherit;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);padding:15px 16px 16px;transition:transform .12s}
+.v2card:hover{transform:translateY(-2px)}
+.v2card.st-live{background:var(--st-live-bg);border-color:var(--st-live-bd)}
+.v2card.st-absent{background:var(--st-absent-bg);border-color:var(--st-absent-bd)}
+.v2card.st-off{background:var(--st-off-bg);border-color:var(--st-off-bd)}
+.v2card.st-inact{background:var(--st-inact-bg);border-color:var(--st-inact-bd)}
+.v2card.st-danger{background:var(--st-danger-bg);border-color:var(--st-danger-bd);box-shadow:0 0 0 1.5px var(--st-danger-bd),0 8px 26px rgba(214,69,90,.22)}
+.v2-top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.v2-loc{font-size:11.5px;color:var(--ink-3);font-weight:600}.v2-who{font-size:16px;font-weight:700;letter-spacing:-.3px;margin-top:1px}
+.v2-tag{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+.v2-tag svg{width:15px;height:15px}
+.st-live .v2-tag{background:color-mix(in srgb,var(--st-live-fg) 15%,transparent);color:var(--st-live-fg)}
+.st-absent .v2-tag{background:color-mix(in srgb,var(--st-absent-fg) 16%,transparent);color:var(--st-absent-fg)}
+.st-off .v2-tag{background:color-mix(in srgb,var(--st-off-fg) 14%,transparent);color:var(--st-off-fg)}
+.st-inact .v2-tag{background:color-mix(in srgb,var(--st-inact-fg) 18%,transparent);color:var(--st-inact-fg)}
+.st-danger .v2-tag{background:var(--st-danger-fg);color:#fff}
+.v2-empty{text-align:center;color:var(--ink-3);font-weight:600;padding:22px 0 16px}
+.v2-hero{display:flex;align-items:center;gap:14px;margin:14px 0 4px;padding:13px 14px;background:color-mix(in srgb,var(--surface) 55%,transparent);border-radius:12px}
+.v2-big{width:58px;height:58px;flex:none;display:grid;place-items:center;border-radius:13px;color:#fff}.v2-big svg{width:38px;height:38px}
+.v2-hlabel{font-size:19px;font-weight:700;letter-spacing:-.4px}.v2-hsub{font-size:12px;color:var(--ink-3);margin-top:3px;display:flex;align-items:center;gap:6px}
+.v2-fall{display:inline-flex;align-items:center;gap:4px;background:var(--st-danger-bg);color:var(--st-danger-fg);font-weight:700;font-size:11px;padding:2px 7px;border-radius:999px}.v2-fall svg{width:12px;height:12px}
+.v2-vitals{display:flex;margin-top:13px;border:1px solid color-mix(in srgb,var(--ink) 8%,transparent);border-radius:11px;overflow:hidden;background:color-mix(in srgb,var(--surface) 62%,transparent)}
+.v2-vital{flex:1;padding:11px 4px;text-align:center;border-right:1px solid color-mix(in srgb,var(--ink) 8%,transparent)}.v2-vital:last-child{border-right:0}
+.v2-vital .vic{display:flex;justify-content:center;margin-bottom:4px}.v2-vital .vic svg{width:19px;height:19px}
+.v2-vital .vnum{font-size:22px;font-weight:700;letter-spacing:-.5px;line-height:1}.v2-vital .vunit{font-size:10.5px;color:var(--ink-3);font-weight:600;margin-top:3px}
+.v-hr .vic,.v-hr .vnum{color:var(--hr)}.v-rr .vic,.v-rr .vnum{color:var(--rr)}.v-act .vic,.v-act .vnum{color:var(--act)}.v-temp .vic,.v-temp .vnum{color:var(--temp)}
+.v2-vital.muted .vic,.v2-vital.muted .vnum{color:var(--ink-3)!important}
+.v2-foot{display:flex;justify-content:space-between;align-items:center;margin-top:13px;font-size:11.5px;color:var(--ink-3)}
+.v2-foot .conn{font-weight:600}.conn.ok{color:var(--ok)}.conn.off{color:var(--off)}
+.v2-none{grid-column:1/-1;text-align:center;color:var(--ink-3);padding:30px}
+@media(max-width:820px){.v2app{grid-template-columns:1fr}.v2side{position:fixed;left:-232px;z-index:20}.v2wrap,.v2top{padding-left:16px;padding-right:16px}}
+"""
+
+_V2_DEFS = """
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20.7c-.35 0-.7-.13-.97-.4C6.5 16.05 3.4 13.25 3.4 9.7 3.4 7.05 5.4 5.05 7.9 5.05c1.45 0 2.83.68 3.73 1.82.14.18.42.18.56 0C13.1 5.73 14.47 5.05 15.9 5.05c2.5 0 4.5 2 4.5 4.65 0 3.55-3.1 6.35-7.63 10.6-.27.27-.62.4-.97.4z"/></symbol>
+<symbol id="i-lung" viewBox="0 0 24 24"><path d="M11 4a1 1 0 0 1 2 0v6.2l2.5-.9c1.55-.56 3.2.52 3.35 2.15l.45 5.2c.18 1.9-1.45 3.45-3.32 3.12-1.4-.24-2.42-1.36-2.6-2.75L13 13.4a2 2 0 0 0-2 0l-.38 3.62c-.18 1.4-1.2 2.5-2.6 2.75-1.87.33-3.5-1.22-3.32-3.12l.45-5.2c.15-1.63 1.8-2.7 3.35-2.15L11 10.2z"/></symbol>
+<symbol id="i-act" viewBox="0 0 24 24"><rect x="3.4" y="13.2" width="3.5" height="7.4" rx="1.3"/><rect x="10.25" y="8.6" width="3.5" height="12" rx="1.3"/><rect x="17.1" y="4.4" width="3.5" height="16.2" rx="1.3"/></symbol>
+<symbol id="i-temp" viewBox="0 0 24 24"><path d="M12 2.6a3.1 3.1 0 0 0-3.1 3.1v7.03a4.6 4.6 0 1 0 6.2 0V5.7A3.1 3.1 0 0 0 12 2.6zm0 2a1.1 1.1 0 0 1 1.1 1.1v7.9l.5.4a2.6 2.6 0 1 1-3.2 0l.5-.4v-7.9A1.1 1.1 0 0 1 12 4.6z"/><circle cx="12" cy="16.6" r="1.7"/><rect x="11.2" y="8" width="1.6" height="8" rx=".8"/></symbol>
+<symbol id="i-bed" viewBox="0 0 24 24"><circle cx="6.6" cy="9.3" r="2.1"/><path d="M10 12.6A2.6 2.6 0 0 1 12.6 10H20a1 1 0 0 1 1 1v3.2H10z"/><path d="M3 9.6a1 1 0 0 1 2 0v4.6H3z"/><rect x="2.6" y="15.6" width="18.8" height="2.1" rx="1"/></symbol>
+<symbol id="i-radar" viewBox="0 0 24 24"><path d="M12 12L5 5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M4 12a8 8 0 1 1 8 8" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M7.5 12a4.5 4.5 0 1 1 4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="12" r="1.1"/></symbol>
+<symbol id="i-wifi" viewBox="0 0 24 24"><path d="M4.5 11a11 11 0 0 1 15 0M7.8 14.3a6.3 6.3 0 0 1 8.4 0M11 17.6a1.5 1.5 0 0 1 2 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+<symbol id="i-wifi-off" viewBox="0 0 24 24"><path d="M4.5 11a11 11 0 0 1 12-2.2M16.2 14.3a6.3 6.3 0 0 0-4.2-1.8M11 17.6a1.5 1.5 0 0 1 2 0M3 3l18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4.5 2.8 20h18.4z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M12 10v4.3M12 17.4v.01" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 7v5l3 2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+<symbol id="i-pulse" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10M12 6v6l4 2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></g></symbol>
+<symbol id="i-place" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M12 21s7-5.5 7-11a7 7 0 1 0-14 0c0 5.5 7 11 7 11z"/><circle cx="12" cy="10" r="2.5"/></g></symbol>
+<symbol id="i-cog" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M22 12h-3M5 12H2M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1M18.4 18.4l-2.1-2.1M7.7 7.7 5.6 5.6"/></g></symbol>
+<symbol id="i-report" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6zM14 3v4h4M9 13h6M9 17h6M9 9h2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M5 4h9a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H5zM19 4h-1a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h1z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+<symbol id="s-absent" viewBox="0 0 24 24"><path d="M19.775 22.625L17.15 20H4v-2.8q0-.85.438-1.562T5.6 14.55q1.125-.575 2.288-.925t2.362-.525L1.375 4.225L2.8 2.8l18.4 18.4zM18.4 14.55q.725.35 1.15 1.062T20 17.15l-3.35-3.35q.45.175.888.35t.862.4m-4.2-3.2L8.65 5.8q.575-.85 1.45-1.325T12 4q1.65 0 2.825 1.175T16 8q0 1.025-.475 1.9T14.2 11.35"/></symbol>
+<symbol id="s-lie" viewBox="0 0 24 24"><path d="M9 14V7h9q1.65 0 2.825 1.175T22 11v3zm-7 3v-2h20v2zm.875-3.875Q2 12.25 2 11t.875-2.125T5 8t2.125.875T8 11t-.875 2.125T5 14t-2.125-.875"/></symbol>
+<symbol id="s-longlie" viewBox="0 0 24 24"><path d="M9 14V7h9q1.65 0 2.825 1.175T22 11v3zm-7 3v-2h20v2zm.875-3.875Q2 12.25 2 11t.875-2.125T5 8t2.125.875T8 11t-.875 2.125T5 14t-2.125-.875"/><text x="5.2" y="5.6" font-family="Arial,sans-serif" font-weight="900" font-size="5" fill="currentColor">z</text><text x="8.8" y="3.1" font-family="Arial,sans-serif" font-weight="900" font-size="3.4" fill="currentColor">z</text></symbol>
+<symbol id="s-sit" viewBox="0 0 24 24"><circle cx="7.7" cy="4.2" r="2.7"/><path d="M5 14.8V9q0-1.15 1.2-1.45h1.9l2.5 3.4q.5.65.5 1.5V14.8z"/><path d="M11.3 11.5h4.3A3.7 3.7 0 0 1 19.3 15.2H11.3z"/><rect x="2.4" y="15" width="17.2" height="2.4" rx="0.8"/><rect x="2.6" y="17.4" width="1.9" height="3.1" rx="0.6"/><rect x="17.5" y="17.4" width="1.9" height="2.6" rx="0.6"/></symbol>
+<symbol id="s-edge" viewBox="0 0 15 15"><path d="M14.5 9c.28 0 .5.22.5.5V14h-2v-3h-2V9zm-8 0v2H2v3H0V9.5c0-.28.22-.5.5-.5zM6 5.75l-1 3H3.75l1.03-3.52c.15-.48.41-.92.76-1.27l.25-.25C6.25 3.25 6.86 3 7.5 3s1.25.25 1.71.71l.25.25c.35.35.61.79.76 1.27l1.03 3.52H11a1.5 1.5 0 0 0-1.25-1.38l-.22-.04L9 5.75v2l.66.11l.15.04l.1.03l.1.06l.08.05l.1.08c.01.02.02.03.04.04l.05.07l.07.09l.06.11l.03.07c.03.08.04.15.05.23l.01.07v3.45c0 .41-.34.75-.75.75S9 12.66 9 12.25V9h-.5v3.25c0 .41-.34.75-.75.75S7 12.66 7 12.25V9l-.12-.01a.8.8 0 0 1-.26-.07l-.14-.06l-.09-.07l-.08-.06l-.03-.04l-.05-.05l-.06-.08v-.01c-.05-.06-.08-.13-.11-.2l-.02-.07c-.01-.05-.03-.1-.03-.16L6 8.06zM7.5 2.5a1.25 1.25 0 1 0 0-2.5a1.25 1.25 0 0 0 0 2.5"/></symbol>
+<symbol id="s-walk" viewBox="0 0 24 24"><path d="M13.5 5.5c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zM9.8 8.9L7 23h2.1l1.8-8 2.1 2v6h2v-7.5l-2.1-2 .6-3C14.8 12 16.8 13 19 13v-2c-1.9 0-3.5-1-4.3-2.4l-1-1.6c-.4-.6-1-1-1.7-1-.3 0-.5.1-.8.1L6 8.3V13h2V9.6l1.8-.7"/></symbol>
+<symbol id="s-fall" viewBox="0 0 24 24"><path d="m13.5 22.5l-2-.4l.8-4.3l-3.6-2.7l-1.3-5.7l-2.2 1.9l.8 3.8l-2 .4l-1-4.9l4.45-3.975q.575-.5 1.363-.412t1.512.387q.8.35 1.663.5t1.737.025t1.613-.575t1.412-1L18 7.1q-.75.575-1.55 1.075t-1.725.775q-.825.225-1.662.238T11.4 9l.7 3.1l3.7-.7l5.2 3.7l-1.2 1.6l-4.3-3l-3.6.7l2.7 2zM6.588 4.913Q6 4.325 6 3.5t.588-1.412T8 1.5t1.413.588T10 3.5t-.587 1.413T8 5.5t-1.412-.587"/></symbol>
+<symbol id="s-turn" viewBox="0 0 15 15"><path d="M1.83 8.16a1.83 1.83 0 0 1 0-3.66c1 0 1.82.82 1.82 1.83s-.82 1.83-1.82 1.83M15 10.5H6.5V5.21H12c1.66 0 3 1.34 3 3zM4.21 8.7V5.98c0-.5.4-.9.9-.9c.49 0 .9.4.9.9V9.6c0 .49-.41.9-.9.9H.94c-.5 0-.9-.41-.9-.9c0-.5.4-.9.9-.9z"/><rect x="0.4" y="11.6" width="14.2" height="1.5" rx="0.55"/></symbol>
+</defs></svg>
+"""
+
+
+@app.get("/dashboard2", response_class=HTMLResponse)
+def view_dashboard2(request: Request, _: str = Depends(require_admin)):
+    """신규 디자인 대시보드 (미리보기). 기존 /dashboard 는 그대로."""
+    p = _build_cards_payload_v2()
+    return HTMLResponse(_v2_page(p))
+
+
+@app.get("/api/cards2")
+def api_cards2(request: Request, _: str = Depends(require_admin)):
+    return _build_cards_payload_v2()
+
+
+def _v2_page(p):
+    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<title>통합 관제 (신규) · 돌봄로봇 사업단</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{_V2_STYLE}</style></head><body>{_V2_DEFS}
+<div class="v2app">
+  <aside class="v2side">
+    <div class="v2brand"><div class="mk"><svg><use href="#i-radar"/></svg></div>
+      <div><b>돌봄로봇 사업단</b><span>통합 관제 시스템</span></div></div>
+    <nav class="v2nav">
+      <div class="v2nl">모니터링</div>
+      <a class="v2ni on"><svg><use href="#i-grid"/></svg>통합 현황</a>
+      <a class="v2ni" href="/view"><svg><use href="#i-place"/></svg>장소별 보기</a>
+      <div class="v2nl">관리</div>
+      <a class="v2ni" href="/devices"><svg><use href="#i-cog"/></svg>장비 관리</a>
+      <div class="v2nl">자료</div>
+      <a class="v2ni" href="/reports"><svg><use href="#i-report"/></svg>리포트</a>
+      <a class="v2ni" href="/help"><svg><use href="#i-book"/></svg>사용 가이드</a>
+    </nav>
+    <div class="v2foot"><span>v{VERSION} · 신규 미리보기</span></div>
+  </aside>
+  <main class="v2main">
+    <div class="v2top">
+      <div><h1>모니터링 센서 통합 대시보드</h1><div class="sub">EMFIT QS · AI Radar · McKare 통합 관제</div></div>
+      <div class="v2sp"></div>
+      <span class="v2chip" id="v2sum">{p['summary']}</span>
+      <span class="v2clock" id="v2clk">{p['now']}</span>
+    </div>
+    <div class="v2wrap">
+      <div class="v2leg"><span class="t">카드 색 = 상태</span>
+        <span class="l"><span class="cs" style="background:var(--st-live-bg);border-color:var(--st-live-bd)"></span>측정 중(재실)</span>
+        <span class="l"><span class="cs" style="background:var(--st-absent-bg);border-color:var(--st-absent-bd)"></span>부재</span>
+        <span class="l"><span class="cs" style="background:var(--st-off-bg);border-color:var(--st-off-bd)"></span>연결 끊김</span>
+        <span class="l"><span class="cs" style="background:var(--st-inact-bg);border-color:var(--st-inact-bd)"></span>비활성(7일+)</span>
+        <span class="l"><span class="cs" style="background:var(--st-danger-bg);border-color:var(--st-danger-fg)"></span>낙상(긴급)</span>
+      </div>
+      <div id="v2secs">{p['sections']}</div>
+    </div>
+  </main>
+</div>
+<script>
+async function v2refresh(){{try{{const r=await fetch('/api/cards2');if(!r.ok)return;const d=await r.json();
+document.getElementById('v2secs').innerHTML=d.sections;document.getElementById('v2sum').innerHTML=d.summary;
+document.getElementById('v2clk').textContent=d.now;}}catch(e){{}}}}
+setInterval(v2refresh,15000);document.addEventListener('visibilitychange',()=>{{if(!document.hidden)v2refresh();}});
+</script></body></html>"""
 
 # 관제 대시보드 (기기별 카드 그리드) — 관리자 전용
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -835,6 +1456,9 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                 <div id="radar-section">
                     {p['radar_section']}
                 </div>
+                <div id="fsr-section">
+                    {p['fsr_section']}
+                </div>
 
                 <p class="nav-buttons" style="text-align:center; margin-top:30px;">
                     <a href="/reports" style="display:inline-block; padding:10px 20px; background:#1a73e8; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">📊 리포트 다운로드</a>
@@ -861,6 +1485,7 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                         const d = await r.json();
                         document.getElementById('emfit-section').innerHTML = d.emfit_section;
                         document.getElementById('radar-section').innerHTML = d.radar_section;
+                        document.getElementById('fsr-section').innerHTML = d.fsr_section;
                         document.getElementById('header-summary').innerHTML = d.summary;
                         document.getElementById('clock').textContent = d.now;
                     }} catch (e) {{}}
@@ -937,6 +1562,9 @@ def view_group_dashboard(request: Request):
                 <div id="radar-section">
                     {p['radar_section']}
                 </div>
+                <div id="fsr-section">
+                    {p['fsr_section']}
+                </div>
 
                 <p class="nav-buttons" style="text-align:center; margin-top:30px;">
                     <a href="/help" style="display:inline-block; padding:10px 20px; background:#27ae60; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">📘 사용 가이드</a>
@@ -958,6 +1586,7 @@ def view_group_dashboard(request: Request):
                         const d = await r.json();
                         document.getElementById('emfit-section').innerHTML = d.emfit_section;
                         document.getElementById('radar-section').innerHTML = d.radar_section;
+                        document.getElementById('fsr-section').innerHTML = d.fsr_section;
                         document.getElementById('header-summary').innerHTML = d.summary;
                         document.getElementById('clock').textContent = d.now;
                     }} catch (e) {{}}
@@ -997,9 +1626,11 @@ def _build_single_card(sn, token=""):
     statuses = analyzer.get_device_statuses()
     state = latest.get(sn)
     ds = statuses.get(sn)
-    if _is_active(ds, now_ts):
-        return _render_card(sn, info, state, ds, now)
-    return _render_inactive_card(sn, info, ds, now)
+    if not _is_active(ds, now_ts):
+        return _render_inactive_card(sn, info, ds, now)
+    if _is_fsr_device(sn, state, ds):
+        return _render_fsr_card(sn, info, state, ds, now)
+    return _render_card(sn, info, state, ds, now)
 
 
 @app.get("/api/device/{sn}/card", response_class=HTMLResponse)
@@ -3290,6 +3921,44 @@ async def receive_mckare_data(request: Request):
 
     # McKare 규격에 맞춘 201 Created 응답 (statusCode/message 형식도 문서와 동일하게)
     return JSONResponse({"statusCode": 201, "message": "created"}, status_code=201)
+
+
+# ── ESP32 압력 사용감지 센서 전용 데이터 수신 경로 ──────────────────────
+# 돌봄기기에 부착해 '지금 쓰이고 있는가'를 보는 센서. 다른 센서들과 분리해
+# payload 혼동을 막는다. 보드가 event 를 그때그때 쏘는 방식이라 전송량은 적지만,
+# 사용 시작/종료가 짝을 이뤄야 의미가 있어 유실에 민감하다.
+_FSR_REQUIRED = ["deviceId", "event"]
+
+
+@app.post("/jy01")
+async def receive_fsr_data(request: Request):
+    try:
+        data = await request.json()
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"invalid JSON: {e}"}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({"status": "error", "message": "JSON object required"}, status_code=400)
+
+    missing = [k for k in _FSR_REQUIRED if k not in data]
+    if missing:
+        return JSONResponse(
+            {"status": "error", "message": f"missing field(s): {', '.join(missing)}"},
+            status_code=400,
+        )
+
+    record = dict(data)
+    record["server_received_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    record["data_source"] = "fsr"
+
+    try:
+        with open(FSR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        # 저장 실패는 반드시 5xx 로 알려야 보드가 재전송할 수 있다.
+        return JSONResponse({"status": "error", "message": f"log write failed: {e}"},
+                            status_code=500)
+
+    return {"status": "success", "source": "fsr", "device": str(data.get("deviceId"))}
 
 
 if __name__ == "__main__":

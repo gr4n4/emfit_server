@@ -2,10 +2,12 @@ import pandas as pd
 import glob
 import os
 import json
+import re
 import argparse
 from datetime import datetime, timezone, timedelta
 from radar_parser import parse_radar_payload
 from mckare_parser import parse_mckare_payload
+from fsr_parser import parse_fsr_payload
 
 # KST 고정 오프셋(+09:00). 한국은 현재 서머타임이 없어 'Asia/Seoul' 과 동일하며,
 # 행마다 pandas Timestamp 를 만드는 것보다 표준 datetime 이 10배 이상 빠르다.
@@ -30,6 +32,24 @@ _DEFAULT_DEVICE_INFO = {
 _RADAR_DEVICE_DEFAULTS = {
     "A1B2C3D4E5F6": _DEFAULT_DEVICE_INFO["A1B2C3D4E5F6"],
 }
+
+# ESP32 압력 사용감지 센서(돌봄기기에 부착) — 알려진 기기는 여기에 적어두면
+# 데이터가 없어도 대시보드에 자리를 잡는다. name/location 은 /devices 에서 편집 가능.
+# 여기 없는 ID 로 데이터가 들어오면 _ensure_fsr_device 가 자동 등록한다(아래 참고).
+# SN 은 보드가 보내는 deviceId 와 같아야 한다. MAC 을 쓸 경우 구분자 없는 대문자
+# (fsr_parser._device_id 가 그렇게 정규화한다).
+_FSR_DEVICE_DEFAULTS = {
+    "ECE334450058": {"name": "돌봄기기 1", "location": "-", "group": "일반"},
+}
+
+# 기기 종류(kind) — 대시보드가 어느 섹션에 넣을지 판단하는 값.
+# ⚠️ 종류를 SN 모양으로 추측하면 안 된다. ESP32 의 MAC 도 12자리 16진수라
+#    레이더(라닉스)와 생김새가 같아서, 데이터가 도착하기 전에는 구분할 수 없다.
+#    그래서 배정 정보에 kind 를 박아둔다.
+KIND_FSR = "fsr"
+# 자동 등록 상한 — /jy01 은 인증이 없어서, 장난성 요청으로 기기 목록이
+# 무한히 불어나지 않도록 막아둔다. 실제로 늘릴 일이 있으면 이 값을 올리면 된다.
+_FSR_AUTO_REGISTER_LIMIT = 20
 
 # 대상자 그룹 — 여기 리스트에만 추가하면 기기 정보·이전 폼의 선택지와 검증에 자동 반영된다.
 GROUPS = ["일반", "뇌성마비", "척수손상", "근육병", "발달장애"]
@@ -175,19 +195,24 @@ def resolve_assignment(sn, dt):
 def _rebuild_device_info():
     """ASSIGNMENTS 의 활성 배정(end=None)으로 DEVICE_INFO 를 갱신.
     실시간 대시보드 등 '현재' 정보를 쓰는 코드와 호환을 유지한다."""
+    def _entry(a, sn):
+        e = {"name": a.get("user", sn),
+             "location": a.get("location", "-"),
+             "group": a.get("group", "일반")}
+        # kind 는 기기 종류(사용감지 등). 대시보드 섹션 분류에 쓰므로 같이 넘긴다.
+        if a.get("kind"):
+            e["kind"] = a["kind"]
+        return e
+
     new_info = {}
     for a in ASSIGNMENTS:
         sn = a.get("sn")
         if sn and not a.get("end"):
-            new_info[sn] = {"name": a.get("user", sn),
-                            "location": a.get("location", "-"),
-                            "group": a.get("group", "일반")}
+            new_info[sn] = _entry(a, sn)
     for a in ASSIGNMENTS:  # 활성 배정이 없는 기기는 마지막 배정으로
         sn = a.get("sn")
         if sn and sn not in new_info:
-            new_info[sn] = {"name": a.get("user", sn),
-                            "location": a.get("location", "-"),
-                            "group": a.get("group", "일반")}
+            new_info[sn] = _entry(a, sn)
     with _DEVICE_INFO_LOCK:
         DEVICE_INFO.clear()
         DEVICE_INFO.update(new_info)
@@ -215,11 +240,17 @@ def handover(sn, user, location, group, when):
                 if not a.get("end"):
                     a["end"] = when_norm
         new_id = f"{sn}-{count + 1}"
-        ASSIGNMENTS.append({
+        # 기기 종류는 사용자가 바뀌어도 그대로다 — 이전 배정에서 물려받는다.
+        prev_kind = next((a.get("kind") for a in ASSIGNMENTS
+                          if a.get("sn") == sn and a.get("kind")), None)
+        new_entry = {
             "id": new_id, "sn": sn, "user": user,
             "location": location, "group": group,
             "start": when_norm, "end": None,
-        })
+        }
+        if prev_kind:
+            new_entry["kind"] = prev_kind
+        ASSIGNMENTS.append(new_entry)
         _save_assignments()
         _rebuild_assign_index()
     _rebuild_device_info()
@@ -259,6 +290,10 @@ def update_active_assignments(updates):
                 cnt = sum(1 for a in ASSIGNMENTS if a.get("sn") == sn)
                 target = {"id": f"{sn}-{cnt + 1}", "sn": sn,
                           "start": None, "end": None}
+                prev_kind = next((a.get("kind") for a in ASSIGNMENTS
+                                  if a.get("sn") == sn and a.get("kind")), None)
+                if prev_kind:
+                    target["kind"] = prev_kind
                 ASSIGNMENTS.append(target)
             target["user"] = info.get("name", sn)
             target["location"] = info.get("location", "-")
@@ -284,9 +319,10 @@ def invalidate_cache():
 ASSIGNMENTS = _load_assignments()
 _assignments_changed = False
 _assigned_sns = {a.get("sn") for a in ASSIGNMENTS}
-for _sn, _info in _RADAR_DEVICE_DEFAULTS.items():
+for _sn, _info, _kind in ([(s, i, None) for s, i in _RADAR_DEVICE_DEFAULTS.items()]
+                          + [(s, i, KIND_FSR) for s, i in _FSR_DEVICE_DEFAULTS.items()]):
     if _sn not in _assigned_sns:
-        ASSIGNMENTS.append({
+        _entry = {
             "id": f"{_sn}-1",
             "sn": _sn,
             "user": _info.get("name", _sn),
@@ -294,7 +330,11 @@ for _sn, _info in _RADAR_DEVICE_DEFAULTS.items():
             "group": _info.get("group", "일반"),
             "start": None,
             "end": None,
-        })
+        }
+        if _kind:
+            _entry["kind"] = _kind
+        ASSIGNMENTS.append(_entry)
+        _assigned_sns.add(_sn)   # 두 기본값 목록에 같은 SN 이 있어도 중복 등록되지 않게
         _assignments_changed = True
 if _assignments_changed:
     _save_assignments()
@@ -337,6 +377,10 @@ def add_to_storage(storage, sn, ts, dtype, extra):
             default_fields = {
                 "심박수(HR)": None, "호흡수(RR)": None, "활동량(ACT)": None, "상태설명": ""
             }
+        elif dtype == "FSR":
+            # 사용감지 센서는 생체신호를 아예 측정하지 않는다. 사용 여부와 배터리가
+            # 전부라 HR/RR/ACT 칸을 만들지 않는다 (만들면 CSV 에 빈 컬럼만 남는다).
+            default_fields = {"상태설명": ""}
         else:
             default_fields = {
                 "심박수(HR)": None, "호흡수(RR)": None, "활동량(ACT)": None,
@@ -419,6 +463,78 @@ def _store_mckare_record(storage, mck):
     }
 
 
+def _ensure_fsr_device(sn):
+    """FSR 보드가 등록 안 된 SN 으로 데이터를 보내면 배정을 하나 만들어준다.
+
+    이게 없으면 대시보드는 DEVICE_INFO 에 있는 기기만 그리므로,
+    '데이터는 파일에 쌓이는데 화면에는 안 보이는' 상황이 된다.
+    보드 ID 를 바꾸거나 두 번째 보드를 붙일 때 서버를 못 만져도 바로 뜨게 하는 장치.
+    이름은 나중에 /devices 화면에서 편집하면 된다."""
+    if sn in DEVICE_INFO:
+        return
+    # /jy01 은 인증이 없으므로 아무 문자열이나 기기로 만들어주지 않는다.
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,31}", sn):
+        return
+    auto_count = sum(1 for a in ASSIGNMENTS if a.get("auto") == "fsr")
+    if auto_count >= _FSR_AUTO_REGISTER_LIMIT:
+        print(f"[analyzer] FSR 자동 등록 상한({_FSR_AUTO_REGISTER_LIMIT}) 도달 — {sn} 건너뜀", flush=True)
+        return
+    ASSIGNMENTS.append({
+        "id": f"{sn}-1",
+        "sn": sn,
+        "user": f"돌봄기기 {sn}",
+        "location": "-",
+        "group": DEFAULT_GROUP,
+        "start": None,
+        "end": None,
+        "kind": KIND_FSR,    # 대시보드 섹션 분류용 — SN 모양으로 추측하지 않게
+        "auto": "fsr",       # 자동 등록 표시 — 상한 계산에 쓴다
+    })
+    try:
+        _save_assignments()
+    except Exception as e:
+        print(f"[analyzer] FSR 자동 등록 저장 실패({sn}): {e}", flush=True)
+    _rebuild_assign_index()
+    _rebuild_device_info()
+    print(f"[analyzer] FSR 기기 자동 등록: {sn}", flush=True)
+
+
+def _store_fsr_record(storage, fsr):
+    """정규화된 사용감지 센서 1건을 공통 저장소와 연결상태에 반영."""
+    sn = fsr["sn"]
+    ts = fsr["ts"]
+
+    # 남의 기기 SN 을 덮어쓰지 않도록 방어.
+    # /jy01 은 인증이 없어서, 누가 레이더나 Emfit 의 SN 을 deviceId 로 넣어 보내면
+    # 그 기기 카드가 '사용감지'로 뒤바뀔 수 있다. 이미 다른 종류로 등록된 SN 이면 버린다.
+    existing = DEVICE_INFO.get(sn)
+    if existing is not None and existing.get("kind") != KIND_FSR:
+        print(f"[analyzer] FSR 기록 거부 — {sn} 은 이미 다른 종류의 기기로 등록됨", flush=True)
+        return
+
+    _ensure_fsr_device(sn)   # 배정을 먼저 만들어야 add_to_storage 가 이름/위치를 제대로 붙인다
+    add_to_storage(storage, sn, ts, "FSR", {
+        "이벤트": fsr.get("event"),
+        "이벤트설명": fsr.get("event_label"),
+        "사용중": fsr.get("in_use"),
+        "사용시간(ms)": fsr.get("duration_ms"),
+        "배터리(%)": fsr.get("battery_pct"),
+        "배터리(mV)": fsr.get("battery_mv"),
+        "가동시간(ms)": fsr.get("uptime_ms"),
+        "상태설명": f"돌봄기기 {fsr.get('event_label')}",
+    })
+    _device_status[sn] = {
+        # 이벤트 기반이라 '조용함'이 정상이다. 전송이 왔다는 것 자체가 살아있다는 뜻.
+        "connected": True,
+        "status_code": None,
+        "last_seen_ts": int(ts),
+        "status_since_ts": int(ts),
+        "server_received_at": fsr.get("server_received_at"),
+        "source": "fsr",
+        "battery_pct": fsr.get("battery_pct"),
+    }
+
+
 def _process_line(line, storage):
     if not line:
         return
@@ -455,6 +571,12 @@ def _process_line(line, storage):
     mck = parse_mckare_payload(row)
     if mck is not None:
         _store_mckare_record(storage, mck)
+        return
+
+    # ESP32 압력 사용감지 센서 — deviceId + event 조합이라 위 센서들과 겹치지 않는다.
+    fsr = parse_fsr_payload(row)
+    if fsr is not None:
+        _store_fsr_record(storage, fsr)
         return
 
     sn = row.get("device")
@@ -778,6 +900,7 @@ def get_latest_states(jsonl_path):
         return _latest_states_cache["result"]
     latest = {}
     radar_by_model = {}  # {sn: {"bed": 최신기록, "fall": 최신기록}}
+    fsr_in_use = {}      # {sn: 사용/미사용이 확정된 최신 FSR 기록}
     # 최신 상태는 각 기기의 '최근 날짜'에만 있으므로, 전체(수십만 레코드)를 훑지 않고
     # 기기별 최근 며칠 버킷만 스캔한다. (몇 달치 과거는 최신 상태 계산에 무의미)
     # 오래 쉰 기기는 어차피 _device_status(마지막 통신)로 비활성 처리되므로 안전.
@@ -789,7 +912,7 @@ def get_latest_states(jsonl_path):
         for date in sorted(dates, reverse=True)[:RECENT_DAYS]:
             for r in storage[(sn, date)]:
                 dtype = r.get("유형")
-                if dtype not in ("Live", "SleepDetail", "Radar", "McKare"):
+                if dtype not in ("Live", "SleepDetail", "Radar", "McKare", "FSR"):
                     continue
                 if dtype in ("Live", "SleepDetail") and r.get("심박수(HR)") is None:
                     continue
@@ -797,7 +920,16 @@ def get_latest_states(jsonl_path):
                     continue
                 if dtype == "McKare" and r.get("심박수(HR)") is None and r.get("재실코드") is None:
                     continue
+                # FSR 은 생체값이 없으므로 이벤트가 붙어 있으면 유효한 기록으로 본다.
+                if dtype == "FSR" and not r.get("이벤트"):
+                    continue
                 this_key = (r["날짜"], r["시간(KST)"])
+                if dtype == "FSR" and r.get("사용중") is not None:
+                    # 생존신고(keep-alive)가 마지막이어도 '지금 사용 중인지'를 잃지 않도록
+                    # 사용/미사용이 확정된 기록을 따로 기억해둔다.
+                    cur_p = fsr_in_use.get(sn)
+                    if cur_p is None or this_key >= (cur_p["날짜"], cur_p["시간(KST)"]):
+                        fsr_in_use[sn] = r
                 if dtype == "Radar":
                     # BED/FALL 을 따로 모아두고 아래에서 합친다.
                     # (안 그러면 1초마다 오는 FALL 이 BED 의 심박·호흡을 영영 덮어씀)
@@ -816,6 +948,14 @@ def get_latest_states(jsonl_path):
     for sn, slot in radar_by_model.items():
         merged = _merge_radar_states(slot.get("bed"), slot.get("fall"))
         if merged is not None:
+            latest[sn] = merged
+    for sn, rec in fsr_in_use.items():
+        cur = latest.get(sn)
+        # 마지막 기록이 사용 여부를 모르는 이벤트(생존신고 등)면 직전 확정값을 채워 넣는다.
+        if cur is not None and cur.get("유형") == "FSR" and cur.get("사용중") is None:
+            merged = dict(cur)
+            merged["사용중"] = rec.get("사용중")
+            merged["사용판정시각"] = f"{rec['날짜']} {rec['시간(KST)']}"
             latest[sn] = merged
     _latest_states_cache["key"] = cache_key
     _latest_states_cache["result"] = latest
