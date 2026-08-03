@@ -26,11 +26,15 @@ _DEFAULT_DEVICE_INFO = {
     "EMFIT-DEMO-03": {"name": "사용자-C", "location": "A시설", "group": "일반"},
     "EMFIT-DEMO-04": {"name": "사용자-D", "location": "사용자-D님 가정", "group": "뇌성마비"},
     "EMFIT-DEMO-05": {"name": "사용자E", "location": "301호", "group": "일반"},
-    "A1B2C3D4E5F6": {"name": "AI Radar", "location": "-", "group": "일반"},
+    # AI Radar(라닉스 RMR602A). 2026-08-03 기기 교체로 MAC 변경:
+    # A1B2C3D4E5F6 → A1B2C3D4E5F7 (같은 OUI A1:B2:C3 = 라닉스).
+    # 옛 기기는 제조사가 사용 권장을 중단했고 실제 수신 데이터도 없어서 정리한다
+    # (아래 _RETIRED_SNS 참고).
+    "A1B2C3D4E5F7": {"name": "AI Radar", "location": "-", "group": "일반"},
 }
 
 _RADAR_DEVICE_DEFAULTS = {
-    "A1B2C3D4E5F6": _DEFAULT_DEVICE_INFO["A1B2C3D4E5F6"],
+    "A1B2C3D4E5F7": _DEFAULT_DEVICE_INFO["A1B2C3D4E5F7"],
 }
 
 # ESP32 압력 사용감지 센서(돌봄기기에 부착) — 알려진 기기는 여기에 적어두면
@@ -40,6 +44,18 @@ _RADAR_DEVICE_DEFAULTS = {
 # (fsr_parser._device_id 가 그렇게 정규화한다).
 _FSR_DEVICE_DEFAULTS = {
     "B1C2D3E4F5A6": {"name": "돌봄기기 1", "location": "-", "group": "일반"},
+}
+
+# ── 퇴역 기기 정리 (1회성 마이그레이션) ─────────────────────────────
+# 교체·철거된 기기의 '기본 등록'을 배정 목록에서 뺀다. 기본 등록은 서버가 자동으로
+# 넣어준 자리라, 안 쓰게 되면 대시보드에 빈 카드로 계속 남는 게 오히려 헷갈린다.
+#
+# ⚠️ 단, 사람이 손댄 흔적이 있으면 절대 건드리지 않는다 (아래 _is_untouched_default).
+#    이름·위치를 고쳤거나 배정 이력이 갈라졌다면 그건 사람이 의미를 부여한 기록이고,
+#    코드가 임의로 지울 대상이 아니다. 그 경우엔 화면에 남고 사용자가 직접 정리하면 된다.
+_RETIRED_SNS = {
+    # 2026-08-03 AI Radar 교체 — 제조사 사용 권장 중단. 수신 데이터 없었음.
+    "A1B2C3D4E5F6": "AI Radar",
 }
 
 # 기기 종류(kind) — 대시보드가 어느 섹션에 넣을지 판단하는 값.
@@ -318,6 +334,27 @@ def invalidate_cache():
 # ── 모듈 초기화: 배정 이력 로드 후 DEVICE_INFO 동기화 ──
 ASSIGNMENTS = _load_assignments()
 _assignments_changed = False
+
+
+def _is_untouched_default(entry, sn, seeded_name):
+    """서버가 자동으로 넣어준 기본 등록 그대로인지 (사람이 손대지 않았는지)."""
+    return (entry.get("id") == f"{sn}-1"
+            and entry.get("user") == seeded_name
+            and entry.get("location") in ("-", None, "")
+            and not entry.get("start")
+            and not entry.get("end"))
+
+
+for _sn, _seeded_name in _RETIRED_SNS.items():
+    _rows = [a for a in ASSIGNMENTS if a.get("sn") == _sn]
+    if len(_rows) == 1 and _is_untouched_default(_rows[0], _sn, _seeded_name):
+        ASSIGNMENTS.remove(_rows[0])
+        _assignments_changed = True
+        print(f"[analyzer] 퇴역 기기 정리: {_sn} ({_seeded_name}) — 기본 등록 상태라 목록에서 제거", flush=True)
+    elif _rows:
+        print(f"[analyzer] 퇴역 기기 {_sn} 은 수정 이력이 있어 그대로 둔다 "
+              f"— 필요하면 /devices 에서 직접 정리", flush=True)
+
 _assigned_sns = {a.get("sn") for a in ASSIGNMENTS}
 for _sn, _info, _kind in ([(s, i, None) for s, i in _RADAR_DEVICE_DEFAULTS.items()]
                           + [(s, i, KIND_FSR) for s, i in _FSR_DEVICE_DEFAULTS.items()]):
