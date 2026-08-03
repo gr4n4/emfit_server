@@ -8,7 +8,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.6.0"
+VERSION = "3.7.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -38,8 +38,13 @@ _view_tokens_lock = threading.Lock()
 _feedback_lock = threading.Lock()
 _prefs_lock = threading.Lock()
 
-# 기기별 페이지 블록 순서의 기본값 (수면요약 → HR → RR → ACT)
-DEFAULT_BLOCK_ORDER = ["summary", "hr", "rr", "act"]
+# 상세페이지 블록의 기본 순서.
+# '얼마나 오래'(재실·자세별·사용 시간)를 맨 위에 둔다 — 화면을 열자마자 제일 먼저
+# 알고 싶은 게 그 값이고, 그래프는 그 뒤를 뒷받침하는 근거이기 때문.
+# ※ 이미 순서를 바꿔 저장한 사용자는 그 순서가 유지되고, 새 블록만 뒤에 붙는다.
+#    (사람이 정한 배치를 코드가 되돌리지 않는다. 원하면 화면에서 다시 끌어 올리면 됨)
+DEFAULT_BLOCK_ORDER = ["occupancy", "postures", "presence", "usage", "daily",
+                       "summary", "hr", "rr", "act", "posture", "temp"]
 
 # 기기 종류마다 상세페이지에 넣을 블록이 다르다.
 # 안 재는 값을 빈 그래프로 그려두면 "고장인가?" 하고 헷갈리므로 아예 만들지 않는다.
@@ -47,15 +52,17 @@ DEFAULT_BLOCK_ORDER = ["summary", "hr", "rr", "act"]
 #   radar  : 심박 + 호흡 + 자세  (활동량·수면요약은 레이더가 측정하지 않음)
 #   mckare : 심박 + 호흡 + 체온  (체온은 McKare 만 잰다)
 #   fsr    : 사용구간 + 일별 사용시간 (생체신호를 아예 재지 않음)
+#   occupancy/postures/presence : '얼마나 오래' 통계 (재실 시간·자세별 시간·구간 재실)
 DEVICE_BLOCKS = {
-    "emfit":  ["summary", "hr", "rr", "act"],
-    "radar":  ["hr", "rr", "posture"],
-    "mckare": ["hr", "rr", "temp"],
+    "emfit":  ["occupancy", "summary", "hr", "rr", "act"],
+    "radar":  ["postures", "hr", "rr", "posture"],
+    "mckare": ["presence", "hr", "rr", "temp"],
     "fsr":    ["usage", "daily"],
 }
 # 블록 순서 환경설정에서 허용하는 전체 블록 목록 (viewer 단위라 기기 종류와 무관하게 저장됨).
 # 화면에 없는 블록 id 는 프런트에서 그냥 무시되므로 한 목록으로 관리해도 안전하다.
-ALL_BLOCK_IDS = ["summary", "hr", "rr", "act", "posture", "temp", "usage", "daily"]
+ALL_BLOCK_IDS = ["occupancy", "postures", "presence", "summary",
+                 "hr", "rr", "act", "posture", "temp", "usage", "daily"]
 
 # 일별 사용시간 그래프에 보여줄 최근 날짜 수
 FSR_DAILY_DAYS = 14
@@ -1849,6 +1856,42 @@ def _fsr_intervals(events, win_start, win_end, now_ts):
     return intervals
 
 
+# 기기마다 측정 간격이 달라, 이 시간보다 크게 벌어지면 '그동안 기록이 없다'로 보고 구간을 끊는다.
+# 너무 크게 잡으면 꺼져 있던 시간까지 재실로 세고, 너무 작으면 구간이 잘게 쪼개진다.
+_BAND_GAP_SEC = {"emfit": 300, "radar": 120, "mckare": 300}
+
+
+def _sampled_bands(samples, max_gap_sec, win_end):
+    """[(epoch, 라벨)] 시간순 → 같은 라벨이 이어지는 구간 목록.
+
+    Emfit·레이더·McKare 는 이벤트가 아니라 '주기적으로 찍히는 값'이라
+    각 표본이 다음 표본까지의 시간을 대표한다고 보고 길이를 매긴다.
+    마지막 표본이나 간격이 벌어진 표본은 max_gap_sec 까지만 인정한다."""
+    bands = []
+    n = len(samples)
+    for i, (t, lab) in enumerate(samples):
+        if lab is None:
+            continue
+        nxt = samples[i + 1][0] if i + 1 < n else win_end
+        end = min(nxt, t + max_gap_sec)
+        if end <= t:
+            continue
+        if bands and bands[-1]["label"] == lab and bands[-1]["end"] >= t - 1:
+            bands[-1]["end"] = max(bands[-1]["end"], end)   # 이어지는 같은 상태는 합친다
+        else:
+            bands.append({"label": lab, "start": int(t), "end": int(end)})
+    return bands
+
+
+def _band_totals(bands):
+    """구간 목록 → {라벨: 총 초}, 그리고 라벨별 등장 횟수."""
+    secs, cnt = {}, {}
+    for b in bands:
+        secs[b["label"]] = secs.get(b["label"], 0) + (b["end"] - b["start"])
+        cnt[b["label"]] = cnt.get(b["label"], 0) + 1
+    return secs, cnt
+
+
 def _fsr_daily_totals(sn, aid, dates, tz=KST):
     """날짜별 총 사용시간(초). dates 는 'YYYY-MM-DD' 목록(최신순)."""
     out = []
@@ -2016,6 +2059,9 @@ def api_device_timeseries(
                 pos = row.get("자세(POS)")
                 pt["pos"] = int(pos) if isinstance(pos, (int, float)) and pd.notna(pos) else None
                 pt["posture"] = str(row.get("자세")) if row.get("자세") is not None else None
+                # McKare 재실/부재 라벨 (구간 재실 시간 계산용)
+                pres = row.get("재실")
+                pt["presence"] = str(pres) if isinstance(pres, str) and pres else None
                 points.append(pt)
 
     # 시간 순 정렬 (multi-day 합쳤을 때 필수)
@@ -2039,6 +2085,28 @@ def api_device_timeseries(
                                    now_ts)
         daily = _fsr_daily_totals(sn, target_id, available_for_sn[:FSR_DAILY_DAYS])
 
+    # ── 기기별 '얼마나 오래' 통계 ───────────────────────────────────
+    # Emfit  : 침대 재실 시간 (움직임 0 이면 매트 위에 사람이 없다고 본다)
+    # Radar  : 자세별 시간
+    # McKare : 구간 재실 시간
+    win_end = edt_obj.timestamp() if edt_obj else datetime.now().timestamp()
+    kind = _detail_kind(sn)
+    bands, band_secs, band_counts = [], {}, {}
+    if points:
+        gap = _BAND_GAP_SEC.get(kind, 300)
+        if kind == "emfit":
+            samples = [(p["epoch"], ("재실" if (p.get("act") or 0) >= 1 else "이탈"))
+                       for p in points if p.get("act") is not None]
+        elif kind == "radar":
+            samples = [(p["epoch"], p.get("posture")) for p in points if p.get("posture")]
+        elif kind == "mckare":
+            samples = [(p["epoch"], p.get("presence")) for p in points if p.get("presence")]
+        else:
+            samples = []
+        if samples:
+            bands = _sampled_bands(samples, gap, win_end)
+            band_secs, band_counts = _band_totals(bands)
+
     return {
         "device": sn,
         "name": disp_name,
@@ -2053,6 +2121,11 @@ def api_device_timeseries(
         "fsr_daily": daily,
         "fsr_battery": [{"epoch": e["epoch"], "pct": e["battery"]}
                         for e in fsr_events if e.get("battery") is not None],
+        # 기기별 '얼마나 오래' — 재실 시간 / 자세별 시간 / 구간 재실
+        "kind": kind,
+        "bands": bands,
+        "band_seconds": band_secs,
+        "band_counts": band_counts,
     }
 
 
@@ -2109,6 +2182,24 @@ _DETAIL_BLOCK_DEFS = {
     "daily":   ("📊 일별 사용시간",
                 '<div class="daily-wrap"><canvas id="chart-daily"></canvas></div>',
                 "최근 기록이 있는 날짜 기준"),
+    # ── '얼마나 오래' 통계 — 띠 + 항목별 시간 막대 (같은 틀을 셋이 공유) ──
+    "occupancy": ("🛏️ 침대 재실 시간",
+                  '<div id="occupancy-total" class="band-total"></div>'
+                  '<div id="occupancy-bar" class="band-bar"></div>'
+                  '<div id="occupancy-ticks" class="band-ticks"></div>'
+                  '<div id="occupancy-legend" class="band-legend"></div>'
+                  '<p class="band-note">움직임(ACT)이 0이면 매트 위에 사람이 없는 것으로 보고 '
+                  '<b>이탈</b>로 계산합니다.</p>', ""),
+    "postures":  ("🧭 자세별 시간",
+                  '<div id="postures-total" class="band-total"></div>'
+                  '<div id="postures-bar" class="band-bar"></div>'
+                  '<div id="postures-ticks" class="band-ticks"></div>'
+                  '<div id="postures-legend" class="band-legend"></div>', ""),
+    "presence":  ("📍 구간 재실 시간",
+                  '<div id="presence-total" class="band-total"></div>'
+                  '<div id="presence-bar" class="band-bar"></div>'
+                  '<div id="presence-ticks" class="band-ticks"></div>'
+                  '<div id="presence-legend" class="band-legend"></div>', ""),
 }
 
 
@@ -2268,6 +2359,33 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                               color: #546e7a; padding: 5px 2px; border-bottom: 1px solid #eceff1; }}
                 .usage-row .dur {{ font-weight: bold; color: #00695c; }}
                 .daily-wrap {{ position: relative; height: 220px; }}
+                /* ── '얼마나 오래' 통계 (재실·자세별·구간 재실 공용) ── */
+                .band-total {{ font-size: 1.05em; color: #37474f; margin-bottom: 12px; }}
+                .band-total b {{ color: #1a73e8; font-size: 1.15em; }}
+                .band-bar {{ position: relative; height: 30px; background: #eceff1;
+                             border-radius: 6px; overflow: hidden; }}
+                .band-bar i {{ position: absolute; top: 0; bottom: 0; min-width: 1px; }}
+                .band-ticks {{ position: relative; height: 18px; margin-top: 4px; }}
+                .band-ticks span {{ position: absolute; transform: translateX(-50%);
+                                    font-size: 0.68em; color: #90a4ae; white-space: nowrap; }}
+                .band-legend {{ margin-top: 14px; }}
+                .band-row {{ display: grid; grid-template-columns: 90px 1fr 62px 40px 44px;
+                             align-items: center; gap: 8px; padding: 5px 0; font-size: 0.85em; }}
+                .band-row .bl {{ display: flex; align-items: center; gap: 7px;
+                                 font-weight: bold; color: #37474f; }}
+                .band-row .bl i {{ width: 11px; height: 11px; border-radius: 3px; flex: none; }}
+                .band-row .bt {{ position: relative; height: 9px; border-radius: 999px;
+                                 background: #eceff1; overflow: hidden; }}
+                .band-row .bt i {{ position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; }}
+                .band-row .bv {{ text-align: right; font-weight: bold; color: #455a64; }}
+                .band-row .bp {{ text-align: right; color: #90a4ae; }}
+                .band-row .bn {{ text-align: right; color: #b0bec5; font-size: 0.92em; }}
+                .band-note {{ margin: 12px 0 0; font-size: 0.78em; color: #90a4ae; line-height: 1.5; }}
+                .band-note b {{ color: #607d8b; }}
+                @media (max-width: 560px) {{
+                    .band-row {{ grid-template-columns: 76px 1fr 58px 36px; }}
+                    .band-row .bn {{ display: none; }}
+                }}
                 .drag-handle:active {{ cursor: grabbing; }}
                 .chart-scroll {{ width: 100%; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }}
                 .chart-canvas-wrap {{ position: relative; height: 180px; }}
@@ -2364,6 +2482,9 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                 let lastSummaries = [];
                 let lastIntervals = [];
                 let lastDaily = [];
+                let lastBands = [];
+                let lastBandSecs = {{}};
+                let lastBandCounts = {{}};
 
                 // ─ 5분 단위 강제 스냅 ─
                 function snapTo5Min(dtLocal) {{
@@ -2494,6 +2615,77 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                             }}
                         }}
                     }});
+                }}
+
+                // ─ '얼마나 오래' 통계 (재실 시간 / 자세별 시간 / 구간 재실) ─
+                // 셋 다 "상태가 이어진 구간"이라 같은 틀로 그린다.
+                const BAND_COLORS = {{
+                    '재실': '#1a73e8', '이탈': '#cfd8dc', '부재': '#cfd8dc',
+                    '누움': '#3f7fd6', '오래누움': '#3f7fd6', '뒤척임': '#3fa88f',
+                    '앉음': '#e2b52f', '걸터앉음': '#df6b3b', '배회': '#e8933c',
+                    '낙상': '#d6455a', '자리비움': '#b0bec5', '감지 대기': '#cfd8dc',
+                }};
+                // 이 상태들은 '있는 시간'이 아니라 '없는 시간' — 합계에서 뺀다
+                const BAND_AWAY = ['이탈', '부재', '자리비움', '감지 대기'];
+
+                function renderBands(blockId) {{
+                    const bar = document.getElementById(blockId + '-bar');
+                    if (!bar) return;
+                    const ticks = document.getElementById(blockId + '-ticks');
+                    const legend = document.getElementById(blockId + '-legend');
+                    const totalEl = document.getElementById(blockId + '-total');
+                    const x0 = new Date(document.getElementById('dt-start').value).getTime() / 1000;
+                    const x1 = new Date(document.getElementById('dt-end').value).getTime() / 1000;
+                    const span = Math.max(1, x1 - x0);
+
+                    if (!lastBands.length) {{
+                        totalEl.innerHTML = '<span style="color:#90a4ae;">이 기간에 기록이 없습니다.</span>';
+                        bar.innerHTML = ''; ticks.innerHTML = ''; legend.innerHTML = '';
+                        return;
+                    }}
+
+                    bar.innerHTML = lastBands.map(b => {{
+                        const l = ((b.start - x0) / span) * 100;
+                        const w = ((b.end - b.start) / span) * 100;
+                        const c = BAND_COLORS[b.label] || '#90a4ae';
+                        const tip = `${{b.label}} · ${{fmtClock(b.start)}}~${{fmtClock(b.end)}} (${{fmtDur(b.end - b.start)}})`;
+                        return `<i style="left:${{Math.max(0, l)}}%; width:${{Math.max(0.2, w)}}%; background:${{c}}" title="${{tip}}"></i>`;
+                    }}).join('');
+
+                    // 눈금
+                    const stepH = (span / 3600) <= 8 ? 1 : ((span / 3600) <= 26 ? 3 : 12);
+                    let t = Math.ceil(x0 / (stepH * 3600)) * (stepH * 3600);
+                    let th = '';
+                    for (; t <= x1; t += stepH * 3600) {{
+                        th += `<span style="left:${{((t - x0) / span) * 100}}%">${{fmtClock(t)}}</span>`;
+                    }}
+                    ticks.innerHTML = th;
+
+                    // 항목별 시간 — 긴 것부터
+                    const rows = Object.entries(lastBandSecs).sort((a, b) => b[1] - a[1]);
+                    const grand = rows.reduce((a, r) => a + r[1], 0) || 1;
+                    legend.innerHTML = rows.map(([label, sec]) => {{
+                        const pct = (sec / grand) * 100;
+                        const c = BAND_COLORS[label] || '#90a4ae';
+                        const n = lastBandCounts[label] || 0;
+                        return `<div class="band-row">
+                            <span class="bl"><i style="background:${{c}}"></i>${{label}}</span>
+                            <span class="bt"><i style="width:${{pct}}%; background:${{c}}"></i></span>
+                            <span class="bv">${{fmtDur(sec)}}</span>
+                            <span class="bp">${{pct.toFixed(0)}}%</span>
+                            <span class="bn">${{n}}회</span>
+                        </div>`;
+                    }}).join('');
+
+                    // 머리말 — '있는 시간'만 합쳐서 보여준다
+                    const present = rows.filter(r => !BAND_AWAY.includes(r[0]))
+                                        .reduce((a, r) => a + r[1], 0);
+                    const awayCnt = rows.filter(r => BAND_AWAY.includes(r[0]))
+                                        .reduce((a, r) => a + (lastBandCounts[r[0]] || 0), 0);
+                    const label = (blockId === 'occupancy') ? '침대 재실'
+                                : (blockId === 'presence') ? '재실' : '측정된 시간';
+                    totalEl.innerHTML = `${{label}} <b>${{fmtDur(present)}}</b>`
+                        + (awayCnt ? ` · 자리 비움 ${{awayCnt}}회` : '');
                 }}
 
                 // ─ 사용 구간 띠 ─
@@ -2654,9 +2846,15 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                         lastPoints = d.points || [];
                         lastIntervals = d.fsr_intervals || [];
                         lastDaily = d.fsr_daily || [];
+                        lastBands = d.bands || [];
+                        lastBandSecs = d.band_seconds || {{}};
+                        lastBandCounts = d.band_counts || {{}};
                         if (BLOCK_IDS.includes('summary')) renderSummary();
                         if (BLOCK_IDS.includes('usage')) renderUsage();
                         if (BLOCK_IDS.includes('daily')) renderDaily();
+                        for (const b of ['occupancy', 'postures', 'presence']) {{
+                            if (BLOCK_IDS.includes(b)) renderBands(b);
+                        }}
 
                         // 사용감지 기기는 '측정값 개수'가 아니라 사용 횟수로 안내한다
                         const statusEl = document.getElementById('data-status');
