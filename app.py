@@ -534,9 +534,11 @@ def _fsr_status(state, ds, now_ts):
     if st.get("센서이상") or d.get("fault"):
         return _FSR_CHECK + ("압력 센서 연결 확인",)
 
-    # 근거 2 — 배터리가 바닥
+    # 근거 2 — 배터리가 바닥.
+    # 범위 밖(음수 등)은 '측정 불가'라는 뜻이지 방전이 아니다. 배터리 측정 회로가 없는
+    # 보드는 -1 을 보내는데, 이걸 0% 로 읽으면 멀쩡한 센서가 '확인 필요'로 뜬다.
     batt = st.get("배터리(%)")
-    if isinstance(batt, (int, float)) and batt <= FSR_BATT_CRITICAL:
+    if isinstance(batt, (int, float)) and 0 <= batt <= FSR_BATT_CRITICAL:
         return _FSR_CHECK + (f"배터리 소진 ({int(batt)}%)",)
 
     # 근거 3 — 생존신고를 보내는 보드인데 그마저 끊긴 경우.
@@ -557,9 +559,9 @@ def _fsr_status(state, ds, now_ts):
 
 
 def _fsr_battery_html(state):
-    """배터리 잔량 표시. 값이 없으면 빈 문자열."""
+    """배터리 잔량 표시. 값이 없거나 범위 밖(측정 불가)이면 빈 문자열."""
     pct = (state or {}).get("배터리(%)")
-    if not isinstance(pct, (int, float)):
+    if not isinstance(pct, (int, float)) or not (0 <= pct <= 100):
         return ""
     pct = int(pct)
     if pct <= FSR_BATT_LOW:
