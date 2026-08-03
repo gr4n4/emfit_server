@@ -8,7 +8,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.5.1"
+VERSION = "3.6.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -40,6 +40,25 @@ _prefs_lock = threading.Lock()
 
 # 기기별 페이지 블록 순서의 기본값 (수면요약 → HR → RR → ACT)
 DEFAULT_BLOCK_ORDER = ["summary", "hr", "rr", "act"]
+
+# 기기 종류마다 상세페이지에 넣을 블록이 다르다.
+# 안 재는 값을 빈 그래프로 그려두면 "고장인가?" 하고 헷갈리므로 아예 만들지 않는다.
+#   emfit  : 수면요약 + 심박 + 호흡 + 활동량 (기존 그대로)
+#   radar  : 심박 + 호흡 + 자세  (활동량·수면요약은 레이더가 측정하지 않음)
+#   mckare : 심박 + 호흡 + 체온  (체온은 McKare 만 잰다)
+#   fsr    : 사용구간 + 일별 사용시간 (생체신호를 아예 재지 않음)
+DEVICE_BLOCKS = {
+    "emfit":  ["summary", "hr", "rr", "act"],
+    "radar":  ["hr", "rr", "posture"],
+    "mckare": ["hr", "rr", "temp"],
+    "fsr":    ["usage", "daily"],
+}
+# 블록 순서 환경설정에서 허용하는 전체 블록 목록 (viewer 단위라 기기 종류와 무관하게 저장됨).
+# 화면에 없는 블록 id 는 프런트에서 그냥 무시되므로 한 목록으로 관리해도 안전하다.
+ALL_BLOCK_IDS = ["summary", "hr", "rr", "act", "posture", "temp", "usage", "daily"]
+
+# 일별 사용시간 그래프에 보여줄 최근 날짜 수
+FSR_DAILY_DAYS = 14
 
 # Emfit 데이터는 모두 KST 기준으로 저장됨 (analyzer가 UTC → Asia/Seoul 변환).
 # 프런트는 datetime-local로 KST 시각을 입력하고, 그대로 KST aware datetime으로 해석.
@@ -1726,10 +1745,11 @@ def api_get_block_order(request: Request):
         raise HTTPException(status_code=401, detail="login required")
     prefs = _load_preferences()
     order = (prefs.get(vid) or {}).get("block_order") or DEFAULT_BLOCK_ORDER
-    # 알려진 블록만 남기고 누락분 뒤에 채워서 신뢰 가능한 순서 보장
-    known = set(DEFAULT_BLOCK_ORDER)
+    # 알려진 블록만 남기고 누락분 뒤에 채워서 신뢰 가능한 순서 보장.
+    # 화면에 없는 블록 id 가 섞여 있어도 프런트가 무시하므로 문제되지 않는다.
+    known = set(ALL_BLOCK_IDS)
     cleaned = [b for b in order if b in known]
-    for b in DEFAULT_BLOCK_ORDER:
+    for b in ALL_BLOCK_IDS:
         if b not in cleaned:
             cleaned.append(b)
     return {"order": cleaned}
@@ -1748,12 +1768,12 @@ async def api_set_block_order(request: Request):
     order = body.get("order")
     if not isinstance(order, list) or not order:
         raise HTTPException(status_code=400, detail="order must be non-empty list")
-    known = set(DEFAULT_BLOCK_ORDER)
+    known = set(ALL_BLOCK_IDS)
     cleaned = [b for b in order if isinstance(b, str) and b in known]
     if not cleaned:
         raise HTTPException(status_code=400, detail="no valid blocks in order")
-    # 누락된 기본 블록은 뒤에 채움
-    for b in DEFAULT_BLOCK_ORDER:
+    # 누락된 블록은 뒤에 채움 (다른 기기 종류의 블록도 순서를 잃지 않도록)
+    for b in ALL_BLOCK_IDS:
         if b not in cleaned:
             cleaned.append(b)
     prefs = _load_preferences()
@@ -1781,6 +1801,96 @@ def _resolve_device_stint(sn, assignment, is_admin):
         if st and st.get("sn") == sn:
             return st
     return _active_assignment(sn)
+
+
+def _fsr_intervals(events, win_start, win_end, now_ts):
+    """사용감지 이벤트 목록 → '언제부터 언제까지 썼는지' 구간 목록.
+
+    events: [{"epoch": int, "in_use": True/False/None, "used_sec": float|None}, ...] 시간순.
+    win_start/win_end: 보고 있는 시간 범위(epoch). 구간은 이 안으로 잘린다.
+
+    까다로운 경우를 다룬다:
+      · 사용 시작만 있고 종료가 없음 → 아직 쓰는 중. now(또는 범위 끝)까지로 본다.
+      · 종료만 있고 시작이 없음     → 범위 이전부터 쓰고 있었다는 뜻.
+                                     보드가 준 사용시간(used_sec)으로 시작 시각을 역산한다.
+      · 생존신고 등 상태를 모르는 이벤트는 무시 (in_use is None)."""
+    intervals = []
+    open_at = None
+    last_end = win_start          # 이미 집계한 구간의 끝 — 겹쳐서 이중 계산되지 않게
+    for ev in events:
+        in_use = ev.get("in_use")
+        if in_use is None:
+            continue
+        ep = ev["epoch"]
+        if in_use:
+            if open_at is None:
+                open_at = ep
+            # 이미 열려 있으면 중복 press — 무시 (먼저 것을 시작으로 유지)
+        else:
+            if open_at is not None:
+                start = open_at
+            else:
+                # 시작을 못 본 종료 — 범위 이전부터 썼거나, 시작 신호가 유실된 경우.
+                # 보드가 준 사용시간으로 역산하고, 없으면 알 수 없으므로
+                # 직전 구간이 끝난 시점부터로 본다(가장 보수적이고 겹치지 않는 선택).
+                used = ev.get("used_sec")
+                start = (ep - used) if isinstance(used, (int, float)) and used > 0 else last_end
+            s = max(start, win_start, last_end)
+            if ep > s:
+                intervals.append({"start": int(s), "end": int(ep), "ongoing": False})
+                last_end = ep
+            open_at = None
+
+    if open_at is not None:                      # 아직 사용 중
+        end = min(win_end, now_ts)
+        s = max(open_at, win_start)
+        if end > s:
+            intervals.append({"start": int(s), "end": int(end), "ongoing": True})
+    return intervals
+
+
+def _fsr_daily_totals(sn, aid, dates, tz=KST):
+    """날짜별 총 사용시간(초). dates 는 'YYYY-MM-DD' 목록(최신순)."""
+    out = []
+    # 아직 사용 중인 세션은 '지금'까지만 센다. 자정까지로 계산하면 오늘 사용시간이 부풀어 오른다.
+    now_ts = datetime.now().timestamp()
+    for d in dates:
+        try:
+            df = analyzer.get_report_df(DATA_FILES, d, sn, assignment_id=aid)
+        except Exception:
+            continue
+        if df is None or df.empty or "사용중" not in df.columns:
+            continue
+        try:
+            day0 = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=tz)
+        except Exception:
+            continue
+        day_start = day0.timestamp()
+        day_end = day_start + 24 * 3600
+        events = []
+        for _, row in df.iterrows():
+            if row.get("유형") != "FSR":
+                continue
+            t = row.get("시간(KST)")
+            if not isinstance(t, str) or len(t) < 8:
+                continue
+            try:
+                ep = datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz).timestamp()
+            except Exception:
+                continue
+            iu = row.get("사용중")
+            used = row.get("사용시간(ms)")
+            events.append({
+                "epoch": ep,
+                "in_use": bool(iu) if isinstance(iu, (bool, int, float)) and pd.notna(iu) else None,
+                "used_sec": float(used) / 1000 if isinstance(used, (int, float)) and pd.notna(used) else None,
+            })
+        events.sort(key=lambda e: e["epoch"])
+        total = sum(i["end"] - i["start"]
+                    for i in _fsr_intervals(events, day_start, day_end, now_ts))
+        out.append({"date": d, "seconds": int(total)})
+    out.reverse()                                 # 오래된 → 최신 (그래프 x축 순서)
+    return out
 
 
 @app.get("/api/device/{sn}/timeseries")
@@ -1845,6 +1955,7 @@ def api_device_timeseries(
 
     points = []
     summaries = []
+    fsr_events = []
     if _has_data():
         for d in dates_to_load:
             try:
@@ -1881,10 +1992,30 @@ def api_device_timeseries(
                         summaries.append(s)
                     continue
 
+                if rtype == "FSR":
+                    # 사용감지는 값이 아니라 '이벤트'라서 꺾은선 점으로 만들지 않는다.
+                    # 아래에서 사용 구간(띠)으로 변환한다.
+                    iu = row.get("사용중")
+                    used = row.get("사용시간(ms)")
+                    batt = row.get("배터리(%)")
+                    fsr_events.append({
+                        "epoch": epoch,
+                        "in_use": bool(iu) if isinstance(iu, (bool, int, float)) and pd.notna(iu) else None,
+                        "used_sec": float(used) / 1000 if isinstance(used, (int, float)) and pd.notna(used) else None,
+                        "event": row.get("이벤트"),
+                        "battery": float(batt) if isinstance(batt, (int, float)) and pd.notna(batt) else None,
+                    })
+                    continue
+
                 pt = {"time": t, "date": d, "epoch": epoch, "type": rtype}
-                for k, jk in [("심박수(HR)", "hr"), ("호흡수(RR)", "rr"), ("활동량(ACT)", "act")]:
+                for k, jk in [("심박수(HR)", "hr"), ("호흡수(RR)", "rr"), ("활동량(ACT)", "act"),
+                              ("체온", "temp")]:
                     v = row.get(k)
                     pt[jk] = float(v) if isinstance(v, (int, float)) and pd.notna(v) else None
+                # 레이더 자세 — 숫자 코드와 한글 라벨 둘 다 (그래프는 코드, 툴팁은 라벨)
+                pos = row.get("자세(POS)")
+                pt["pos"] = int(pos) if isinstance(pos, (int, float)) and pd.notna(pos) else None
+                pt["posture"] = str(row.get("자세")) if row.get("자세") is not None else None
                 points.append(pt)
 
     # 시간 순 정렬 (multi-day 합쳤을 때 필수)
@@ -1897,6 +2028,17 @@ def api_device_timeseries(
         return (total, s.get("__epoch__") or 0)
     summaries.sort(key=_summary_key)
 
+    # 사용감지 — 이벤트를 '사용 구간'으로 바꾸고, 최근 며칠치 일별 합계도 같이 준다.
+    fsr_events.sort(key=lambda e: e["epoch"])
+    intervals, daily = [], []
+    if fsr_events or (info and _is_fsr_device(sn)):
+        now_ts = datetime.now().timestamp()
+        intervals = _fsr_intervals(fsr_events,
+                                   sdt_obj.timestamp() if sdt_obj else 0,
+                                   edt_obj.timestamp() if edt_obj else now_ts,
+                                   now_ts)
+        daily = _fsr_daily_totals(sn, target_id, available_for_sn[:FSR_DAILY_DAYS])
+
     return {
         "device": sn,
         "name": disp_name,
@@ -1907,7 +2049,73 @@ def api_device_timeseries(
         "available_dates": available_for_sn,
         "points": points,
         "summaries": summaries,
+        "fsr_intervals": intervals,
+        "fsr_daily": daily,
+        "fsr_battery": [{"epoch": e["epoch"], "pct": e["battery"]}
+                        for e in fsr_events if e.get("battery") is not None],
     }
+
+
+def _detail_kind(sn):
+    """상세페이지에서 쓸 기기 종류. 대시보드 카드와 같은 판정을 재사용한다."""
+    ds = analyzer.get_device_statuses().get(sn)
+    state = None
+    if _has_data():
+        try:
+            state = analyzer.get_latest_states(DATA_FILES).get(sn)
+        except Exception:
+            pass
+    return _v2_kind(sn, state, ds)
+
+
+# 블록 한 장을 그리는 틀. (큰 f-string 밖에서 만들어 중괄호 이스케이프를 피한다)
+def _detail_block(bid, title, body, hint=""):
+    hint_html = f'<div class="chart-hint">{hint}</div>' if hint else ""
+    return f"""
+                    <div class="block-card" data-block-id="{bid}">
+                        <div class="block-header">
+                            <h3>{title}</h3>
+                            <div class="block-actions">
+                                <button class="arrow-btn" data-arrow="up" title="위로 이동">▲</button>
+                                <button class="arrow-btn" data-arrow="down" title="아래로 이동">▼</button>
+                                <span class="drag-handle" title="드래그해서 이동">⋮⋮</span>
+                            </div>
+                        </div>
+                        {body}{hint_html}
+                    </div>"""
+
+
+def _chart_body(key):
+    return (f'<div class="chart-scroll"><div class="chart-canvas-wrap" id="wrap-{key}">'
+            f'<canvas id="chart-{key}"></canvas></div></div>')
+
+
+_SCROLL_HINT = "↔ 가로 스크롤 · 30분 간격 눈금"
+
+# 블록 id → (제목, 본문 HTML, 힌트)
+_DETAIL_BLOCK_DEFS = {
+    "summary": ("🛌 수면 요약", '<div id="summary-area"></div>', ""),
+    "hr":      ("❤️ 심박수 (HR) — 분당", _chart_body("hr"), _SCROLL_HINT),
+    "rr":      ("🫁 호흡수 (RR) — 분당", _chart_body("rr"), _SCROLL_HINT),
+    "act":     ("🏃 활동량 (ACT)", _chart_body("act"), _SCROLL_HINT),
+    "temp":    ("🌡️ 체온 (℃)", _chart_body("temp"), _SCROLL_HINT),
+    "posture": ("🧭 자세", _chart_body("posture"), _SCROLL_HINT),
+    # 사용 구간은 Chart.js 대신 직접 그린다 — 단순한 띠라 훨씬 가볍고 예측 가능하다.
+    "usage":   ("🦶 사용 구간",
+                '<div id="usage-summary" class="usage-summary"></div>'
+                '<div id="usage-timeline" class="usage-timeline"></div>'
+                '<div id="usage-ticks" class="usage-ticks"></div>'
+                '<div id="usage-list" class="usage-list"></div>', ""),
+    "daily":   ("📊 일별 사용시간",
+                '<div class="daily-wrap"><canvas id="chart-daily"></canvas></div>',
+                "최근 기록이 있는 날짜 기준"),
+}
+
+
+def _build_detail_blocks(kind):
+    """기기 종류에 맞는 블록들만 HTML 로 만든다."""
+    ids = DEVICE_BLOCKS.get(kind) or DEVICE_BLOCKS["emfit"]
+    return "".join(_detail_block(b, *_DETAIL_BLOCK_DEFS[b]) for b in ids if b in _DETAIL_BLOCK_DEFS), ids
 
 
 @app.get("/device/{sn}", response_class=HTMLResponse)
@@ -2012,6 +2220,10 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
             f'<div id="status-card" style="margin-bottom:20px;">{initial_card_html}</div>'
         )
         realtime_js = "true"
+    # 기기 종류별 블록 — 안 재는 값을 빈 그래프로 두지 않는다
+    kind = _detail_kind(sn)
+    blocks_html, block_ids = _build_detail_blocks(kind)
+    block_ids_json = json.dumps(block_ids)
     # 날짜 버튼용 — 데이터 있는 날짜를 JS로 직렬화. (analyzer.list_available은 최신 → 과거 순)
     available_json = json.dumps(available_for_sn)
     # datetime-local 기본값 — 가장 최근 날짜의 00:00 ~ 23:55
@@ -2040,6 +2252,22 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                 .arrow-btn:disabled {{ opacity: 0.35; cursor: not-allowed; }}
                 .drag-handle {{ cursor: grab; color: #cfd8dc; font-size: 1.2em; user-select: none; padding: 2px 6px; border-radius: 4px; line-height: 1; margin-left: 2px; }}
                 .drag-handle:hover {{ background: #f5f5f5; color: #607d8b; }}
+                /* ── 사용 구간 띠 (사용감지 센서 전용) ── */
+                .usage-summary {{ font-size: 0.9em; color: #37474f; margin-bottom: 12px; }}
+                .usage-timeline {{ position: relative; height: 34px; background: #eceff1;
+                                   border-radius: 6px; overflow: hidden; }}
+                .usage-timeline .seg {{ position: absolute; top: 0; bottom: 0; background: #26a69a;
+                                        border-radius: 3px; min-width: 2px; }}
+                .usage-timeline .seg.ongoing {{ background: repeating-linear-gradient(45deg,
+                                        #26a69a, #26a69a 6px, #4db6ac 6px, #4db6ac 12px); }}
+                .usage-ticks {{ position: relative; height: 18px; margin-top: 4px; }}
+                .usage-ticks span {{ position: absolute; transform: translateX(-50%);
+                                     font-size: 0.68em; color: #90a4ae; white-space: nowrap; }}
+                .usage-list {{ margin-top: 12px; }}
+                .usage-row {{ display: flex; justify-content: space-between; font-size: 0.85em;
+                              color: #546e7a; padding: 5px 2px; border-bottom: 1px solid #eceff1; }}
+                .usage-row .dur {{ font-weight: bold; color: #00695c; }}
+                .daily-wrap {{ position: relative; height: 220px; }}
                 .drag-handle:active {{ cursor: grabbing; }}
                 .chart-scroll {{ width: 100%; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }}
                 .chart-canvas-wrap {{ position: relative; height: 180px; }}
@@ -2104,54 +2332,7 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
 
                 <div id="data-status" style="text-align:center; color:#90a4ae; padding:20px;">로딩 중...</div>
 
-                <div id="blocks-container">
-                    <div class="block-card" data-block-id="summary">
-                        <div class="block-header">
-                            <h3>🛌 수면 요약</h3>
-                            <div class="block-actions">
-                                <button class="arrow-btn" data-arrow="up" title="위로 이동">▲</button>
-                                <button class="arrow-btn" data-arrow="down" title="아래로 이동">▼</button>
-                                <span class="drag-handle" title="드래그해서 이동">⋮⋮</span>
-                            </div>
-                        </div>
-                        <div id="summary-area"></div>
-                    </div>
-                    <div class="block-card" data-block-id="hr">
-                        <div class="block-header">
-                            <h3>❤️ 심박수 (HR) — 분당</h3>
-                            <div class="block-actions">
-                                <button class="arrow-btn" data-arrow="up" title="위로 이동">▲</button>
-                                <button class="arrow-btn" data-arrow="down" title="아래로 이동">▼</button>
-                                <span class="drag-handle" title="드래그해서 이동">⋮⋮</span>
-                            </div>
-                        </div>
-                        <div class="chart-scroll"><div class="chart-canvas-wrap" id="wrap-hr"><canvas id="chart-hr"></canvas></div></div>
-                        <div class="chart-hint">↔ 가로 스크롤 · 30분 간격 눈금</div>
-                    </div>
-                    <div class="block-card" data-block-id="rr">
-                        <div class="block-header">
-                            <h3>🫁 호흡수 (RR) — 분당</h3>
-                            <div class="block-actions">
-                                <button class="arrow-btn" data-arrow="up" title="위로 이동">▲</button>
-                                <button class="arrow-btn" data-arrow="down" title="아래로 이동">▼</button>
-                                <span class="drag-handle" title="드래그해서 이동">⋮⋮</span>
-                            </div>
-                        </div>
-                        <div class="chart-scroll"><div class="chart-canvas-wrap" id="wrap-rr"><canvas id="chart-rr"></canvas></div></div>
-                        <div class="chart-hint">↔ 가로 스크롤 · 30분 간격 눈금</div>
-                    </div>
-                    <div class="block-card" data-block-id="act">
-                        <div class="block-header">
-                            <h3>🏃 활동량 (ACT)</h3>
-                            <div class="block-actions">
-                                <button class="arrow-btn" data-arrow="up" title="위로 이동">▲</button>
-                                <button class="arrow-btn" data-arrow="down" title="아래로 이동">▼</button>
-                                <span class="drag-handle" title="드래그해서 이동">⋮⋮</span>
-                            </div>
-                        </div>
-                        <div class="chart-scroll"><div class="chart-canvas-wrap" id="wrap-act"><canvas id="chart-act"></canvas></div></div>
-                        <div class="chart-hint">↔ 가로 스크롤 · 30분 간격 눈금</div>
-                    </div>
+                <div id="blocks-container">{blocks_html}
                 </div>
 
                 <p style="text-align:center; margin-top:30px;">
@@ -2169,12 +2350,20 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                     return path + (path.indexOf('?') >= 0 ? '&' : '?') + authQS;
                 }}
                 const charts = {{}};
-                const CHART_KEYS = ['hr', 'rr', 'act'];
-                const CHART_COLORS = {{ hr: '#e74c3c', rr: '#3498db', act: '#f39c12' }};
+                // 이 기기에 실제로 있는 블록만 그린다 (기기 종류마다 다름)
+                const BLOCK_IDS = {block_ids_json};
+                const CHART_KEYS = ['hr', 'rr', 'act', 'temp', 'posture'].filter(k => BLOCK_IDS.includes(k));
+                const CHART_COLORS = {{ hr: '#e74c3c', rr: '#3498db', act: '#f39c12',
+                                        temp: '#e2703f', posture: '#7e57c2' }};
+                // 자세는 숫자 코드로 오므로 눈금에 한글 라벨을 붙인다
+                const POSTURE_LABELS = {{ '-1': '감지대기', '0': '누움', '1': '뒤척임', '2': '앉음',
+                                          '3': '걸터앉음', '4': '낙상', '5': '자리비움', '6': '배회' }};
                 const AVAILABLE_DATES = {available_json};
 
                 let lastPoints = [];
                 let lastSummaries = [];
+                let lastIntervals = [];
+                let lastDaily = [];
 
                 // ─ 5분 단위 강제 스냅 ─
                 function snapTo5Min(dtLocal) {{
@@ -2206,11 +2395,14 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                     const ctx = document.getElementById(id);
                     if (!ctx) return;
 
+                    // 블록 id 와 데이터 필드 이름이 다른 경우 (자세 블록은 숫자 코드 pos 를 쓴다)
+                    const field = (key === 'posture') ? 'pos' : key;
+
                     // {{x: epoch_sec, y: value}}. 5분 이상 갭이면 중간에 null 점 삽입해서 line 끊기.
                     const data = [];
                     let prevEpoch = null;
                     for (const p of lastPoints) {{
-                        const v = p[key];
+                        const v = p[field];
                         if (v === null || v === undefined) continue;
                         if (prevEpoch !== null && p.epoch - prevEpoch > 5 * 60) {{
                             data.push({{ x: prevEpoch + 1, y: null }});
@@ -2254,6 +2446,8 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                     }}
 
                     const color = CHART_COLORS[key] || '#888';
+                    // 자세는 연속값이 아니라 상태 코드라 계단식으로 그리고 곡선 보간을 끈다
+                    const isPosture = (key === 'posture');
                     charts[id] = new Chart(ctx, {{
                         type: 'line',
                         data: {{
@@ -2261,10 +2455,11 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                                 data,
                                 borderColor: color,
                                 backgroundColor: color + '22',
-                                tension: 0.2,
+                                tension: isPosture ? 0 : 0.2,
+                                stepped: isPosture ? 'before' : false,
                                 pointRadius: 0,
                                 spanGaps: false,
-                                fill: true,
+                                fill: !isPosture,
                             }}]
                         }},
                         options: {{
@@ -2286,9 +2481,106 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                                         axis.ticks = tickArr.map(v => ({{ value: v }}));
                                     }},
                                 }},
-                                y: {{ beginAtZero: false }},
+                                y: isPosture ? {{
+                                    beginAtZero: false,
+                                    ticks: {{ callback: (v) => POSTURE_LABELS[String(v)] || '' }},
+                                }} : {{ beginAtZero: false }},
                             }},
-                            plugins: {{ legend: {{ display: false }} }}
+                            plugins: {{
+                                legend: {{ display: false }},
+                                tooltip: isPosture ? {{ callbacks: {{
+                                    label: (c) => POSTURE_LABELS[String(c.parsed.y)] || c.parsed.y
+                                }} }} : {{}},
+                            }}
+                        }}
+                    }});
+                }}
+
+                // ─ 사용 구간 띠 ─
+                // Chart.js 대신 직접 그린다. 단순한 가로 띠라 라이브러리보다 가볍고
+                // 시간 축을 창 범위에 정확히 맞추기도 쉽다.
+                function fmtClock(epochSec) {{
+                    const d = new Date(epochSec * 1000);
+                    return String(d.getHours()).padStart(2, '0') + ':' +
+                           String(d.getMinutes()).padStart(2, '0');
+                }}
+                function fmtDur(sec) {{
+                    sec = Math.round(sec);
+                    if (sec < 60) return sec + '초';
+                    const m = Math.round(sec / 60);
+                    if (m < 60) return m + '분';
+                    return Math.floor(m / 60) + '시간 ' + (m % 60) + '분';
+                }}
+                function renderUsage() {{
+                    const bar = document.getElementById('usage-timeline');
+                    const ticks = document.getElementById('usage-ticks');
+                    const sum = document.getElementById('usage-summary');
+                    const list = document.getElementById('usage-list');
+                    if (!bar) return;
+                    const sEl = document.getElementById('dt-start');
+                    const eEl = document.getElementById('dt-end');
+                    const x0 = new Date(sEl.value).getTime() / 1000;
+                    const x1 = new Date(eEl.value).getTime() / 1000;
+                    const span = Math.max(1, x1 - x0);
+
+                    const total = lastIntervals.reduce((a, i) => a + (i.end - i.start), 0);
+                    const pct = Math.min(100, (total / span) * 100);
+                    sum.innerHTML = lastIntervals.length
+                        ? `이 기간에 <b>${{fmtDur(total)}}</b> 사용 · ${{lastIntervals.length}}회 · 기간의 ${{pct.toFixed(1)}}%`
+                        : '<span style="color:#90a4ae;">이 기간에 사용 기록이 없습니다.</span>';
+
+                    bar.innerHTML = lastIntervals.map(i => {{
+                        const l = ((i.start - x0) / span) * 100;
+                        const w = ((i.end - i.start) / span) * 100;
+                        const cls = i.ongoing ? 'seg ongoing' : 'seg';
+                        const tip = `${{fmtClock(i.start)}} ~ ${{i.ongoing ? '사용 중' : fmtClock(i.end)}} (${{fmtDur(i.end - i.start)}})`;
+                        return `<div class="${{cls}}" style="left:${{Math.max(0, l)}}%; width:${{Math.max(0.4, w)}}%" title="${{tip}}"></div>`;
+                    }}).join('');
+
+                    // 눈금 — 범위 길이에 따라 간격 자동
+                    const hours = span / 3600;
+                    const stepH = hours <= 8 ? 1 : (hours <= 26 ? 3 : 12);
+                    const step = stepH * 3600;
+                    let t = Math.ceil(x0 / step) * step;
+                    let th = '';
+                    for (; t <= x1; t += step) {{
+                        const l = ((t - x0) / span) * 100;
+                        th += `<span style="left:${{l}}%">${{fmtClock(t)}}</span>`;
+                    }}
+                    ticks.innerHTML = th;
+
+                    list.innerHTML = lastIntervals.length
+                        ? lastIntervals.slice(-8).reverse().map(i =>
+                            `<div class="usage-row"><span>${{fmtClock(i.start)}} ~ ${{i.ongoing ? '<b>사용 중</b>' : fmtClock(i.end)}}</span>`
+                            + `<span class="dur">${{fmtDur(i.end - i.start)}}</span></div>`).join('')
+                        : '';
+                }}
+
+                // ─ 일별 사용시간 ─
+                function renderDaily() {{
+                    const cv = document.getElementById('chart-daily');
+                    if (!cv) return;
+                    if (charts.daily) {{ charts.daily.destroy(); delete charts.daily; }}
+                    if (!lastDaily.length) return;
+                    const labels = lastDaily.map(d => d.date.slice(5).replace('-', '/'));
+                    const hours = lastDaily.map(d => +(d.seconds / 3600).toFixed(2));
+                    charts.daily = new Chart(cv.getContext('2d'), {{
+                        type: 'bar',
+                        data: {{ labels, datasets: [{{
+                            data: hours, backgroundColor: '#00897b', borderRadius: 4,
+                        }}] }},
+                        options: {{
+                            responsive: true, maintainAspectRatio: false,
+                            scales: {{
+                                y: {{ beginAtZero: true, title: {{ display: true, text: '시간' }} }},
+                                x: {{ grid: {{ display: false }} }},
+                            }},
+                            plugins: {{
+                                legend: {{ display: false }},
+                                tooltip: {{ callbacks: {{
+                                    label: (c) => fmtDur(lastDaily[c.dataIndex].seconds)
+                                }} }},
+                            }},
                         }}
                     }});
                 }}
@@ -2360,13 +2652,27 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                         const d = await r.json();
                         lastSummaries = d.summaries || [];
                         lastPoints = d.points || [];
-                        renderSummary();
+                        lastIntervals = d.fsr_intervals || [];
+                        lastDaily = d.fsr_daily || [];
+                        if (BLOCK_IDS.includes('summary')) renderSummary();
+                        if (BLOCK_IDS.includes('usage')) renderUsage();
+                        if (BLOCK_IDS.includes('daily')) renderDaily();
+
+                        // 사용감지 기기는 '측정값 개수'가 아니라 사용 횟수로 안내한다
+                        const statusEl = document.getElementById('data-status');
+                        if (BLOCK_IDS.includes('usage')) {{
+                            const total = lastIntervals.reduce((a, i) => a + (i.end - i.start), 0);
+                            statusEl.textContent = lastIntervals.length
+                                ? `${{lastIntervals.length}}회 사용 · 총 ${{fmtDur(total)}}`
+                                : '선택 범위에 사용 기록이 없습니다.';
+                            return;
+                        }}
                         if (lastPoints.length === 0) {{
-                            document.getElementById('data-status').textContent = '선택 범위에 데이터가 없습니다.';
+                            statusEl.textContent = '선택 범위에 데이터가 없습니다.';
                             destroyCharts();
                             return;
                         }}
-                        document.getElementById('data-status').textContent = `총 ${{lastPoints.length}}개 측정값`;
+                        statusEl.textContent = `총 ${{lastPoints.length}}개 측정값`;
                         for (const k of CHART_KEYS) renderChart(k);
                     }} catch (e) {{
                         document.getElementById('data-status').textContent = '오류: ' + e.message;
