@@ -55,6 +55,10 @@ unsigned long candidateSince = 0;       // 그 상태가 시작된 시각
 unsigned long pressStartedAt = 0;       // 눌리기 시작한 시각 (사용 시간 계산용)
 unsigned long lastKeepalive  = 0;
 bool          faultReported  = false;   // 같은 이상을 반복해서 보내지 않도록
+unsigned long lastWifiTry    = 0;       // WiFi 재시도 시각 (계속 붙잡고 있지 않도록)
+bool          wifiWasDown    = false;   // 끊겼다 돌아오면 현재 상태를 다시 보내기 위함
+
+const unsigned long WIFI_RETRY_MS = 15000;   // WiFi 재시도 간격
 
 // ── 배터리 ──────────────────────────────────────────────────────────
 int readBatteryMv() {
@@ -104,12 +108,29 @@ bool sendEvent(const char* event, unsigned long durationMs) {
 }
 
 // ── WiFi ────────────────────────────────────────────────────────────
-void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+// 끊겨 있어도 loop() 를 붙잡지 않도록, WIFI_RETRY_MS 간격으로만 재시도합니다.
+// (매번 20초씩 기다리면 그동안 압력 변화를 놓칩니다)
+void connectWiFi(bool firstTime) {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifiWasDown) {
+      wifiWasDown = false;
+      Serial.println("[WiFi] 재접속됨 — 현재 상태를 다시 보냅니다");
+      // 끊긴 사이 바뀐 상태를 서버가 놓쳤을 수 있으므로 지금 상태를 다시 알립니다.
+      sendEvent(isPressed ? "press" : "release", 0);
+    }
+    return;
+  }
+
+  wifiWasDown = true;
+  unsigned long now = millis();
+  if (!firstTime && (now - lastWifiTry) < WIFI_RETRY_MS) return;
+  lastWifiTry = now;
+
   Serial.printf("[WiFi] '%s' 접속 시도...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
+  int waits = firstTime ? 40 : 10;      // 부팅 때만 오래 기다림
+  for (int i = 0; i < waits && WiFi.status() != WL_CONNECTED; i++) {
     delay(500);
     Serial.print(".");
   }
@@ -121,7 +142,7 @@ void connectWiFi() {
     Serial.printf("[WiFi] 이 보드의 MAC = %s  <-- 서버 등록값과 같아야 함\n",
                   WiFi.macAddress().c_str());
   } else {
-    Serial.println("[WiFi] 접속 실패 — 잠시 후 재시도");
+    Serial.printf("[WiFi] 접속 실패 — %lu초 후 재시도\n", WIFI_RETRY_MS / 1000);
   }
 }
 
@@ -134,7 +155,7 @@ void setup() {
   analogSetPinAttenuation(FSR_PIN, ADC_11db);   // 최대 약 3.3V 까지 읽기
   if (BATT_PIN >= 0) analogSetPinAttenuation(BATT_PIN, ADC_11db);
 
-  connectWiFi();
+  connectWiFi(true);
 
   // 부팅했다고 알림 (서버에서 생존신고로 처리 — 사용 상태는 바뀌지 않음)
   sendEvent("boot", 0);
@@ -142,7 +163,7 @@ void setup() {
 }
 
 void loop() {
-  connectWiFi();                       // 끊기면 자동 재접속
+  connectWiFi(false);                  // 끊기면 주기적으로 재접속 (loop 를 붙잡지 않음)
 
   int raw = analogRead(FSR_PIN);
   unsigned long now = millis();
