@@ -8,13 +8,20 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.8.1"
+VERSION = "3.9.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
 RADAR_LOG_FILE = "radar_data.jsonl"  # AI Radar 는 별도 파일에 쌓는다
 MCKARE_LOG_FILE = "mckare_data.jsonl"  # McKare(VSR22) 도 별도 파일
 MCKARE_APIKEY_FILE = "mckare_apikey.txt"  # 있으면 그 값으로 ApiKey 검증, 없으면 미적용
+# McKare AI 110 열화상 이미지 — ⚠️ 이미지는 jsonl 에 넣지 않는다.
+# 한 장 10KB 라도 1분마다면 하루 14MB, 1년 5GB 다. 측정값 로그에 섞으면
+# 대시보드가 읽어야 할 파일이 그만큼 무거워져 조회가 통째로 느려진다.
+# 파일은 날짜별 폴더에 두고, jsonl 에는 '어디에 뭐가 있다'는 목록만 남긴다.
+MCKARE_IMAGE_DIR = "mckare_images"
+MCKARE_IMAGE_LOG = "mckare_image_log.jsonl"   # 이미지 목록(메타데이터)만
+MCKARE_IMAGE_MAX_BYTES = 10 * 1024 * 1024     # 한 장 상한 — 이상하게 큰 요청 차단
 FSR_LOG_FILE = "fsr_data.jsonl"  # ESP32 압력 사용감지 센서(돌봄기기 부착) 이벤트
 # 대시보드·리포트가 읽어야 할 로그 파일 전체. 기기 종류가 늘면 여기에 추가.
 # 원본을 나눠두면 한쪽 데이터가 커져도 다른 쪽 조회 속도에 영향을 주지 않는다.
@@ -364,9 +371,8 @@ async def _maintenance_gate(request: Request, call_next):
     데이터 수신은 점검 중에도 받아 데이터 유실을 막는다."""
     if not _SERVER_READY:
         # McKare 표준 경로는 여러 개라 아래 목록과 합쳐서 판단한다.
-        receive_paths = {"/", "/radar", "/mckare", "/jy01",
-                         "/data-receiver/device-measurement",
-                         "/data_receiver/device_measurement"}
+        receive_paths = ({"/", "/radar", "/jy01"}
+                         | set(_MCKARE_PATHS) | set(_MCKARE_IMAGE_PATHS))
         if not (request.method == "POST" and request.url.path in receive_paths):
             return HTMLResponse(_maintenance_page_html(), status_code=503,
                                 headers={"Retry-After": "5"})
@@ -4446,10 +4452,23 @@ def _load_mckare_apikey():
 # 를 그대로 흉내 낸다. 센서 펌웨어가 이 경로로 쏘게 되어 있어서, 우리 쪽이
 # 그 모양을 갖춰줘야 한다. 기존 /mckare 는 이미 쓰고 있으므로 별칭으로 남긴다.
 # 하이픈이 문서상 정식이지만, 언더스코어로 잘못 전달되는 경우가 잦아 둘 다 받는다.
+# 문서의 {mckare-api-address} 가 '호스트만'인지 '경로까지 포함'인지 명시돼 있지 않다.
+# 펌웨어에 무엇을 넣든 닿도록 접두어 있는 형태와 없는 형태를 모두 연다.
+# (경로만 다르고 처리는 완전히 동일하므로 열어둬도 부작용이 없다)
 _MCKARE_PATHS = [
-    "/data-receiver/device-measurement",   # 문서 정식 경로
-    "/data_receiver/device_measurement",   # 언더스코어 표기 대응
-    "/mckare",                             # 기존 경로 (하위 호환)
+    "/data-receiver/device-measurement",          # 문서 정식 (호스트만 설정하는 경우)
+    "/mckare/data-receiver/device-measurement",   # base 에 /mckare 까지 넣는 경우
+    "/data_receiver/device_measurement",          # 언더스코어 표기 대응
+    "/mckare/data_receiver/device_measurement",
+    "/mckare",                                    # 기존 경로 (하위 호환)
+]
+
+# 이미지 수신 경로 — AI 110(열화상 탑재) 대응. VSR 22 문서에는 없는 규격이다.
+_MCKARE_IMAGE_PATHS = [
+    "/data-receiver/device-image",
+    "/mckare/data-receiver/device-image",
+    "/data_receiver/device_image",
+    "/mckare/data_receiver/device_image",
 ]
 
 
@@ -4494,6 +4513,147 @@ async def receive_mckare_data(request: Request):
 for _p in _MCKARE_PATHS:
     if _p != "/mckare":
         app.add_api_route(_p, receive_mckare_data, methods=["POST"])
+
+
+# ── McKare AI 110 열화상 이미지 수신 ──────────────────────────────────
+# ⚠️ JCFT 문서(VSR 22 기준)에는 이미지 규격이 없다. AI 110 은 열화상이 붙은
+#    다른 모델이라 별도 규격이 있을 텐데 아직 못 받았다.
+#    그래서 흔히 쓰이는 세 가지 방식을 모두 받아둔다 — 규격을 몰라도 데이터를 잃지 않고,
+#    실제로 뭐가 들어오는지 보면 규격을 역으로 확인할 수 있다.
+#      (1) multipart/form-data  — 파일 업로드의 표준. 가장 가능성 높음
+#      (2) application/json     — base64 문자열로 담아 보내는 방식
+#      (3) 원시 바이너리         — Content-Type: image/jpeg 등으로 본문에 그대로
+_IMAGE_EXT = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+    "image/bmp": ".bmp", "image/webp": ".webp", "application/octet-stream": ".bin",
+}
+# 파일 시그니처로 실제 형식을 판별한다 (Content-Type 을 못 믿는 경우 대비)
+_IMAGE_MAGIC = [
+    (b"\xff\xd8\xff", ".jpg"), (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"BM", ".bmp"), (b"RIFF", ".webp"), (b"GIF8", ".gif"),
+]
+
+
+def _guess_image_ext(blob, content_type=""):
+    """바이트 앞부분(시그니처)으로 형식 판별. 모르면 Content-Type, 그것도 없으면 .bin."""
+    for magic, ext in _IMAGE_MAGIC:
+        if blob.startswith(magic):
+            return ext
+    return _IMAGE_EXT.get((content_type or "").split(";")[0].strip().lower(), ".bin")
+
+
+def _mckare_image_mac(*sources):
+    """여러 곳(폼 필드·JSON·헤더·쿼리)에서 기기 식별자를 찾는다.
+    필드 이름을 모르므로 흔한 후보를 모두 훑는다."""
+    keys = ("macAddress", "mac_address", "mac", "deviceId", "device_id", "device", "serial")
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for k in keys:
+            for actual in src:
+                if str(actual).lower() == k.lower() and src[actual]:
+                    compact = str(src[actual]).strip().replace(":", "").replace("-", "").upper()
+                    if compact:
+                        return compact
+    return "UNKNOWN"
+
+
+async def receive_mckare_image(request: Request):
+    """열화상 이미지 수신. 형식을 가리지 않고 받아 파일로 저장하고 목록에 기록한다."""
+    expected = _load_mckare_apikey()
+    if expected and request.headers.get("ApiKey") != expected:
+        return JSONResponse({"statusCode": 401, "message": "API key is missing or invalid."},
+                            status_code=401)
+
+    ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    blob, meta, how = None, {}, ""
+
+    try:
+        if ctype == "multipart/form-data":
+            form = await request.form()
+            for key, val in form.multi_items():
+                if hasattr(val, "read"):                 # 업로드된 파일
+                    blob = await val.read()
+                    meta["field"] = key
+                    meta["filename"] = getattr(val, "filename", "") or ""
+                    meta["upload_content_type"] = getattr(val, "content_type", "") or ""
+                else:
+                    meta[key] = str(val)                 # 같이 온 텍스트 필드
+            how = "multipart"
+        elif ctype == "application/json":
+            data = await request.json()
+            if not isinstance(data, dict):
+                return JSONResponse({"statusCode": 400, "message": "JSON object required",
+                                     "error": "Bad Request"}, status_code=400)
+            # base64 가 담겼을 만한 필드 이름을 모두 뒤진다
+            for k in ("image", "imageData", "image_data", "data", "file",
+                      "thermal", "thermalImage", "base64", "content"):
+                for actual in data:
+                    if str(actual).lower() == k.lower() and isinstance(data[actual], str) and data[actual]:
+                        raw = data[actual]
+                        if "," in raw[:64] and raw[:5] == "data:":   # data:image/jpeg;base64,....
+                            raw = raw.split(",", 1)[1]
+                        try:
+                            import base64 as _b64
+                            blob = _b64.b64decode(raw, validate=False)
+                            meta["field"] = actual
+                        except Exception:
+                            pass
+                        break
+                if blob is not None:
+                    break
+            meta.update({k: v for k, v in data.items() if not isinstance(v, (dict, list))
+                         and len(str(v)) < 200})
+            how = "json-base64"
+        else:
+            blob = await request.body()                  # 원시 바이너리
+            how = "raw"
+    except Exception as e:
+        return JSONResponse({"statusCode": 400, "message": f"could not read body: {e}",
+                             "error": "Bad Request"}, status_code=400)
+
+    if not blob:
+        return JSONResponse({"statusCode": 400,
+                             "message": "image payload not found. "
+                                        "send multipart file, JSON base64, or raw image body.",
+                             "error": "Bad Request"}, status_code=400)
+    if len(blob) > MCKARE_IMAGE_MAX_BYTES:
+        return JSONResponse({"statusCode": 413,
+                             "message": f"image too large ({len(blob)} bytes)"}, status_code=413)
+
+    now = datetime.now(KST)
+    mac = _mckare_image_mac(meta, dict(request.query_params), dict(request.headers))
+    ext = _guess_image_ext(blob, meta.get("upload_content_type") or ctype)
+    day_dir = os.path.join(MCKARE_IMAGE_DIR, now.strftime("%Y-%m-%d"))
+    fname = f"{mac}_{now.strftime('%H%M%S')}_{secrets.token_hex(3)}{ext}"
+    path = os.path.join(day_dir, fname)
+
+    try:
+        os.makedirs(day_dir, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(blob)
+        with open(MCKARE_IMAGE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "macAddress": mac,
+                "server_received_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "path": path.replace("\\", "/"),
+                "bytes": len(blob),
+                "format": ext.lstrip("."),
+                "how": how,                 # 어떤 방식으로 왔는지 — 규격 확인용
+                "content_type": ctype,
+                "meta": meta,               # 같이 온 필드 전부 (규격 파악에 쓴다)
+                "data_source": "mckare_image",
+            }, ensure_ascii=False) + "\n")
+    except Exception as e:
+        return JSONResponse({"statusCode": 500, "message": f"image save failed: {e}"},
+                            status_code=500)
+
+    print(f"[mckare] 이미지 수신: {mac} {len(blob)}바이트 {ext} ({how}) → {path}", flush=True)
+    return JSONResponse({"statusCode": 201, "message": "created"}, status_code=201)
+
+
+for _p in _MCKARE_IMAGE_PATHS:
+    app.add_api_route(_p, receive_mckare_image, methods=["POST"])
 
 
 # ── ESP32 압력 사용감지 센서 전용 데이터 수신 경로 ──────────────────────

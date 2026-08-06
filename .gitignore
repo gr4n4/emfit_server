@@ -16,6 +16,8 @@ emfit_data.jsonl
 radar_data.jsonl
 mckare_data.jsonl
 fsr_data.jsonl
+mckare_image_log.jsonl
+mckare_images/
 feedback.jsonl
 assignments.json
 preferences.json
