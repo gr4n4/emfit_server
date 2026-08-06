@@ -52,14 +52,20 @@ _FSR_DEVICE_DEFAULTS = {}
 # ⚠️ 단, 사람이 손댄 흔적이 있으면 절대 건드리지 않는다 (아래 _is_untouched_default).
 #    이름·위치를 고쳤거나 배정 이력이 갈라졌다면 그건 사람이 의미를 부여한 기록이고,
 #    코드가 임의로 지울 대상이 아니다. 그 경우엔 화면에 남고 사용자가 직접 정리하면 된다.
+# 값 = 시드 당시 이름. 그 이름·기본 위치 그대로일 때만 지운다(사람이 손댄 건 보존).
+# 값이 None 이면 강제 제거 — 이름·위치를 바꿨더라도 지운다.
+#   ⚠️ 강제는 "사용자가 이 기기를 명시적으로 없애라고 한 경우"에만 쓴다.
+#      측정 데이터가 있는 기기를 강제로 빼면 과거 기록이 Unknown(SN) 으로 표시된다.
 _RETIRED_SNS = {
-    # 2026-08-03 AI Radar 교체 — 제조사 사용 권장 중단. 수신 데이터 없었음.
-    "A1B2C3D4E5F6": "AI Radar",
+    # 2026-08-03 AI Radar 교체 — 제조사 사용 권장 중단.
+    # 2026-08-06 강제 제거로 전환: 위치를 '테스트 공간'로 바꿔둔 탓에 안 지워지고 있었다.
+    # 수신 데이터가 없는 기기라 잃을 기록도 없다.
+    "A1B2C3D4E5F6": None,
     # 2026-08-06 AI Radar 재교체 — 설치 시 다른 실물이 와서 MAC 변경. 보유 기기는 A1B2C3D4E5F8 한 대뿐.
-    "A1B2C3D4E5F7": "AI Radar",
+    "A1B2C3D4E5F7": None,
     # 2026-08-06 사용감지 테스트 잔재 정리 — 실제 운영에 쓰지 않는 자리.
-    "B1C2D3E4F5A6": "돌봄기기 1",
-    "CONNECTIVITY-TEST": "돌봄기기 CONNECTIVITY-TEST",
+    "B1C2D3E4F5A6": None,
+    "CONNECTIVITY-TEST": None,
 }
 
 # 기기 종류(kind) — 대시보드가 어느 섹션에 넣을지 판단하는 값.
@@ -351,13 +357,21 @@ def _is_untouched_default(entry, sn, seeded_name):
 
 for _sn, _seeded_name in _RETIRED_SNS.items():
     _rows = [a for a in ASSIGNMENTS if a.get("sn") == _sn]
-    if len(_rows) == 1 and _is_untouched_default(_rows[0], _sn, _seeded_name):
+    if not _rows:
+        continue
+    _force = _seeded_name is None
+    if _force:
+        for _r in _rows:
+            ASSIGNMENTS.remove(_r)
+        _assignments_changed = True
+        print(f"[analyzer] 퇴역 기기 정리: {_sn} — 강제 제거 ({len(_rows)}건)", flush=True)
+    elif len(_rows) == 1 and _is_untouched_default(_rows[0], _sn, _seeded_name):
         ASSIGNMENTS.remove(_rows[0])
         _assignments_changed = True
         print(f"[analyzer] 퇴역 기기 정리: {_sn} ({_seeded_name}) — 기본 등록 상태라 목록에서 제거", flush=True)
-    elif _rows:
+    else:
         print(f"[analyzer] 퇴역 기기 {_sn} 은 수정 이력이 있어 그대로 둔다 "
-              f"— 필요하면 /devices 에서 직접 정리", flush=True)
+              f"— 지우려면 _RETIRED_SNS 값을 None 으로", flush=True)
 
 _assigned_sns = {a.get("sn") for a in ASSIGNMENTS}
 for _sn, _info, _kind in ([(s, i, None) for s, i in _RADAR_DEVICE_DEFAULTS.items()]
