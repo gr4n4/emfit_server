@@ -26,15 +26,14 @@ _DEFAULT_DEVICE_INFO = {
     "EMFIT-DEMO-03": {"name": "사용자-C", "location": "A시설", "group": "일반"},
     "EMFIT-DEMO-04": {"name": "사용자-D", "location": "사용자-D님 가정", "group": "뇌성마비"},
     "EMFIT-DEMO-05": {"name": "사용자E", "location": "301호", "group": "일반"},
-    # AI Radar(라닉스 RMR602A). 2026-08-03 기기 교체로 MAC 변경:
-    # A1B2C3D4E5F6 → A1B2C3D4E5F7 (같은 OUI A1:B2:C3 = 라닉스).
-    # 옛 기기는 제조사가 사용 권장을 중단했고 실제 수신 데이터도 없어서 정리한다
-    # (아래 _RETIRED_SNS 참고).
-    "A1B2C3D4E5F7": {"name": "AI Radar", "location": "-", "group": "일반"},
+    # AI Radar(라닉스 RMR602A). 실물 기기가 두 번 바뀌었다:
+    #   A1B2C3D4E5F6 → A1B2C3D4E5F7 → A1B2C3D4E5F8 (2026-08-06 현재 이 한 대만 보유)
+    # 옛 두 대는 아래 _RETIRED_SNS 로 정리한다.
+    "A1B2C3D4E5F8": {"name": "AI Radar", "location": "-", "group": "일반"},
 }
 
 _RADAR_DEVICE_DEFAULTS = {
-    "A1B2C3D4E5F7": _DEFAULT_DEVICE_INFO["A1B2C3D4E5F7"],
+    "A1B2C3D4E5F8": _DEFAULT_DEVICE_INFO["A1B2C3D4E5F8"],
 }
 
 # ESP32 압력 사용감지 센서(돌봄기기에 부착) — 알려진 기기는 여기에 적어두면
@@ -42,9 +41,9 @@ _RADAR_DEVICE_DEFAULTS = {
 # 여기 없는 ID 로 데이터가 들어오면 _ensure_fsr_device 가 자동 등록한다(아래 참고).
 # SN 은 보드가 보내는 deviceId 와 같아야 한다. MAC 을 쓸 경우 구분자 없는 대문자
 # (fsr_parser._device_id 가 그렇게 정규화한다).
-_FSR_DEVICE_DEFAULTS = {
-    "B1C2D3E4F5A6": {"name": "돌봄기기 1", "location": "-", "group": "일반"},
-}
+# 지금은 비어 있다 — 실물 보드(jy02, jy03 …)가 처음 데이터를 보내면 자동 등록되므로
+# 여기에 미리 적어둘 필요가 없다. 데이터 없이도 자리를 잡아둬야 하는 기기만 넣는다.
+_FSR_DEVICE_DEFAULTS = {}
 
 # ── 퇴역 기기 정리 (1회성 마이그레이션) ─────────────────────────────
 # 교체·철거된 기기의 '기본 등록'을 배정 목록에서 뺀다. 기본 등록은 서버가 자동으로
@@ -56,6 +55,11 @@ _FSR_DEVICE_DEFAULTS = {
 _RETIRED_SNS = {
     # 2026-08-03 AI Radar 교체 — 제조사 사용 권장 중단. 수신 데이터 없었음.
     "A1B2C3D4E5F6": "AI Radar",
+    # 2026-08-06 AI Radar 재교체 — 설치 시 다른 실물이 와서 MAC 변경. 보유 기기는 A1B2C3D4E5F8 한 대뿐.
+    "A1B2C3D4E5F7": "AI Radar",
+    # 2026-08-06 사용감지 테스트 잔재 정리 — 실제 운영에 쓰지 않는 자리.
+    "B1C2D3E4F5A6": "돌봄기기 1",
+    "CONNECTIVITY-TEST": "돌봄기기 CONNECTIVITY-TEST",
 }
 
 # 기기 종류(kind) — 대시보드가 어느 섹션에 넣을지 판단하는 값.
@@ -358,6 +362,10 @@ for _sn, _seeded_name in _RETIRED_SNS.items():
 _assigned_sns = {a.get("sn") for a in ASSIGNMENTS}
 for _sn, _info, _kind in ([(s, i, None) for s, i in _RADAR_DEVICE_DEFAULTS.items()]
                           + [(s, i, KIND_FSR) for s, i in _FSR_DEVICE_DEFAULTS.items()]):
+    # 퇴역시킨 SN 은 기본 목록에 남아 있어도 다시 만들지 않는다
+    # (위에서 지운 걸 여기서 되살리면 정리가 무효화된다)
+    if _sn in _RETIRED_SNS:
+        continue
     if _sn not in _assigned_sns:
         _entry = {
             "id": f"{_sn}-1",
@@ -508,6 +516,10 @@ def _ensure_fsr_device(sn):
     보드 ID 를 바꾸거나 두 번째 보드를 붙일 때 서버를 못 만져도 바로 뜨게 하는 장치.
     이름은 나중에 /devices 화면에서 편집하면 된다."""
     if sn in DEVICE_INFO:
+        return
+    # 퇴역시킨 기기는 되살리지 않는다.
+    # 로그 파일에 옛 데이터가 남아 있으면 재파싱 때마다 다시 등록돼 정리가 무효화된다.
+    if sn in _RETIRED_SNS:
         return
     # /jy01 은 인증이 없으므로 아무 문자열이나 기기로 만들어주지 않는다.
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,31}", sn):

@@ -8,7 +8,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.7.0"
+VERSION = "3.8.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -363,7 +363,10 @@ async def _maintenance_gate(request: Request, call_next):
     단, Emfit(POST /)·AI Radar(POST /radar)·McKare(POST /mckare)·FSR(POST /jy01)의
     데이터 수신은 점검 중에도 받아 데이터 유실을 막는다."""
     if not _SERVER_READY:
-        receive_paths = {"/", "/radar", "/mckare", "/jy01"}
+        # McKare 표준 경로는 여러 개라 아래 목록과 합쳐서 판단한다.
+        receive_paths = {"/", "/radar", "/mckare", "/jy01",
+                         "/data-receiver/device-measurement",
+                         "/data_receiver/device_measurement"}
         if not (request.method == "POST" and request.url.path in receive_paths):
             return HTMLResponse(_maintenance_page_html(), status_code=503,
                                 headers={"Retry-After": "5"})
@@ -680,7 +683,14 @@ def _render_fsr_card(sn, info, state, ds, now, link_suffix=""):
 
 
 def _card_sort_key(sn, state, ds, now):
-    """이상 상태일수록 위로. 같은 카테고리에서는 SN 순."""
+    """이상 상태일수록 위로. 같은 카테고리에서는 SN 순.
+
+    사용감지 센서는 생체값이 없어 아래 ACT 기준이 통하지 않으므로 따로 판정한다.
+    순서: 센서 확인 필요 → 사용 중 → 미사용 → 판정 대기
+    (대시보드 전체 원칙과 같다 — 손봐야 할 것이 위로, 조용한 것이 아래로)"""
+    if _is_fsr_device(sn, state, ds):
+        label = _fsr_status(state, ds, now.timestamp())[0] if state is not None else None
+        return ({"센서 확인 필요": -1, "사용 중": 2, "미사용": 3}.get(label, 1), sn)
     if isinstance(state, dict) and state.get("낙상"):
         return (-1, sn)
     if ds is not None and not ds.get("connected"):
@@ -4431,6 +4441,18 @@ def _load_mckare_apikey():
         return None
 
 
+# JCFT 표준 경로 — 문서(JCFT-MCK-API-IM-001) 6장의
+#   https://{mckare-api-address}/data-receiver/device-measurement
+# 를 그대로 흉내 낸다. 센서 펌웨어가 이 경로로 쏘게 되어 있어서, 우리 쪽이
+# 그 모양을 갖춰줘야 한다. 기존 /mckare 는 이미 쓰고 있으므로 별칭으로 남긴다.
+# 하이픈이 문서상 정식이지만, 언더스코어로 잘못 전달되는 경우가 잦아 둘 다 받는다.
+_MCKARE_PATHS = [
+    "/data-receiver/device-measurement",   # 문서 정식 경로
+    "/data_receiver/device_measurement",   # 언더스코어 표기 대응
+    "/mckare",                             # 기존 경로 (하위 호환)
+]
+
+
 @app.post("/mckare")
 async def receive_mckare_data(request: Request):
     try:
@@ -4466,6 +4488,12 @@ async def receive_mckare_data(request: Request):
 
     # McKare 규격에 맞춘 201 Created 응답 (statusCode/message 형식도 문서와 동일하게)
     return JSONResponse({"statusCode": 201, "message": "created"}, status_code=201)
+
+
+# 표준 경로들을 같은 처리기에 연결한다. (경로만 다르고 동작은 동일)
+for _p in _MCKARE_PATHS:
+    if _p != "/mckare":
+        app.add_api_route(_p, receive_mckare_data, methods=["POST"])
 
 
 # ── ESP32 압력 사용감지 센서 전용 데이터 수신 경로 ──────────────────────
