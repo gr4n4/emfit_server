@@ -8,7 +8,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.9.0"
+VERSION = "3.9.1"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -322,7 +322,7 @@ def _maintenance_page_html():
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="refresh" content="5">
-    <title>점검 중 · Emfit</title>
+    <title>점검 중 · 돌봄기기 통합 대시보드</title>
     <style>
         body { font-family:'Malgun Gothic',sans-serif; margin:0; min-height:100vh;
                display:flex; align-items:center; justify-content:center;
@@ -394,7 +394,7 @@ def _login_page_html(error="", next_url="/dashboard"):
     <html>
     <head>
         <meta charset="utf-8">
-        <title>관리자 로그인 · Emfit</title>
+        <title>관리자 로그인 · 돌봄기기 통합 대시보드</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             * {{ box-sizing: border-box; }}
@@ -430,7 +430,7 @@ def _login_page_html(error="", next_url="/dashboard"):
     <body>
         <div class="box">
             <div class="logo">📡</div>
-            <h1>Emfit QS 대시보드</h1>
+            <h1>돌봄기기 통합 대시보드</h1>
             <p class="sub">관리자 로그인</p>
             {error_html}
             <form method="post" action="/login" autocomplete="on">
@@ -454,7 +454,7 @@ def _other_device_page_html():
     <html>
     <head>
         <meta charset="utf-8">
-        <title>접근 불가 · Emfit</title>
+        <title>접근 불가 · 돌봄기기 통합 대시보드</title>
         <style>
             body{ font-family:'Malgun Gothic',sans-serif; padding:40px; background:#f0f2f5; margin:0; }
             .box{ max-width:480px; margin:60px auto; background:white; padding:36px; border-radius:14px;
@@ -1478,7 +1478,7 @@ def _v2_page(p):
   </aside>
   <main class="v2main">
     <div class="v2top">
-      <div><h1>모니터링 센서 통합 대시보드</h1><div class="sub">EMFIT QS · AI Radar · McKare 통합 관제</div></div>
+      <div><h1>돌봄기기 통합 대시보드</h1><div class="sub">EMFIT QS · AI Radar · McKare · 사용감지 통합 관제</div></div>
       <div class="v2sp"></div>
       <span class="v2chip" id="v2sum">{p['summary']}</span>
       <span class="v2clock" id="v2clk">{p['now']}</span>
@@ -1557,7 +1557,7 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                     15초마다 자동 갱신 · 카드를 누르면 기기별 상세 그래프
                 </p>
                 <p style="text-align:center; color:#90a4ae; font-size:0.75em; margin-top:20px;">
-                    Emfit Server v{VERSION}
+                    돌봄기기 통합 대시보드 v{VERSION}
                 </p>
             </div>
             <script>
@@ -1658,7 +1658,7 @@ def view_group_dashboard(request: Request):
                     15초마다 자동 갱신 · 카드를 누르면 기기별 상세 그래프
                 </p>
                 <p style="text-align:center; color:#90a4ae; font-size:0.75em; margin-top:20px;">
-                    Emfit Server v{VERSION}
+                    돌봄기기 통합 대시보드 v{VERSION}
                 </p>
             </div>
             <script>
@@ -2340,7 +2340,7 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
     return f"""
     <html>
         <head>
-            <title>{info['name']} · Emfit</title>
+            <title>{info['name']} · 돌봄기기 통합 대시보드</title>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
@@ -3160,7 +3160,7 @@ async def view_dashboard_raw(request: Request, _: str = Depends(require_admin)):
     return f"""
     <html>
         <head>
-            <title>Emfit Raw Data</title>
+            <title>수신 원본 데이터 · 돌봄기기 통합 대시보드</title>
             <meta http-equiv="refresh" content="15">
         </head>
         <body style="font-family: 'Malgun Gothic', sans-serif; padding:30px; background:#f0f2f5; line-height:1.6;">
@@ -3219,7 +3219,7 @@ def reports_ui(request: Request, _: str = Depends(require_admin)):
     return f"""
     <html>
         <head>
-            <title>Emfit 리포트 다운로드</title>
+            <title>리포트 다운로드 · 돌봄기기 통합 대시보드</title>
             <meta charset="utf-8">
         </head>
         <body style="font-family: 'Malgun Gothic', sans-serif; padding:30px; background:#f0f2f5;">
@@ -3459,14 +3459,14 @@ def help_page():
     return """
     <html>
         <head>
-            <title>Emfit QS 대시보드 — 사용 가이드</title>
+            <title>사용 가이드 · 돌봄기기 통합 대시보드</title>
             <meta charset="utf-8">
         </head>
         <body style="font-family: 'Malgun Gothic', sans-serif; padding:30px; background:#f0f2f5; line-height:1.7;">
             <div style="max-width:900px; margin:auto; background:white; padding:40px; border-radius:20px; box-shadow:0 10px 25px rgba(0,0,0,0.08);">
 
-                <h1 style="color:#1a73e8; border-bottom:2px solid #e8f0fe; padding-bottom:10px;">📘 Emfit QS 서버 사용 가이드</h1>
-                <p style="color:#7f8c8d;">Emfit 침대 센서 실시간 관제 및 리포트 서비스.</p>
+                <h1 style="color:#1a73e8; border-bottom:2px solid #e8f0fe; padding-bottom:10px;">📘 돌봄기기 통합 대시보드 사용 가이드</h1>
+                <p style="color:#7f8c8d;">EMFIT QS · AI Radar · McKare · 사용감지 센서 통합 관제 및 리포트 서비스.</p>
 
                 <h2 style="color:#1a73e8; margin-top:40px;">1. 대시보드 보는 법</h2>
 
@@ -3524,7 +3524,7 @@ def help_page():
                     <tr><td style="padding:8px; border-top:1px solid #eee;">유형</td><td style="padding:8px; border-top:1px solid #eee;">Live(실시간), HRV, SleepDetail(수면상세), Summary(수면요약)</td></tr>
                     <tr><td style="padding:8px; border-top:1px solid #eee;">심박수(HR)</td><td style="padding:8px; border-top:1px solid #eee;">분당 심박수</td></tr>
                     <tr><td style="padding:8px; border-top:1px solid #eee;">호흡수(RR)</td><td style="padding:8px; border-top:1px solid #eee;">분당 호흡수</td></tr>
-                    <tr><td style="padding:8px; border-top:1px solid #eee;">활동량(ACT)</td><td style="padding:8px; border-top:1px solid #eee;">Emfit 활동 지표 (0에 가까우면 부재)</td></tr>
+                    <tr><td style="padding:8px; border-top:1px solid #eee;">활동량(ACT)</td><td style="padding:8px; border-top:1px solid #eee;">EMFIT QS 활동 지표 (0에 가까우면 부재)</td></tr>
                     <tr><td style="padding:8px; border-top:1px solid #eee;">심박변이도(RMSSD)</td><td style="padding:8px; border-top:1px solid #eee;">HRV 지표 (HRV 행만)</td></tr>
                     <tr><td style="padding:8px; border-top:1px solid #eee;">수면점수 / 총수면(분) 등</td><td style="padding:8px; border-top:1px solid #eee;">하루 수면 요약 (Summary 행만)</td></tr>
                 </table>
@@ -3533,13 +3533,15 @@ def help_page():
 
                 <h3 style="color:#2c3e50;">Q. 카드 값이 안 바뀌는 것 같아요</h3>
                 <p>
-                    Emfit은 30초 주기로 데이터를 PUSH 하고 있습니다. 30초 이내 새로고침 시 같은 값이 보일 수 있습니다.
-                    카드의 <b>측정</b> 시각이 업데이트 되고있다면 정상이며, 계속 같은 시각이라면 Emfit 장비에서 새 측정이 없는 상태입니다.
+                    기기마다 전송 주기가 다릅니다. EMFIT QS 는 30초, AI Radar 는 1~50초 주기로 보냅니다.
+                    사용감지 센서는 <b>주기적으로 보내지 않고</b> 사용 시작·종료 때만 보내므로, 값이 안 바뀌는 게 정상입니다.
+                    카드의 <b>측정</b>(또는 마지막 신호) 시각이 갱신되고 있다면 정상입니다.
                 </p>
 
                 <h3 style="color:#2c3e50;">Q. HR/RR/ACT 가 모두 "-" 로 떠요</h3>
                 <p>
                     10분 이상 데이터 측정이 없거나 침대 위에 없는 상태입니다. 또는 장비의 연결이 끊겼을 때도 "-"로 표시되며, 이는 Q3 답변 참고 바랍니다.
+                    <br>※ <b>사용감지 센서</b>는 심박·호흡을 아예 측정하지 않으므로 해당 칸이 없습니다. 대신 사용 중/미사용과 배터리를 보여줍니다.
                 </p>
 
                 <h3 style="color:#2c3e50;">Q. 🔴 끊김 이 뜨면 어떻게 하나요</h3>
@@ -3549,7 +3551,7 @@ def help_page():
 
                 <h3 style="color:#2c3e50;">Q. 수면 점수(Summary)가 이상해요 — REM/깊은수면이 0</h3>
                 <p>
-                    Emfit 알고리즘이 수면 단계 분류에 실패하는 것으로 추정되며, 총수면(분) 값만 신뢰해서 보세요.
+                    EMFIT QS 알고리즘이 수면 단계 분류에 실패하는 것으로 추정되며, 총수면(분) 값만 신뢰해서 보세요.
                 </p>
 
                 <h3 style="color:#2c3e50;">Q. 리포트 창을 띄우는데 너무 오래 걸려요</h3>
@@ -3639,7 +3641,7 @@ def view_devices(request: Request, saved: int = 0, handover: int = 0, _: str = D
     return f"""
     <html>
     <head>
-        <title>기기 정보 관리 · Emfit</title>
+        <title>기기 정보 관리 · 돌봄기기 통합 대시보드</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -3886,7 +3888,7 @@ def view_feedback(request: Request, ok: int = 0):
     return f"""
     <html>
     <head>
-        <title>의견 보내기 · Emfit</title>
+        <title>의견 보내기 · 돌봄기기 통합 대시보드</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -4151,7 +4153,7 @@ def admin_tokens(request: Request, _: str = Depends(require_admin)):
     return f"""
     <html>
     <head>
-        <title>사용자 URL 관리 · Emfit</title>
+        <title>사용자 URL 관리 · 돌봄기기 통합 대시보드</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -4357,11 +4359,11 @@ def view_one_device(token: str):
 @app.get("/", response_class=HTMLResponse)
 def root_page():
     return """
-    <html><head><meta charset="utf-8"><title>Emfit</title>
+    <html><head><meta charset="utf-8"><title>돌봄기기 통합 대시보드</title>
     <style>body{font-family:'Malgun Gothic',sans-serif; padding:40px; background:#f0f2f5;}
     .box{max-width:520px; margin:60px auto; background:white; padding:30px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.06); text-align:center;}</style></head>
     <body><div class="box">
-        <h1 style="color:#1a73e8;">📡 Emfit QS 대시보드</h1>
+        <h1 style="color:#1a73e8;">📡 돌봄기기 통합 대시보드</h1>
         <p style="color:#546e7a;">전달받으신 개인 URL로 접속해주세요.<br>
         URL을 받지 못하셨다면 관리자에게 문의해주세요.</p>
     </div></body></html>
