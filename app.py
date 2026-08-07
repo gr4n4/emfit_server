@@ -8,7 +8,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.9.2"
+VERSION = "3.10.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -973,8 +973,9 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
     statuses = analyzer.get_device_statuses()
 
     sn_set = set(sn_filter) if sn_filter else None
-    visible_sns = [sn for sn in analyzer.DEVICE_INFO.keys()
-                   if sn_set is None or sn in sn_set]
+    # 숨김 처리한 기기는 카드에서 뺀다 — 데이터·리포트·기기관리에는 그대로 남는다
+    visible_sns = [sn for sn, i in analyzer.DEVICE_INFO.items()
+                   if not i.get("hidden") and (sn_set is None or sn in sn_set)]
 
     active_sns, inactive_sns = [], []
     connected_count = 0
@@ -1285,7 +1286,8 @@ def _build_cards_payload_v2(sn_filter=None, view_token=""):
             latest = {}
     statuses = analyzer.get_device_statuses()
     sn_set = set(sn_filter) if sn_filter else None
-    visible = [sn for sn in analyzer.DEVICE_INFO.keys() if sn_set is None or sn in sn_set]
+    visible = [sn for sn, i in analyzer.DEVICE_INFO.items()
+               if not i.get("hidden") and (sn_set is None or sn in sn_set)]
 
     active, inactive, connected_count = [], [], 0
     for sn in visible:
@@ -3592,28 +3594,70 @@ def help_page():
 @app.get("/devices", response_class=HTMLResponse)
 def view_devices(request: Request, saved: int = 0, handover: int = 0, _: str = Depends(require_admin)):
     admin_token = _get_token_from_request(request) or ""
-    rows_html = ""
+
+    # 기기 종류 태그 — 대시보드와 같은 색을 써서 어느 섹션 기기인지 바로 알아보게
+    _KIND_TAG = {
+        "emfit":  ("EMFIT", "#e05575"), "radar": ("Radar", "#7c5cd6"),
+        "mckare": ("McKare", "#1fa39c"), "fsr":   ("사용감지", "#00897b"),
+    }
+    kind_counts = {}
+    entries = []
     for sn in sorted(analyzer.DEVICE_INFO.keys()):
         info = analyzer.DEVICE_INFO[sn]
-        name = html.escape(str(info.get("name", "")))
-        location = html.escape(str(info.get("location", "")))
-        group = info.get("group", analyzer.DEFAULT_GROUP)
-        group_opts = "".join(
-            f'<option value="{html.escape(g)}"{" selected" if g == group else ""}>{html.escape(g)}</option>'
-            for g in analyzer.GROUPS
-        )
-        rows_html += f"""
-        <tr>
-            <td style="padding:10px; font-family:monospace; color:#607d8b; white-space:nowrap;">{sn}</td>
+        kind = _detail_kind(sn)
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        entries.append((sn, info, kind))
+
+    # 설치장소로 묶는다 — 같은 장소 기기가 붙어 있어야 훑기 쉽다
+    by_loc = {}
+    for sn, info, kind in entries:
+        loc = str(info.get("location") or "").strip()
+        by_loc.setdefault(loc if loc and loc != "-" else "미지정", []).append((sn, info, kind))
+
+    rows_html = ""
+    for loc in sorted(by_loc, key=lambda x: (x == "미지정", x)):   # '미지정'은 맨 뒤로
+        members = by_loc[loc]
+        rows_html += (f'<tr class="loc-head"><td colspan="5" style="padding:14px 6px 6px;'
+                      f' color:#546e7a; font-size:0.9em; font-weight:bold;'
+                      f' border-bottom:2px solid #eceff1;">📍 {html.escape(loc)}'
+                      f' <span style="color:#b0bec5; font-weight:normal;">· {len(members)}대</span></td></tr>')
+        for sn, info, kind in members:
+            name = html.escape(str(info.get("name", "")))
+            location = html.escape(str(info.get("location", "")))
+            group = info.get("group", analyzer.DEFAULT_GROUP)
+            hidden = bool(info.get("hidden"))
+            tag_label, tag_color = _KIND_TAG.get(kind, ("기타", "#90a4ae"))
+            group_opts = "".join(
+                f'<option value="{html.escape(g)}"{" selected" if g == group else ""}>{html.escape(g)}</option>'
+                for g in analyzer.GROUPS
+            )
+            # data-* 는 검색·필터가 쓰는 값 (화면 안에서만 걸러내므로 저장과 무관하게 즉시 반응)
+            rows_html += f"""
+        <tr class="dev-row{' is-hidden' if hidden else ''}" data-kind="{kind}"
+            data-search="{name.lower()} {location.lower()} {sn.lower()}">
+            <td style="padding:10px; font-family:monospace; color:#607d8b; white-space:nowrap; font-size:0.85em;">{sn}</td>
             <td style="padding:6px;"><input name="name_{sn}" value="{name}" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; font-size:1em; box-sizing:border-box;"></td>
             <td style="padding:6px;"><input name="location_{sn}" value="{location}" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; font-size:1em; box-sizing:border-box;"></td>
-            <td style="padding:6px;">
-                <select name="group_{sn}" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; font-size:1em;">
+            <td style="padding:6px; white-space:nowrap;">
+                <span style="display:inline-block; padding:2px 9px; border-radius:10px; background:{tag_color}; color:white; font-size:0.75em; font-weight:bold; margin-bottom:4px;">{tag_label}</span>
+                <select name="group_{sn}" style="width:100%; padding:6px; border:1px solid #ddd; border-radius:6px; font-size:0.9em;">
                     {group_opts}
                 </select>
             </td>
+            <td style="padding:6px; text-align:center; white-space:nowrap;">
+                <label class="eye-label" title="대시보드 카드에서 감춥니다 (데이터는 그대로 남습니다)">
+                    <input type="checkbox" name="hidden_{sn}" {'checked' if hidden else ''} onchange="this.closest('tr').classList.toggle('is-hidden', this.checked); refreshCounts();">
+                    <span class="eye-face">{'🚫' if hidden else '👁'}</span>
+                </label>
+            </td>
         </tr>
         """
+
+    hidden_count = sum(1 for _, i, _ in entries if i.get("hidden"))
+    filter_chips = f'<button type="button" class="chipbtn on" data-kind="all">전체 {len(entries)}</button>'
+    for k, (lbl, _c) in _KIND_TAG.items():
+        if kind_counts.get(k):
+            filter_chips += f'<button type="button" class="chipbtn" data-kind="{k}">{lbl} {kind_counts[k]}</button>'
 
     saved_banner = ""
     if saved:
@@ -3664,6 +3708,22 @@ def view_devices(request: Request, saved: int = 0, handover: int = 0, _: str = D
             table {{ width:100%; border-collapse: collapse; }}
             th {{ background:#e8f0fe; padding:10px; text-align:left; font-size:0.9em; color:#1a237e; }}
             tr {{ border-top: 1px solid #eee; }}
+            /* 검색·필터 도구 */
+            .dev-toolbar {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:14px 0; }}
+            .dev-search {{ flex:1; min-width:180px; padding:9px 13px; border:1px solid #cfd8dc;
+                           border-radius:8px; font-size:0.95em; box-sizing:border-box; }}
+            .chipbtn {{ padding:7px 14px; border-radius:999px; border:1px solid #cfd8dc; background:#fff;
+                        font-size:0.85em; color:#546e7a; font-weight:bold; cursor:pointer; white-space:nowrap; }}
+            .chipbtn.on {{ background:#1a73e8; color:#fff; border-color:transparent; }}
+            /* 숨김 토글 */
+            .eye-label {{ cursor:pointer; user-select:none; }}
+            .eye-label input {{ display:none; }}
+            .eye-face {{ display:inline-block; padding:5px 10px; border:1px solid #dfe6ea;
+                         border-radius:6px; font-size:1em; }}
+            .dev-row.is-hidden {{ opacity:0.45; }}
+            .dev-row.is-hidden .eye-face {{ background:#fff4e5; border-color:#ffcc80; }}
+            .dev-row.filtered-out, .loc-head.filtered-out {{ display:none; }}
+            #no-match {{ display:none; text-align:center; color:#90a4ae; padding:26px 0; }}
             @media (max-width: 600px) {{
                 body {{ padding: 10px; }}
                 .container {{ padding: 16px; }}
@@ -3671,6 +3731,7 @@ def view_devices(request: Request, saved: int = 0, handover: int = 0, _: str = D
                 tr {{ margin-bottom:14px; padding:10px; background:#fafafa; border-radius:8px; }}
                 td {{ padding:4px 0 !important; }}
                 td:first-child {{ font-weight:bold; }}
+                .loc-head {{ margin-bottom:0; padding:6px 0 !important; background:none; }}
             }}
         </style>
     </head>
@@ -3681,16 +3742,75 @@ def view_devices(request: Request, saved: int = 0, handover: int = 0, _: str = D
             <p style="color:#607d8b;">아래 표는 <b>현재 사용중인</b> 정보 — 이름/위치 오타 수정용입니다.<br>
             사용자가 <b>아예 바뀌면</b> 아래쪽 <b>🔄 기기 이전</b>을 쓰세요. 그래야 과거 데이터가 안 섞입니다.</p>
             {saved_banner}{handover_banner}
+            <div class="dev-toolbar">
+                <input id="dev-search" class="dev-search" placeholder="🔍 이름 · 위치 · SN 검색" autocomplete="off">
+                {filter_chips}
+            </div>
             <form method="post" action="/devices/save">
                 <table>
                     <thead>
                         <tr>
-                            <th>SN</th><th>이름</th><th>위치</th><th>그룹</th>
+                            <th>SN</th><th>이름</th><th>위치</th><th>종류 / 그룹</th><th style="text-align:center;">표시</th>
                         </tr>
                     </thead>
                     <tbody>{rows_html}</tbody>
                 </table>
-                <div style="margin-top:20px; text-align:right;">
+                <p id="no-match">검색 결과가 없습니다.</p>
+                <script>
+                    // 검색·필터는 화면 안에서만 걸러낸다 — 서버 왕복도, 저장도 필요 없다.
+                    let kindFilter = 'all';
+                    function applyFilter() {{
+                        const q = (document.getElementById('dev-search').value || '').trim().toLowerCase();
+                        let shown = 0;
+                        document.querySelectorAll('tr.dev-row').forEach(function (tr) {{
+                            const okKind = (kindFilter === 'all') || (tr.dataset.kind === kindFilter);
+                            const okText = !q || (tr.dataset.search || '').indexOf(q) >= 0;
+                            const show = okKind && okText;
+                            tr.classList.toggle('filtered-out', !show);
+                            if (show) shown++;
+                        }});
+                        // 장소 머리글은 그 아래에 보이는 기기가 하나도 없으면 같이 숨긴다
+                        document.querySelectorAll('tr.loc-head').forEach(function (head) {{
+                            let any = false;
+                            let n = head.nextElementSibling;
+                            while (n && !n.classList.contains('loc-head')) {{
+                                if (n.classList.contains('dev-row') && !n.classList.contains('filtered-out')) {{
+                                    any = true; break;
+                                }}
+                                n = n.nextElementSibling;
+                            }}
+                            head.classList.toggle('filtered-out', !any);
+                        }});
+                        document.getElementById('no-match').style.display = shown ? 'none' : 'block';
+                    }}
+                    function refreshCounts() {{
+                        const n = document.querySelectorAll('tr.dev-row.is-hidden').length;
+                        document.getElementById('hidden-count').textContent =
+                            n ? '(현재 ' + n + '대 숨김 — 저장해야 반영됩니다)' : '';
+                    }}
+                    document.getElementById('dev-search').addEventListener('input', applyFilter);
+                    document.querySelectorAll('.chipbtn').forEach(function (btn) {{
+                        btn.addEventListener('click', function () {{
+                            document.querySelectorAll('.chipbtn').forEach(b => b.classList.remove('on'));
+                            btn.classList.add('on');
+                            kindFilter = btn.dataset.kind;
+                            applyFilter();
+                        }});
+                    }});
+                    // 체크박스 상태에 맞춰 아이콘 글자도 바꾼다
+                    document.querySelectorAll('.eye-label input').forEach(function (cb) {{
+                        cb.addEventListener('change', function () {{
+                            cb.parentElement.querySelector('.eye-face').textContent = cb.checked ? '🚫' : '👁';
+                        }});
+                    }});
+                    refreshCounts();
+                </script>
+                <div style="margin-top:20px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+                    <span style="color:#90a4ae; font-size:0.85em;">
+                        👁 를 눌러 <b>🚫</b> 로 바꾸면 대시보드 카드에서 감춰집니다 —
+                        데이터·리포트는 그대로 남고 언제든 되돌릴 수 있습니다.
+                        <span id="hidden-count" style="color:#e65100; font-weight:bold;"></span>
+                    </span>
                     <button type="submit" style="padding:12px 28px; background:#1a73e8; color:white; border:none; border-radius:8px; font-weight:bold; font-size:1em; cursor:pointer;">저장</button>
                 </div>
             </form>
@@ -3747,7 +3867,11 @@ async def save_devices(request: Request, _: str = Depends(require_admin)):
             location = "-"
         if group not in analyzer.GROUPS:
             group = analyzer.DEFAULT_GROUP
-        new_data[sn] = {"name": name, "location": location, "group": group}
+        # 체크박스는 체크됐을 때만 전송된다 → 없으면 표시(=숨김 해제)
+        entry = {"name": name, "location": location, "group": group}
+        if form.get(f"hidden_{sn}"):
+            entry["hidden"] = True
+        new_data[sn] = entry
     try:
         analyzer.update_active_assignments(new_data)
         analyzer.invalidate_cache()

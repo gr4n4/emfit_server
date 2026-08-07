@@ -228,6 +228,9 @@ def _rebuild_device_info():
         # kind 는 기기 종류(사용감지 등). 대시보드 섹션 분류에 쓰므로 같이 넘긴다.
         if a.get("kind"):
             e["kind"] = a["kind"]
+        # hidden 은 '대시보드 카드에서만 감춤'. 데이터·리포트·기기관리에는 그대로 남는다.
+        if a.get("hidden"):
+            e["hidden"] = True
         return e
 
     new_info = {}
@@ -276,6 +279,10 @@ def handover(sn, user, location, group, when):
         }
         if prev_kind:
             new_entry["kind"] = prev_kind
+        # 숨김 상태도 물려받는다 — 사용자가 바뀌어도 같은 실물 기기다.
+        # 다시 쓰기 시작했다면 /devices 에서 표시로 되돌리면 된다.
+        if any(a.get("sn") == sn and a.get("hidden") for a in ASSIGNMENTS):
+            new_entry["hidden"] = True
         ASSIGNMENTS.append(new_entry)
         _save_assignments()
         _rebuild_assign_index()
@@ -324,6 +331,11 @@ def update_active_assignments(updates):
             target["user"] = info.get("name", sn)
             target["location"] = info.get("location", "-")
             target["group"] = info.get("group", "일반")
+            # 숨김은 켤 때만 키를 남기고, 끄면 지운다 (파일에 쓸데없는 false 가 안 쌓이게)
+            if info.get("hidden"):
+                target["hidden"] = True
+            else:
+                target.pop("hidden", None)
         _save_assignments()
         _rebuild_assign_index()
     _rebuild_device_info()
