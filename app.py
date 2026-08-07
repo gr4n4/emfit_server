@@ -8,7 +8,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.9.1"
+VERSION = "3.9.2"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -488,6 +488,17 @@ async def _auth_html_handler(request: Request, exc: StarletteHTTPException):
         return HTMLResponse(_other_device_page_html(), status_code=403)
     return PlainTextResponse(str(exc.detail), status_code=exc.status_code)
 
+def _state_dt(state):
+    """측정 레코드의 '날짜 + 시간(KST)' → KST 인식 datetime.
+
+    ⚠️ 반드시 tz 를 붙여야 한다. 예전에는 naive 로 만들어 서버 로컬 시각과 직접 뺐는데,
+    서버 시간대가 KST 가 아니면 계산이 통째로 어긋났다. 특히 UTC 서버에서는
+    5시간 전에 끊긴 기기가 '재실 · 방금' 으로 표시돼, 죽은 장비를 정상으로 오인하게 된다.
+    실패 시 예외를 그대로 올려 호출부의 try/except 가 '측정 시각 알 수 없음' 으로 처리한다."""
+    return datetime.strptime(f"{state['날짜']} {state['시간(KST)']}",
+                             "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+
+
 def _format_ago(delta_sec):
     if delta_sec < 60:
         return "방금"
@@ -704,7 +715,7 @@ def _card_sort_key(sn, state, ds, now):
     if state is None:
         return (1, sn)
     try:
-        last_dt = datetime.strptime(f"{state['날짜']} {state['시간(KST)']}", "%Y-%m-%d %H:%M:%S")
+        last_dt = _state_dt(state)
         mins_ago = (now - last_dt).total_seconds() / 60
     except Exception:
         return (2, sn)
@@ -717,7 +728,8 @@ def _card_sort_key(sn, state, ds, now):
 
 def _render_inactive_card(sn, info, ds, now, link_suffix=""):
     """비활성 기기용 minimal 카드. 측정값은 안 보여주고 위치/이름/마지막 통신만."""
-    location_text = info['location'] if info['location'] and info['location'] != '-' else '미지정'
+    location_text = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
+    name_safe = html.escape(str(info['name']))
     if ds is None:
         last_text = "통신 이력 없음"
     else:
@@ -732,7 +744,7 @@ def _render_inactive_card(sn, info, ds, now, link_suffix=""):
         <div style="display:flex; justify-content:space-between; align-items:center;">
             <div>
                 <div style="font-size:0.75em; color:#78909c;">{location_text}</div>
-                <div style="font-size:1em; font-weight:bold; color:#546e7a;">{info['name']}</div>
+                <div style="font-size:1em; font-weight:bold; color:#546e7a;">{name_safe}</div>
             </div>
             <div style="font-size:1.3em; opacity:0.6;">💤</div>
         </div>
@@ -744,7 +756,8 @@ def _render_inactive_card(sn, info, ds, now, link_suffix=""):
 
 
 def _render_card(sn, info, state, ds, now, link_suffix=""):
-    location_text = info['location'] if info['location'] and info['location'] != '-' else '미지정'
+    location_text = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
+    name_safe = html.escape(str(info['name']))
     is_radar = _is_radar_device(sn, state, ds)
     source_badge = (
         '<span style="display:inline-block; margin-left:6px; padding:2px 7px; border-radius:10px; '
@@ -777,7 +790,7 @@ def _render_card(sn, info, state, ds, now, link_suffix=""):
             <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                 <div>
                     <div style="font-size:0.85em; color:#5d4037;">{location_text}</div>
-                    <div style="font-size:1.3em; font-weight:bold; color:#263238;">{info['name']}{source_badge}</div>
+                    <div style="font-size:1.3em; font-weight:bold; color:#263238;">{name_safe}{source_badge}</div>
                 </div>
                 <div style="font-size:1.8em;">{conn_icon}</div>
             </div>
@@ -789,7 +802,7 @@ def _render_card(sn, info, state, ds, now, link_suffix=""):
         """
 
     try:
-        last_dt = datetime.strptime(f"{state['날짜']} {state['시간(KST)']}", "%Y-%m-%d %H:%M:%S")
+        last_dt = _state_dt(state)
         delta_sec = max(0, int((now - last_dt).total_seconds()))
         mins_ago = delta_sec // 60
         if delta_sec >= 3600:
@@ -859,7 +872,7 @@ def _render_card(sn, info, state, ds, now, link_suffix=""):
         <div style="display:flex; justify-content:space-between; align-items:flex-start;">
             <div>
                 <div style="font-size:0.85em; color:#455a64;">{location_text}</div>
-                <div style="font-size:1.3em; font-weight:bold; color:#1a237e;">{info['name']}{source_badge}</div>
+                <div style="font-size:1.3em; font-weight:bold; color:#1a237e;">{name_safe}{source_badge}</div>
             </div>
             <div style="font-size:1.8em;">{status_icon}</div>
         </div>
@@ -947,7 +960,7 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
     view_token 주면 카드 링크에 ?view= 를 붙여 그룹 컨텍스트를 명시한다
     (그래야 admin이 그룹 대시보드에서 누른 기기의 '뒤로가기'가 /view 로 돌아감)."""
     link_suffix = f"?view={view_token}" if view_token else ""
-    now = datetime.now()
+    now = datetime.now(KST)   # 서버 시간대와 무관하게 KST 기준으로 비교
     now_ts = now.timestamp()
 
     latest = {}
@@ -1111,7 +1124,7 @@ def _render_card_v2(sn, info, state, ds, now, link_suffix=""):
     if _is_fsr_device(sn, state, ds):
         return _render_fsr_card_v2(sn, info, state, ds, now, link_suffix)
     is_radar = _is_radar_device(sn, state, ds)
-    loc = info['location'] if info['location'] and info['location'] != '-' else '미지정'
+    loc = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
     name = html.escape(str(info['name']))
 
     # 연결 상태
@@ -1140,7 +1153,7 @@ def _render_card_v2(sn, info, state, ds, now, link_suffix=""):
 
     # 측정 시각
     try:
-        last_dt = datetime.strptime(f"{state['날짜']} {state['시간(KST)']}", "%Y-%m-%d %H:%M:%S")
+        last_dt = _state_dt(state)
         delta_sec = max(0, int((now - last_dt).total_seconds()))
         mins_ago = delta_sec // 60
         tp = last_dt.strftime("%m-%d %H:%M") if delta_sec >= 3600 else last_dt.strftime("%H:%M")
@@ -1226,7 +1239,7 @@ def _render_card_v2(sn, info, state, ds, now, link_suffix=""):
 
 def _render_inactive_card_v2(sn, info, ds, now, link_suffix=""):
     """비활성(7일+) 미니 카드."""
-    loc = info['location'] if info['location'] and info['location'] != '-' else '미지정'
+    loc = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
     name = html.escape(str(info['name']))
     last = "통신 이력 없음"
     if ds and isinstance(ds.get("last_seen_ts"), (int, float)):
@@ -1262,7 +1275,7 @@ _V2_SECTIONS = [
 def _build_cards_payload_v2(sn_filter=None, view_token=""):
     """신규 대시보드 카드 섹션 HTML + 요약."""
     link_suffix = f"?view={view_token}" if view_token else ""
-    now = datetime.now()
+    now = datetime.now(KST)   # 서버 시간대와 무관하게 KST 기준으로 비교
     now_ts = now.timestamp()
     latest = {}
     if _has_data():
@@ -1698,7 +1711,7 @@ def _build_single_card(sn, token=""):
     info = analyzer.DEVICE_INFO.get(sn)
     if info is None:
         return ""
-    now = datetime.now()
+    now = datetime.now(KST)   # 서버 시간대와 무관하게 KST 기준으로 비교
     now_ts = now.timestamp()
     latest = {}
     if _has_data():
@@ -2250,7 +2263,8 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
                 "location": target.get("location", "-"),
                 "group": target.get("group", "일반")}
 
-    location_text = info['location'] if info['location'] and info['location'] != '-' else '미지정'
+    location_text = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
+    name_safe = html.escape(str(info['name']))
 
     csv_query = f"assignment={target_id}" if target_id else f"device={sn}"
     lo = target["start"][:10] if target and target.get("start") else None
@@ -2340,7 +2354,7 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
     return f"""
     <html>
         <head>
-            <title>{info['name']} · 돌봄기기 통합 대시보드</title>
+            <title>{name_safe} · 돌봄기기 통합 대시보드</title>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
@@ -2442,7 +2456,7 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
         <body>
             <div class="container">
                 <p style="margin: 0 0 12px 0;">{back_link}</p>
-                <h1 style="margin: 8px 0; color: #1a237e; display:inline-block;">{info['name']}</h1>{edit_name_ui}
+                <h1 style="margin: 8px 0; color: #1a237e; display:inline-block;">{name_safe}</h1>{edit_name_ui}
                 <p style="color: #607d8b; margin: 0 0 16px 0;">{location_text} · {sn}</p>
 
                 {realtime_section}
