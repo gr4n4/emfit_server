@@ -308,12 +308,20 @@ def update_active_user(sn, new_user):
         target["user"] = new_user
         _save_assignments()
         _rebuild_assign_index()
+        aid, loc = target.get("id"), target.get("location", "-")
     _rebuild_device_info()
+    # 배정 경계는 그대로다 → 재파싱 없이 라벨만 갈아끼운다 (수분 → 즉시)
+    relabel_assignment(aid, new_user, loc)
     return True
 
 
 def update_active_assignments(updates):
-    """{sn: {name, location, group}} — 각 기기의 활성 배정 필드를 수정(오타 수정 등)."""
+    """{sn: {name, location, group}} — 각 기기의 활성 배정 필드를 수정(오타 수정 등).
+
+    반환: True 면 새 배정이 생겨 재파싱이 필요하고, False 면 라벨만 바뀌어
+    (이 함수가 이미 갱신했으므로) 호출부가 따로 할 일이 없다."""
+    structural = False
+    relabels = []
     with _ASSIGNMENTS_LOCK:
         for sn, info in updates.items():
             active = [a for a in ASSIGNMENTS if a.get("sn") == sn and not a.get("end")]
@@ -328,6 +336,7 @@ def update_active_assignments(updates):
                 if prev_kind:
                     target["kind"] = prev_kind
                 ASSIGNMENTS.append(target)
+                structural = True     # 없던 배정이 생겼다 → 재파싱 필요
             target["user"] = info.get("name", sn)
             target["location"] = info.get("location", "-")
             target["group"] = info.get("group", "일반")
@@ -336,14 +345,54 @@ def update_active_assignments(updates):
                 target["hidden"] = True
             else:
                 target.pop("hidden", None)
+            relabels.append((target.get("id"), target["user"], target["location"]))
         _save_assignments()
         _rebuild_assign_index()
     _rebuild_device_info()
+    if not structural:
+        # 이름·위치만 바뀐 경우 — 재파싱 없이 라벨만 갈아끼운다
+        for aid, user, loc in relabels:
+            relabel_assignment(aid, user, loc)
+    return structural
+
+
+def relabel_assignment(assignment_id, user, location):
+    """이미 읽어둔 레코드의 '사용자/위치' 라벨만 그 자리에서 갈아끼운다.
+
+    왜 필요한가 — 레코드에는 파싱할 때 사용자명이 박혀서 저장된다. 그래서 지금까지는
+    이름만 고쳐도 invalidate_cache() 로 캐시를 통째로 버리고 86MB 를 다시 읽었다.
+    저장 버튼을 누르고 몇 분씩 기다려야 했던 이유다.
+
+    하지만 **이름 수정은 배정 경계(start/end)를 건드리지 않는다.** 어떤 레코드가
+    어느 배정에 속하는지가 그대로이므로, 라벨만 바꾸면 재파싱과 결과가 같다.
+    (기기 이전처럼 경계가 바뀌는 경우는 여전히 invalidate_cache 가 맞다)
+
+    반환: 갈아끼운 레코드 수."""
+    n = 0
+    for slot in _caches.values():
+        st = slot.get("storage")
+        if not st:
+            continue
+        for recs in st.values():
+            for r in recs:
+                if r.get("배정ID") == assignment_id:
+                    r["사용자"] = user
+                    r["위치"] = location
+                    n += 1
+    # 최신상태·날짜목록 캐시는 레코드 사본을 들고 있을 수 있어 비운다.
+    # (둘 다 다시 만드는 비용이 작다 — 재파싱과 달리 storage 는 그대로 쓴다)
+    _latest_states_cache["key"] = None
+    _latest_states_cache["result"] = None
+    _avail_assign_cache["key"] = None
+    _avail_assign_cache["result"] = None
+    print(f"[analyzer] 라벨 갱신: 배정 {assignment_id} → {user} / {location} ({n}건, 재파싱 없음)", flush=True)
+    return n
 
 
 def invalidate_cache():
-    """파싱 캐시 무효화 — 배정 이력이 바뀌면 다음 조회 때 전체 재파싱하여
-    과거 데이터까지 올바른 사용자로 다시 라벨링한다."""
+    """파싱 캐시 무효화 — 배정 경계가 바뀌었을 때만 쓴다(기기 이전 등).
+    다음 조회 때 전체 재파싱하여 과거 데이터까지 올바른 사용자로 다시 라벨링한다.
+    ⚠️ 로그가 크면 수십 초~수 분 걸린다. 이름만 바뀌는 경우엔 relabel_assignment 를 쓸 것."""
     _caches.clear()
     _merged_cache["key"] = None
     _merged_cache["storage"] = None

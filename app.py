@@ -8,7 +8,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.11.0"
+VERSION = "3.12.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -786,15 +786,16 @@ def _render_card(sn, info, state, ds, now, link_suffix=""):
     if state is None:
         return f"""
         <a href="/device/{sn}{link_suffix}" style="display:block; text-decoration:none; color:inherit;">
-        <div style="background:#fff8e1; padding:16px; border-radius:14px; border:2px solid #ffd54f; transition:transform 0.1s;" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
+        <div style="background:#f5f7f9; padding:16px; border-radius:14px; border:2px solid #cfd8dc; transition:transform 0.1s;" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
             <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                 <div>
-                    <div style="font-size:0.85em; color:#5d4037;">{location_text}</div>
+                    <div style="font-size:0.85em; color:#546e7a;">{location_text}</div>
                     <div style="font-size:1.3em; font-weight:bold; color:#263238;">{name_safe}{source_badge}</div>
                 </div>
                 <div style="font-size:1.8em;">{conn_icon}</div>
             </div>
-            <div style="text-align:center; margin-top:20px; color:#5d4037; font-size:1em; font-weight:bold;">측정 데이터 없음</div>
+            <div style="text-align:center; margin-top:20px; color:#546e7a; font-size:1em; font-weight:bold;">설치됨 · 측정 대기</div>
+            <div style="text-align:center; margin-top:2px; color:#90a4ae; font-size:0.75em;">아직 측정된 사람이 없습니다</div>
             <div style="text-align:center; margin-top:6px; color:{conn_color}; font-size:0.9em; font-weight:bold;">{conn_text}</div>
             <div style="text-align:center; margin-top:6px; color:#90a4ae; font-size:0.65em;">{sn}</div>
         </div>
@@ -3147,31 +3148,94 @@ def view_device(sn: str, request: Request, assignment: str = Query(None)):
 
 
 # 원본(raw) 대시보드 — 기존 디버깅용 뷰 (관리자 전용)
-@app.get("/dashboard/raw", response_class=HTMLResponse)
-async def view_dashboard_raw(request: Request, _: str = Depends(require_admin)):
-    admin_token = _get_token_from_request(request) or ""
-    count = 0
-    last_data = "아직 수신된 데이터가 없습니다."
-    formatted_json = ""
+def _tail_lines(path, n=5, chunk=64 * 1024):
+    """파일 끝에서부터 마지막 n줄만 읽는다 (오래된 → 최신 순으로 반환).
 
-    # Emfit·Radar 로그를 모두 세고, 가장 최근에 갱신된 파일의 마지막 줄을 보여준다.
-    newest_mtime = None
-    for path in DATA_FILES:
-        if not os.path.exists(path):
-            continue
-        with open(path, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f.readlines() if l.strip()]
-        count += len(lines)
-        mtime = os.path.getmtime(path)
-        if lines and (newest_mtime is None or mtime > newest_mtime):
-            newest_mtime = mtime
-            last_data = lines[-1]
-
+    86MB 짜리 로그를 통째로 메모리에 올리지 않으려고 뒤에서부터 조금씩 읽는다.
+    파일이 아무리 커도 읽는 양은 마지막 몇 KB 뿐이다."""
+    if not os.path.exists(path):
+        return []
+    out = b""
     try:
-        parsed_json = json.loads(last_data)
-        formatted_json = json.dumps(parsed_json, indent=4, ensure_ascii=False)
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            while end > 0 and out.count(b"\n") <= n:
+                step = min(chunk, end)
+                end -= step
+                f.seek(end)
+                out = f.read(step) + out
     except Exception:
-        formatted_json = last_data
+        return []
+    lines = [l.decode("utf-8", errors="replace").strip()
+             for l in out.split(b"\n") if l.strip()]
+    return lines[-n:]
+
+
+@app.get("/dashboard/raw", response_class=HTMLResponse)
+async def view_dashboard_raw(request: Request, file: str = Query(None),
+                             n: int = Query(5), _: str = Depends(require_admin)):
+    """수신 원본 보기 — 파일을 골라 마지막 몇 줄을 확인한다.
+
+    ⚠️ 파일을 통째로 읽지 않는다. emfit_data.jsonl 이 86MB 라 예전 방식(readlines)은
+    페이지를 열 때마다 그만큼을 메모리에 올려서 느렸다. 끝에서부터 필요한 만큼만 읽는다."""
+    admin_token = _get_token_from_request(request) or ""
+    n = max(1, min(int(n or 5), 50))
+
+    # 볼 수 있는 파일 — 측정 로그 + 이미지 목록. 경로를 밖에서 받지 않으므로 임의 파일 열람은 불가.
+    viewable = list(DATA_FILES) + [MCKARE_IMAGE_LOG]
+    labels = {
+        LOG_FILE: "EMFIT QS", RADAR_LOG_FILE: "AI Radar",
+        MCKARE_LOG_FILE: "McKare", FSR_LOG_FILE: "사용감지",
+        MCKARE_IMAGE_LOG: "McKare 이미지 목록",
+    }
+    if file not in viewable:
+        # 기본값 — 가장 최근에 갱신된 파일
+        existing = [p for p in viewable if os.path.exists(p)]
+        file = max(existing, key=os.path.getmtime) if existing else viewable[0]
+
+    # 파일별 요약 (크기·최종 갱신) — stat 만 보므로 크기와 무관하게 즉시
+    tabs = ""
+    for p in viewable:
+        exists = os.path.exists(p)
+        size = os.path.getsize(p) if exists else 0
+        mt = (datetime.fromtimestamp(os.path.getmtime(p), KST).strftime("%m-%d %H:%M")
+              if exists else "-")
+        on = (p == file)
+        size_txt = (f"{size/1024/1024:.1f}MB" if size >= 1024*1024
+                    else f"{size/1024:.0f}KB" if size else "없음")
+        tabs += (
+            f'<a href="/dashboard/raw?file={quote(p)}&n={n}" '
+            f'style="display:inline-block; padding:9px 14px; margin:3px; border-radius:9px;'
+            f' text-decoration:none; font-size:0.88em;'
+            f' background:{"#1a73e8" if on else "#fff"}; color:{"#fff" if on else "#546e7a"};'
+            f' border:1px solid {"transparent" if on else "#cfd8dc"};">'
+            f'<b>{html.escape(labels.get(p, p))}</b>'
+            f'<span style="opacity:0.75; font-size:0.85em;"> · {size_txt} · {mt}</span></a>')
+
+    lines = _tail_lines(file, n)
+    blocks = ""
+    for ln in reversed(lines):                 # 최신이 위로
+        try:
+            body = json.dumps(json.loads(ln), indent=4, ensure_ascii=False)
+        except Exception:
+            body = ln
+        blocks += (f'<pre style="background:#202124; color:#00ff9c; padding:16px; border-radius:10px;'
+                   f' font-size:0.86em; line-height:1.5; white-space:pre-wrap; word-wrap:break-word;'
+                   f' overflow-x:hidden; margin:0 0 12px;">{html.escape(body)}</pre>')
+    if not blocks:
+        blocks = ('<p style="text-align:center; color:#90a4ae; padding:30px;">'
+                  '이 파일에는 아직 수신된 데이터가 없습니다.</p>')
+
+    size = os.path.getsize(file) if os.path.exists(file) else 0
+    n_opts = "".join(
+        f'<a href="/dashboard/raw?file={quote(file)}&n={k}" style="display:inline-block;'
+        f' padding:5px 12px; margin:2px; border-radius:7px; text-decoration:none; font-size:0.82em;'
+        f' background:{"#e8f0fe" if k == n else "#fff"}; color:#1a73e8;'
+        f' border:1px solid {"#1a73e8" if k == n else "#cfd8dc"};">{k}줄</a>'
+        for k in (1, 5, 20, 50))
+    file_label = html.escape(labels.get(file, file))
+    size_label = f"{size/1024/1024:.2f}MB" if size >= 1024*1024 else f"{size/1024:.1f}KB"
 
     return f"""
     <html>
@@ -3181,14 +3245,20 @@ async def view_dashboard_raw(request: Request, _: str = Depends(require_admin)):
         </head>
         <body style="font-family: 'Malgun Gothic', sans-serif; padding:30px; background:#f0f2f5; line-height:1.6;">
             <div style="max-width:800px; margin:auto; background:white; padding:30px; border-radius:20px; box-shadow:0 10px 25px rgba(0,0,0,0.1);">
-                <h1 style="text-align:center; color:#1a73e8; margin-bottom:10px;">🔎 마지막 수신 원본</h1>
-                <p style="text-align:center; color:#7f8c8d; font-size:0.9em; margin-bottom:20px;">서버 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                <div style="margin: 20px 0; padding: 15px; background: #e8f0fe; border-radius: 10px;">
-                    <p style="margin:0;"><b>총 로그:</b> <span style="color:#e74c3c;">{count:,}개</span></p>
+                <h1 style="text-align:center; color:#1a73e8; margin-bottom:6px;">🔎 수신 원본 데이터</h1>
+                <p style="text-align:center; color:#7f8c8d; font-size:0.9em; margin-bottom:18px;">서버 시간: {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+                <div style="text-align:center; margin-bottom:14px;">{tabs}</div>
+
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px; padding:12px 14px; background:#e8f0fe; border-radius:10px;">
+                    <span style="color:#1a237e;"><b>{file_label}</b>
+                        <span style="color:#5c6bc0; font-size:0.88em;"> · {size_label} · {file}</span></span>
+                    <span>{n_opts}</span>
                 </div>
-                <pre style="background:#202124; color:#00ff00; padding:20px; border-radius:10px;
-                           font-size:0.95em; line-height:1.5; white-space: pre-wrap; word-wrap: break-word; overflow-x: hidden;">{formatted_json}</pre>
-                <p style="text-align:center; margin-top:25px;">
+
+                {blocks}
+
+                <p style="text-align:center; margin-top:22px;">
                     <a href="/dashboard" style="color:#1a73e8;">← 관제 화면으로</a>
                 </p>
             </div>
@@ -3873,8 +3943,10 @@ async def save_devices(request: Request, _: str = Depends(require_admin)):
             entry["hidden"] = True
         new_data[sn] = entry
     try:
-        analyzer.update_active_assignments(new_data)
-        analyzer.invalidate_cache()
+        # 이름·위치만 바뀌면 라벨만 갈아끼우고(즉시), 새 배정이 생겼을 때만 재파싱한다.
+        # 예전에는 무조건 재파싱해서 저장 후 몇 분씩 기다려야 했다.
+        if analyzer.update_active_assignments(new_data):
+            analyzer.invalidate_cache()
     except Exception as e:
         return PlainTextResponse(f"저장 실패: {e}", status_code=500)
     return RedirectResponse("/devices?saved=1", status_code=303)
@@ -3928,7 +4000,7 @@ async def devices_edit_user(request: Request):
         ok = analyzer.update_active_user(sn, new_user)
         if not ok:
             return PlainTextResponse("활성 배정을 찾지 못했습니다.", status_code=400)
-        analyzer.invalidate_cache()
+        # 재파싱 불필요 — update_active_user 가 라벨을 그 자리에서 갱신한다
     except Exception as e:
         return PlainTextResponse(f"이름 변경 실패: {e}", status_code=500)
     return RedirectResponse(f"/device/{sn}", status_code=303)
