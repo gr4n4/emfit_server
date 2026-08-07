@@ -8,7 +8,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.10.0"
+VERSION = "3.11.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -4141,9 +4141,26 @@ async def feedback_reply(request: Request, _: str = Depends(require_admin)):
     return RedirectResponse("/feedback", status_code=303)
 
 
+# 그룹(view) 편집 UI 용 — 기기 종류 태그. 대시보드 섹션과 같은 색을 써서 한눈에 구분된다.
+_VIEW_KIND_TAG = {
+    "emfit": ("EMFIT", "#e05575"), "radar": ("Radar", "#7c5cd6"),
+    "mckare": ("McKare", "#1fa39c"), "fsr": ("사용감지", "#00897b"),
+}
+
+
+def _devices_by_location():
+    """{설치장소: [SN, ...]} — 그룹 편집 체크박스를 장소별로 묶어 보여주기 위함.
+    숨긴 기기도 포함한다 (그룹에 넣을지는 관리자가 정할 일)."""
+    out = {}
+    for sn in sorted(analyzer.DEVICE_INFO):
+        loc = str(analyzer.DEVICE_INFO[sn].get("location") or "").strip()
+        out.setdefault(loc if loc and loc != "-" else "미지정", []).append(sn)
+    return out
+
+
 # 관리자: 기기별 사용자 URL(토큰) 관리 — admin ID/비번 통과 시 접근
 @app.get("/admin/tokens", response_class=HTMLResponse)
-def admin_tokens(request: Request, _: str = Depends(require_admin)):
+def admin_tokens(request: Request, view_saved: int = 0, _: str = Depends(require_admin)):
     tokens = _load_tokens()
     # SN → 발급된 device 토큰 목록 (admin 토큰 항목 "*"는 무시)
     by_sn = {}
@@ -4226,22 +4243,70 @@ def admin_tokens(request: Request, _: str = Depends(require_admin)):
         for vtok, vinfo in views.items():
             vname = html.escape(str(vinfo.get("name", "")))
             vsns = vinfo.get("sns") or []
+            # SN 만으론 누구 건지 모르니 기기 이름을 같이 보여준다
             sn_chips = "".join(
-                f'<span style="display:inline-block; background:#eef; color:#1a237e; padding:3px 8px; border-radius:10px; font-family:monospace; font-size:0.75em; margin:2px;">{html.escape(s)}</span>'
+                f'<span style="display:inline-block; background:#eef; color:#1a237e; padding:3px 8px;'
+                f' border-radius:10px; font-size:0.78em; margin:2px;">'
+                f'{html.escape(str((analyzer.DEVICE_INFO.get(s) or {}).get("name", s)))}'
+                f'<span style="color:#9fa8da; font-family:monospace; font-size:0.85em;"> {html.escape(s)}</span></span>'
                 for s in vsns
-            )
+            ) or '<span style="color:#b0bec5; font-size:0.8em;">기기 없음</span>'
+
+            # 편집 폼 — 토큰(=URL)은 그대로 두고 체크만 바꾼다
+            edit_boxes = ""
+            for _loc in sorted(_devices_by_location(), key=lambda x: (x == "미지정", x)):
+                edit_boxes += (f'<div style="margin:8px 0 3px; color:#78909c; font-size:0.78em;'
+                               f' font-weight:bold;">📍 {html.escape(_loc)}</div>')
+                for _sn2 in _devices_by_location()[_loc]:
+                    _i2 = analyzer.DEVICE_INFO[_sn2]
+                    _checked = " checked" if _sn2 in vsns else ""
+                    _tag, _color = _VIEW_KIND_TAG.get(_detail_kind(_sn2), ("기타", "#90a4ae"))
+                    edit_boxes += (
+                        f'<label style="display:block; padding:4px 2px; font-size:0.85em; cursor:pointer;">'
+                        f'<input type="checkbox" name="sns" value="{html.escape(_sn2)}"{_checked}> '
+                        f'<span style="display:inline-block; padding:1px 7px; border-radius:9px;'
+                        f' background:{_color}; color:white; font-size:0.72em; font-weight:bold;">{_tag}</span> '
+                        f'{html.escape(str(_i2.get("name", _sn2)))}'
+                        f'<span style="color:#b0bec5; font-family:monospace; font-size:0.8em;"> {html.escape(_sn2)}</span>'
+                        f'</label>')
+
             view_rows += f"""
             <tr>
                 <td style="padding:12px; vertical-align:top;">
-                    <div style="font-weight:bold; color:#1a237e;">{vname}</div>
+                    <div style="font-weight:bold; color:#1a237e;">{vname}
+                        <span style="color:#90a4ae; font-weight:normal; font-size:0.85em;">· {len(vsns)}대</span></div>
                     <div style="margin-top:4px;">{sn_chips}</div>
+                    <button type="button" class="view-edit-btn" data-target="edit-{vtok}"
+                        style="margin-top:8px; padding:5px 12px; background:transparent; color:#1a73e8;
+                               border:1px solid #1a73e8; border-radius:6px; cursor:pointer; font-size:0.8em;">
+                        \u270f\ufe0f 기기 추가/제외</button>
+                    <form method="post" action="/admin/views/edit" id="edit-{vtok}"
+                          style="display:none; margin-top:10px; padding:12px; background:#f5f7fa;
+                                 border:1px solid #cfd8dc; border-radius:8px;">
+                        <input type="hidden" name="target" value="{vtok}">
+                        <label style="display:block; font-size:0.8em; color:#546e7a; font-weight:bold;">그룹 이름</label>
+                        <input name="name" value="{vname}" required maxlength="40"
+                               style="width:100%; padding:6px 9px; margin:4px 0 8px; border:1px solid #cfd8dc;
+                                      border-radius:6px; box-sizing:border-box;">
+                        <div style="max-height:260px; overflow-y:auto; background:white; border:1px solid #e3e8ee;
+                                    border-radius:6px; padding:8px;">{edit_boxes}</div>
+                        <p style="margin:8px 0 0; font-size:0.75em; color:#78909c;">
+                            \u2705 <b>URL 은 바뀌지 않습니다</b> — 이미 배포한 주소를 그대로 쓰시면 됩니다.</p>
+                        <div style="text-align:right; margin-top:8px;">
+                            <button type="button" class="view-edit-cancel" data-target="edit-{vtok}"
+                                style="padding:6px 12px; background:#b0bec5; color:white; border:none;
+                                       border-radius:6px; cursor:pointer; font-size:0.85em;">취소</button>
+                            <button type="submit" style="padding:6px 16px; background:#16a085; color:white;
+                                border:none; border-radius:6px; cursor:pointer; font-weight:bold; font-size:0.85em;">저장</button>
+                        </div>
+                    </form>
                 </td>
                 <td style="padding:12px;">
                     <div style="border:1px solid #eee; border-radius:8px; padding:10px; background:white;">
                         {_url_block(vtok, prefix='v')}
                         <form method="post" action="/admin/views/revoke" style="margin:6px 0 0 0; text-align:right;">
                             <input type="hidden" name="target" value="{vtok}">
-                            <button type="submit" onclick="return confirm('이 그룹 URL을 폐기할까요?\\n받은 사람에게 새 URL을 다시 보내야 합니다.');" style="padding:6px 10px; background:#e57373; color:white; border:none; border-radius:6px; cursor:pointer; font-size:0.8em;">🗑️ 폐기</button>
+                            <button type="submit" onclick="return confirm('이 그룹 URL을 폐기할까요?\n받은 사람에게 새 URL을 다시 보내야 합니다.');" style="padding:6px 10px; background:#e57373; color:white; border:none; border-radius:6px; cursor:pointer; font-size:0.8em;">\U0001f5d1\ufe0f 폐기</button>
                         </form>
                     </div>
                 </td>
@@ -4257,9 +4322,30 @@ def admin_tokens(request: Request, _: str = Depends(require_admin)):
             </thead>
             <tbody>{view_rows}</tbody>
         </table>
+        <script>
+            // '기기 추가/제외' 펼치기 — 한 번에 하나만 열어 화면이 복잡해지지 않게
+            document.querySelectorAll('.view-edit-btn').forEach(function (b) {{
+                b.addEventListener('click', function () {{
+                    var f = document.getElementById(b.dataset.target);
+                    var opening = (f.style.display === 'none' || !f.style.display);
+                    document.querySelectorAll('form[id^="edit-"]').forEach(function (o) {{ o.style.display = 'none'; }});
+                    f.style.display = opening ? 'block' : 'none';
+                }});
+            }});
+            document.querySelectorAll('.view-edit-cancel').forEach(function (b) {{
+                b.addEventListener('click', function () {{
+                    document.getElementById(b.dataset.target).style.display = 'none';
+                }});
+            }});
+        </script>
         """
     else:
         views_table_html = '<p style="color:#90a4ae; padding:12px 0;">발급된 그룹 URL이 없습니다.</p>'
+
+    view_saved_banner = ('<div style="background:#e8f5e9; border-left:4px solid #43a047; padding:10px 14px;'
+                         ' margin-bottom:14px; border-radius:6px; color:#2e7d32;">'
+                         '✅ 그룹이 수정되었습니다. <b>URL 은 그대로입니다</b> — 다시 배포하지 않으셔도 됩니다.</div>'
+                         ) if view_saved else ''
 
     sn_checkboxes = ""
     for sn in sorted(analyzer.DEVICE_INFO.keys()):
@@ -4333,7 +4419,7 @@ def admin_tokens(request: Request, _: str = Depends(require_admin)):
                 <b>💡 그룹 URL이란?</b><br>
                 여러 기기를 한 페이지에 모아 보여주는 URL입니다. 대상 기기 선택 후 URL 발급을 진행하면, 선택된 기기에 대해서만 대시보드가 생성됩니다.
             </div>
-            {views_table_html}
+            {view_saved_banner}{views_table_html}
             {issue_view_form_html}
         </div>
         <script>
@@ -4412,6 +4498,36 @@ async def admin_views_issue(request: Request, _: str = Depends(require_admin)):
     views[new_tok] = {"name": name, "sns": sns}
     _save_view_tokens(views)
     return RedirectResponse("/admin/tokens", status_code=303)
+
+
+@app.post("/admin/views/edit")
+async def admin_views_edit(request: Request, _: str = Depends(require_admin)):
+    """기존 그룹의 이름·기기 목록을 수정한다. **토큰(=URL)은 그대로 둔다.**
+
+    받는 분들에게 이미 나간 주소를 바꾸지 않고 기기만 더하거나 빼기 위한 기능이다.
+    (기기가 늘 때마다 새 URL 을 발급해 다시 배포하는 건 현실적이지 않다)"""
+    form = await request.form()
+    target = (form.get("target") or "").strip()
+    views = _load_view_tokens()
+    cur = views.get(target)
+    if not isinstance(cur, dict):
+        raise HTTPException(status_code=400, detail="unknown view token")
+
+    name = (form.get("name") or "").strip() or str(cur.get("name") or "")
+    sns = [s for s in form.getlist("sns") if s in analyzer.DEVICE_INFO]
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    if not sns:
+        # 기기를 모두 빼면 그룹 대시보드가 '접근할 수 있는 그룹이 없습니다'가 되어버린다.
+        # 폐기하려는 의도라면 폐기 버튼을 써야 하므로, 여기서는 막는다.
+        raise HTTPException(status_code=400, detail="at least one device required")
+
+    before = set(cur.get("sns") or [])
+    views[target] = {"name": name, "sns": sns}
+    _save_view_tokens(views)
+    added, removed = set(sns) - before, before - set(sns)
+    print(f"[view] 그룹 '{name}' 수정 — 추가 {sorted(added)} / 제외 {sorted(removed)} (URL 유지)", flush=True)
+    return RedirectResponse("/admin/tokens?view_saved=1", status_code=303)
 
 
 @app.post("/admin/views/revoke")
