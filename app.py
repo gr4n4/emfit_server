@@ -8,7 +8,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.12.0"
+VERSION = "3.13.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -5021,6 +5021,383 @@ async def receive_fsr_data(request: Request):
 
     return {"status": "success", "source": "fsr", "device": str(data.get("deviceId"))}
 
+# ============================================================================
+#  원격 FSR 튜닝 — app.py 맨 아래 (`if __name__ == "__main__":` 앞) 에 붙여넣기
+#
+#  게이트웨이는 사용자 집 공유기 뒤에 있어 서버가 먼저 접속할 수 없다.
+#  그래서 게이트웨이가 주기적으로 물어보는 폴링 구조로 만든다.
+#
+#      게이트웨이 --(N초마다)--> GET  /jy01/cmd?gw=gw01
+#                 <------------ ECE33445000,th1,900,42   (CSV 한 줄)
+#                 --(적용 후)--> POST /jy01/cmd/ack
+#
+#  노드가 딥슬립 중이면 어떤 방식으로도 즉시 전달할 수 없다. 전화로 값을
+#  맞추려면 사용자가 노드 버튼을 3초 눌러 FSR 모드로 들여야 하고, 그때는
+#  노드가 1초마다 통신하므로 게이트웨이 폴링만 짧으면 실시간에 가까워진다.
+#  게이트웨이는 FSR 모드 노드가 있으면 폴링을 5초로 자동 전환한다.
+# ============================================================================
+
+GW_CMD_FILE = "gw_commands.json"   # 대기·완료 명령 이력
+_gw_cmd_lock = threading.Lock()
+
+# 게이트웨이가 FSR 모드 노드의 실시간 값을 올려주는 곳.
+# 초당 1건이라 파일에 쓰면 금방 커지므로 메모리에만 둔다. 서버가 재시작되면
+# 사라지지만, 튜닝 중에만 쓰는 값이라 문제되지 않는다.
+_fsr_live = {}                     # mac -> {"ts":…, "gw":…, "fsr":[…], …}
+_fsr_live_lock = threading.Lock()
+FSR_LIVE_TTL = 30                  # 초. 이보다 오래된 값은 '끊김'으로 본다
+
+# 노드에 내릴 수 있는 명령. (표시이름, 최소, 최대) — None이면 값 없는 동작 명령
+GW_CMD_SPEC = {
+    "th":     ("임계 상승폭 (전체)", 30, 3000),
+    "th1":    ("임계 상승폭 1번",    30, 3000),
+    "th2":    ("임계 상승폭 2번",    30, 3000),
+    "th3":    ("임계 상승폭 3번",    30, 3000),
+    "hyst":   ("해제 비율 (전체)",   30, 100),
+    "hyst1":  ("해제 비율 1번",      30, 100),
+    "hyst2":  ("해제 비율 2번",      30, 100),
+    "hyst3":  ("해제 비율 3번",      30, 100),
+    "nhit":   ("판정 센서 수",        1, 3),
+    "poll":   ("폴링 주기(초)",       5, 3600),
+    "hb":     ("생존신고 주기(초)",  30, 86400),
+    "led":    ("LED (0/1)",           0, 1),
+    "base":   ("무부하 기준 측정",  None, None),
+    "cal":    ("캘리브레이션 시작", None, None),
+    "calend": ("캘리브레이션 종료", None, None),
+    "apply":  ("산정값 적용",        None, None),
+    "exit":   ("FSR 모드 종료",     None, None),
+    "reboot": ("노드 재부팅",        None, None),
+}
+
+
+def _load_gw_cmds():
+    try:
+        with open(GW_CMD_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            return data
+    except Exception:
+        pass
+    return {"next_id": 1, "items": []}
+
+
+def _save_gw_cmds(data):
+    tmp = GW_CMD_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, GW_CMD_FILE)
+
+
+def _gw_cmd_prune(data, keep=200):
+    """완료·만료 항목이 무한정 쌓이지 않게 최근 것만 남긴다."""
+    items = data["items"]
+    if len(items) > keep:
+        done = [i for i in items if i["status"] != "pending"]
+        pend = [i for i in items if i["status"] == "pending"]
+        data["items"] = pend + done[-keep:]
+
+
+def _gw_cmd_add(mac, cmd, val, gw=""):
+    """명령을 대기열에 넣는다. 같은 노드의 같은 항목이 이미 대기 중이면
+    덮어쓴다 — 값을 두 번 바꾸면 마지막 것만 의미가 있기 때문."""
+    mac = (mac or "").upper().replace(":", "").replace("-", "")
+    with _gw_cmd_lock:
+        data = _load_gw_cmds()
+        for it in data["items"]:
+            if it["status"] == "pending" and it["mac"] == mac and it["cmd"] == cmd:
+                it["val"] = val
+                it["at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                _save_gw_cmds(data)
+                return it["id"]
+        cid = data["next_id"]
+        data["next_id"] = cid + 1
+        data["items"].append({
+            "id": cid, "mac": mac, "cmd": cmd, "val": val, "gw": gw,
+            "status": "pending", "result": "",
+            "at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+            "done_at": "",
+        })
+        _gw_cmd_prune(data)
+        _save_gw_cmds(data)
+        return cid
+
+
+@app.get("/jy01/cmd", response_class=PlainTextResponse)
+def gw_poll_command(gw: str = ""):
+    """게이트웨이가 대기 명령을 가져간다.
+
+    CSV 한 줄로 응답한다 — 보드에서 JSON 파서를 쓰지 않아도 되고,
+    IRAM 여유가 빠듯한 상황에서 라이브러리를 하나 덜 넣을 수 있다.
+
+        MAC,항목,값,명령ID
+        none                (대기 없음)
+
+    한 번에 하나씩만 준다. 여러 개를 몰아주면 중간에 실패했을 때
+    어디까지 적용됐는지 서버가 알 수 없다.
+    """
+    with _gw_cmd_lock:
+        data = _load_gw_cmds()
+        for it in data["items"]:
+            if it["status"] != "pending":
+                continue
+            if it.get("gw") and gw and it["gw"] != gw:
+                continue
+            it["status"] = "sent"
+            it["sent_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+            _save_gw_cmds(data)
+            val = it["val"] if it["val"] is not None else 0
+            return f"{it['mac']},{it['cmd']},{val},{it['id']}"
+    return "none"
+
+
+@app.post("/jy01/cmd/ack")
+async def gw_ack_command(request: Request):
+    """노드가 명령을 적용했다고 게이트웨이가 보고한다."""
+    try:
+        data_in = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error"}, status_code=400)
+
+    cid = data_in.get("id")
+    result = str(data_in.get("result") or "ok")
+    if cid is None:
+        return JSONResponse({"status": "error", "message": "id required"},
+                            status_code=400)
+
+    with _gw_cmd_lock:
+        data = _load_gw_cmds()
+        for it in data["items"]:
+            if it["id"] == int(cid):
+                it["status"] = "done" if result == "ok" else "fail"
+                it["result"] = result
+                it["done_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                _save_gw_cmds(data)
+                return {"status": "success"}
+    return {"status": "success", "note": "unknown id"}
+
+
+@app.post("/jy01/live")
+async def gw_fsr_live(request: Request):
+    """FSR 모드 노드의 실시간 센서값. 파일에 쓰지 않고 메모리에만 둔다."""
+    try:
+        d = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error"}, status_code=400)
+
+    mac = str(d.get("mac") or "").upper()
+    if not mac:
+        return JSONResponse({"status": "error", "message": "mac required"},
+                            status_code=400)
+
+    with _fsr_live_lock:
+        _fsr_live[mac] = {
+            "ts": datetime.now(KST).timestamp(),
+            "at": datetime.now(KST).strftime("%H:%M:%S"),
+            "gw": str(d.get("gw") or ""),
+            "name": str(d.get("name") or ""),
+            "fsr": d.get("fsr") or [0, 0, 0],
+            "base": d.get("base") or [0, 0, 0],
+            "th": d.get("th") or [0, 0, 0],
+            "hyst": d.get("hyst") or [0, 0, 0],
+            "mask": int(d.get("mask") or 0),
+            "nhit": int(d.get("nhit") or 1),
+            "batt": int(d.get("batt") or 0),
+            "rssi": int(d.get("rssi") or 0),
+            "cal": int(d.get("cal") or 0),
+        }
+    return {"status": "success"}
+
+
+@app.get("/api/fsr/live")
+def api_fsr_live(_: str = Depends(require_admin)):
+    """튜닝 화면이 1초마다 읽어가는 실시간 값."""
+    now = datetime.now(KST).timestamp()
+    out = {}
+    with _fsr_live_lock:
+        for mac, v in _fsr_live.items():
+            age = now - v["ts"]
+            item = dict(v)
+            item["age"] = round(age, 1)
+            item["stale"] = age > FSR_LIVE_TTL
+            out[mac] = item
+
+    with _gw_cmd_lock:
+        cmds = _load_gw_cmds()["items"]
+    recent = [c for c in cmds if c["status"] == "pending" or c["status"] == "sent"]
+    done = [c for c in cmds if c["status"] in ("done", "fail")][-8:]
+    return {"live": out, "pending": recent, "recent": list(reversed(done))}
+
+
+@app.post("/api/fsr/cmd")
+async def api_fsr_cmd(request: Request, _: str = Depends(require_admin)):
+    """튜닝 화면에서 명령을 등록한다."""
+    try:
+        d = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error"}, status_code=400)
+
+    mac = str(d.get("mac") or "").strip()
+    cmd = str(d.get("cmd") or "").strip()
+    if not mac or cmd not in GW_CMD_SPEC:
+        return JSONResponse({"status": "error", "message": "bad mac/cmd"},
+                            status_code=400)
+
+    label, lo, hi = GW_CMD_SPEC[cmd]
+    val = None
+    if lo is not None:
+        try:
+            val = int(d.get("val"))
+        except Exception:
+            return JSONResponse({"status": "error", "message": "value required"},
+                                status_code=400)
+        if not (lo <= val <= hi):
+            return JSONResponse(
+                {"status": "error", "message": f"{label} 범위 {lo}~{hi}"},
+                status_code=400)
+
+    cid = _gw_cmd_add(mac, cmd, val, str(d.get("gw") or ""))
+    return {"status": "success", "id": cid}
+
+
+@app.get("/fsr-tune", response_class=HTMLResponse)
+def view_fsr_tune(_: str = Depends(require_admin)):
+    """원격 FSR 튜닝 화면.
+
+    전화로 사용자와 통화하며 값을 맞추는 용도라 실시간성이 중요하다.
+    1초마다 값을 갱신하고, 명령은 누르는 즉시 대기열에 들어간다.
+    """
+    return """<!DOCTYPE html><html lang="ko"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FSR 원격 튜닝</title>
+<style>
+ body{font-family:-apple-system,'Malgun Gothic',sans-serif;margin:0;
+      background:#eceff1;color:#263238}
+ .wrap{max-width:900px;margin:0 auto;padding:16px}
+ h1{font-size:1.3em;margin:8px 0 4px}
+ .sub{color:#607d8b;font-size:.9em;margin-bottom:16px;line-height:1.6}
+ .card{background:#fff;border-radius:10px;padding:16px;margin-bottom:14px;
+       box-shadow:0 1px 3px rgba(0,0,0,.12)}
+ .name{font-size:1.15em;font-weight:bold}
+ .meta{color:#78909c;font-size:.85em;margin-top:2px}
+ .stale{background:#ffebee;border-left:4px solid #e53935}
+ .sensors{display:flex;gap:10px;margin:14px 0}
+ .sen{flex:1;background:#f5f7f8;border-radius:8px;padding:10px;text-align:center}
+ .sen.hit{background:#e8f5e9;box-shadow:inset 0 0 0 2px #43a047}
+ .sen .n{font-size:.75em;color:#90a4ae}
+ .sen .v{font-size:1.5em;font-weight:bold;margin:2px 0}
+ .sen .t{font-size:.72em;color:#78909c}
+ .bar{height:6px;background:#e0e0e0;border-radius:3px;margin-top:6px;overflow:hidden}
+ .bar i{display:block;height:100%;background:#43a047;width:0}
+ .row{display:flex;gap:6px;align-items:center;margin:6px 0;flex-wrap:wrap}
+ .row label{width:110px;font-size:.85em;color:#546e7a}
+ input[type=number]{width:80px;padding:6px;border:1px solid #cfd8dc;border-radius:6px}
+ button{padding:7px 12px;border:0;border-radius:6px;background:#00897b;color:#fff;
+        cursor:pointer;font-size:.88em}
+ button:hover{background:#00695c}
+ button.g{background:#546e7a} button.g:hover{background:#37474f}
+ button.r{background:#c62828} button.r:hover{background:#8e0000}
+ .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px;
+       padding-top:12px;border-top:1px solid #eceff1}
+ .log{font-size:.8em;color:#607d8b;margin-top:10px;line-height:1.7}
+ .badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:.75em;
+        margin-right:5px}
+ .b-pend{background:#fff3e0;color:#e65100}
+ .b-done{background:#e8f5e9;color:#2e7d32}
+ .b-fail{background:#ffebee;color:#c62828}
+ .empty{text-align:center;color:#90a4ae;padding:50px 20px;line-height:1.9}
+</style></head><body><div class="wrap">
+<h1>FSR 원격 튜닝</h1>
+<div class="sub">
+ 사용자에게 <b>노드 버튼을 3초 누르라고</b> 안내하면 FSR 모드로 들어가 값이 여기 나타납니다.<br>
+ 딥슬립 중인 노드에는 명령이 즉시 전달되지 않습니다 — 반드시 FSR 모드에서 조정하세요.
+</div>
+<div id="list"></div>
+<div class="card"><div style="font-weight:bold;margin-bottom:8px">최근 명령</div>
+ <div id="hist" class="log">-</div></div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+let LIVE={};
+
+async function send(mac,cmd,valSel){
+  let val=null;
+  if(valSel){
+    const el=document.querySelector(valSel);
+    if(!el||el.value==='') { alert('값을 입력하세요'); return; }
+    val=parseInt(el.value);
+  }
+  const r=await fetch('/api/fsr/cmd',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mac,cmd,val})});
+  const j=await r.json();
+  if(j.status!=='success') alert(j.message||'실패');
+  tick();
+}
+
+function card(mac,d){
+  const hit=i=>(d.mask>>i)&1;
+  const sens=[0,1,2].map(i=>{
+    const on=d.base[i]+d.th[i];
+    const pct=Math.min(100,Math.max(0,(d.fsr[i]-d.base[i])/Math.max(1,d.th[i])*100));
+    return `<div class="sen ${hit(i)?'hit':''}">
+      <div class="n">${i+1}번</div><div class="v">${d.fsr[i]}</div>
+      <div class="t">기준 ${d.base[i]} · 감지 ${on}</div>
+      <div class="bar"><i style="width:${pct}%"></i></div></div>`;
+  }).join('');
+
+  const num=(cmd,label,ph)=>`<div class="row">
+     <label>${label}</label>
+     <input type="number" id="i-${mac}-${cmd}" placeholder="${ph}">
+     <button onclick="send('${mac}','${cmd}','#i-${mac}-${cmd}')">전송</button></div>`;
+
+  return `<div class="card ${d.stale?'stale':''}">
+    <div class="name">${d.name||mac} ${d.cal?'<span class="badge b-pend">CAL 측정중</span>':''}</div>
+    <div class="meta">${mac} · ${d.gw} · 배터리 ${d.batt}% · ${d.rssi}dBm
+      · ${d.stale?'<b style="color:#c62828">'+Math.round(d.age)+'초 끊김</b>':d.at}</div>
+    <div class="sensors">${sens}</div>
+    ${num('th1','임계 1번','상승폭 mV')}
+    ${num('th2','임계 2번','상승폭 mV')}
+    ${num('th3','임계 3번','상승폭 mV')}
+    ${num('th','임계 일괄','상승폭 mV')}
+    ${num('hyst','해제 비율','30~100')}
+    ${num('nhit','판정 센서 수','1~3')}
+    <div class="acts">
+      <button class="g" onclick="send('${mac}','base')">기준 측정</button>
+      <button class="g" onclick="send('${mac}','cal')">CAL 시작</button>
+      <button class="g" onclick="send('${mac}','calend')">CAL 종료</button>
+      <button onclick="send('${mac}','apply')">산정값 적용</button>
+      <button class="g" onclick="send('${mac}','exit')">FSR 모드 종료</button>
+      <button class="r" onclick="if(confirm('노드를 재부팅합니다'))send('${mac}','reboot')">재부팅</button>
+    </div></div>`;
+}
+
+async function tick(){
+  try{
+    const j=await(await fetch('/api/fsr/live')).json();
+    LIVE=j.live;
+    const macs=Object.keys(LIVE);
+    $('#list').innerHTML = macs.length
+      ? macs.map(m=>card(m,LIVE[m])).join('')
+      : `<div class="card empty">FSR 모드인 노드가 없습니다.<br>
+          사용자에게 노드 버튼을 3초 누르라고 안내하세요.<br>
+          <span style="font-size:.9em">흰색 LED가 길게 한 번 켜지면 진입한 것입니다.</span></div>`;
+
+    let h='';
+    (j.pending||[]).forEach(c=>{
+      h+=`<div><span class="badge b-pend">대기</span>${c.mac} ${c.cmd}`
+       + (c.val!==null?' = '+c.val:'')+` <span style="color:#b0bec5">${c.at}</span></div>`;
+    });
+    (j.recent||[]).forEach(c=>{
+      const b=c.status==='done'?'b-done':'b-fail';
+      h+=`<div><span class="badge ${b}">${c.status==='done'?'완료':'실패'}</span>`
+       + `${c.mac} ${c.cmd}`+(c.val!==null?' = '+c.val:'')
+       + ` <span style="color:#b0bec5">${c.done_at||c.at}</span></div>`;
+    });
+    $('#hist').innerHTML = h || '<span style="color:#b0bec5">없음</span>';
+  }catch(e){}
+}
+tick(); setInterval(tick,1000);
+</script></body></html>"""
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=80)

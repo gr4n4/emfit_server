@@ -22,6 +22,7 @@ feedback.jsonl
 assignments.json
 preferences.json
 device_info.json
+gw_commands.json
 
 # 일별 리포트 출력물 (재생성 가능)
 *_리포트.csv
