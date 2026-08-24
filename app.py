@@ -1,14 +1,22 @@
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    # Windows 콘솔 기본 코드페이지(cp949)는 한글 로그의 em dash(—) 등을 인코딩 못 해
+    # print() 가 있는 모듈을 import 하는 순간 UnicodeEncodeError 로 서버가 죽는다.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from fastapi import FastAPI, Request, Query, HTTPException, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, RedirectResponse, JSONResponse
-import json, os, uvicorn, threading, io, zipfile, html, secrets, hmac, hashlib
+import json, os, uvicorn, threading, io, zipfile, html, secrets, hmac, hashlib, time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import pandas as pd
+import requests
 import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.14.0"
+VERSION = "3.15.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -31,6 +39,7 @@ TOKENS_FILE = "device_tokens.json"
 VIEW_TOKENS_FILE = "view_tokens.json"  # 그룹(여러 기기 묶음) 보기 토큰
 ADMIN_PW_FILE = "admin_password.txt"
 PREFERENCES_FILE = "preferences.json"  # viewer 단위 UI 환경설정 (블록 순서 등)
+DISCORD_CONFIG_FILE = "discord_config.json"  # Webhook URL·끊김 임계값 (/admin/discord 에서 편집)
 ADMIN_COOKIE = "emfit_admin"  # device 토큰 쿠키 이름 (변수 이름은 옛 잔재)
 SESSION_COOKIE = "emfit_session"  # 관리자 로그인 세션 쿠키
 VIEW_COOKIE = "emfit_view"  # 그룹(view) 토큰 쿠키
@@ -362,6 +371,110 @@ def _warmup_then_ready():
 
 # 서비스 시작 시 백그라운드에서 캐시 워밍업 (첫 요청 느림 방지)
 threading.Thread(target=_warmup_then_ready, daemon=True).start()
+
+
+# ── 디스코드 연결 끊김 알림 ──────────────────────────────────────
+# Webhook URL·임계값은 파일로 저장해서 /admin/discord 화면에서 바로 바꿀 수 있고,
+# 서버 재시작 없이 다음 점검 주기(1분 이내)부터 반영된다.
+DISCORD_CHECK_INTERVAL_SEC = 60
+_DEFAULT_DISCORD_CONFIG = {"webhook_url": "", "threshold_minutes": 30, "enabled": False}
+_discord_config_lock = threading.Lock()
+# {sn: True}  끊김 알림을 이미 보낸 기기. 복구되면 지워서 다음에 또 끊기면 다시 보낸다.
+_discord_alerted = {}
+
+
+def _load_discord_config():
+    with _discord_config_lock:
+        if not os.path.exists(DISCORD_CONFIG_FILE):
+            return dict(_DEFAULT_DISCORD_CONFIG)
+        try:
+            with open(DISCORD_CONFIG_FILE, encoding="utf-8") as f:
+                cfg = json.load(f)
+            return {**_DEFAULT_DISCORD_CONFIG, **cfg}
+        except Exception:
+            return dict(_DEFAULT_DISCORD_CONFIG)
+
+
+def _save_discord_config(cfg):
+    with _discord_config_lock:
+        with open(DISCORD_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def _send_discord_message(webhook_url, content):
+    """알림 실패가 서버를 죽이면 안 되므로 예외는 여기서 삼킨다."""
+    try:
+        resp = requests.post(webhook_url, json={"content": content}, timeout=10)
+        return 200 <= resp.status_code < 300
+    except Exception as e:
+        print(f"[discord] 알림 전송 실패: {e}", flush=True)
+        return False
+
+
+def _discord_device_snapshot(threshold_sec):
+    """숨기지 않은 기기 전체의 연결 상태 스냅샷.
+    /admin/discord 설정 화면, 끊김 감시 루프, 디스코드 봇 API가 모두 이 함수 하나를 써서
+    '연결됨' 판정 기준이 세 곳에서 어긋나지 않게 한다."""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    statuses = analyzer.get_device_statuses()
+    out = []
+    for sn in sorted(analyzer.DEVICE_INFO):
+        info = analyzer.DEVICE_INFO[sn]
+        if info.get("hidden"):
+            continue
+        ds = statuses.get(sn)
+        last_seen = ds.get("last_seen_ts") if isinstance(ds, dict) else None
+        name = str(info.get("name") or sn)
+        location = str(info.get("location") or "").strip()
+        if location == "-":
+            location = ""
+        if isinstance(last_seen, (int, float)):
+            age_sec = now_ts - last_seen
+            connected = age_sec < threshold_sec
+            last_seen_text = _format_ago(int(age_sec))
+        else:
+            age_sec, connected, last_seen_text = None, None, "통신 이력 없음"
+        out.append({
+            "sn": sn, "name": name, "location": location,
+            "connected": connected, "age_sec": age_sec, "last_seen_text": last_seen_text,
+        })
+    return out
+
+
+def _discord_check_once():
+    cfg = _load_discord_config()
+    if not cfg.get("enabled") or not cfg.get("webhook_url"):
+        return
+    threshold_sec = max(1, int(cfg.get("threshold_minutes") or 30)) * 60
+
+    for d in _discord_device_snapshot(threshold_sec):
+        if d["connected"] is None:
+            continue  # 한 번도 통신한 적 없는 기기 — 판단 근거가 없으니 건너뜀
+        sn = d["sn"]
+        was_alerted = _discord_alerted.get(sn, False)
+        label = f"{d['name']} ({d['location']})" if d["location"] else d["name"]
+
+        if not d["connected"] and not was_alerted:
+            _send_discord_message(
+                cfg["webhook_url"],
+                f"🔴 **연결 끊김** — {label}\n마지막 통신: {d['last_seen_text']}",
+            )
+            _discord_alerted[sn] = True
+        elif d["connected"] and was_alerted:
+            _send_discord_message(cfg["webhook_url"], f"🟢 **연결 복구** — {label}")
+            _discord_alerted.pop(sn, None)
+
+
+def _discord_monitor_loop():
+    while True:
+        try:
+            _discord_check_once()
+        except Exception as e:
+            print(f"[discord] 점검 중 오류: {e}", flush=True)
+        time.sleep(DISCORD_CHECK_INTERVAL_SEC)
+
+
+threading.Thread(target=_discord_monitor_loop, daemon=True).start()
 
 
 @app.middleware("http")
@@ -1486,6 +1599,7 @@ def _v2_page(p):
       <a class="v2ni" href="/view"><svg><use href="#i-place"/></svg>장소별 보기</a>
       <div class="v2nl">관리</div>
       <a class="v2ni" href="/devices"><svg><use href="#i-cog"/></svg>장비 관리</a>
+      <a class="v2ni" href="/admin/discord"><svg><use href="#i-cog"/></svg>디스코드 알림</a>
       <div class="v2nl">자료</div>
       <a class="v2ni" href="/reports"><svg><use href="#i-report"/></svg>리포트</a>
       <a class="v2ni" href="/help"><svg><use href="#i-book"/></svg>사용 가이드</a>
@@ -1563,6 +1677,7 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                     <a href="/reports" style="display:inline-block; padding:10px 20px; background:#1a73e8; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">📊 리포트 다운로드</a>
                     <a href="/devices" style="display:inline-block; padding:10px 20px; background:#8e44ad; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">⚙️ 기기 정보</a>
                     <a href="/admin/tokens" style="display:inline-block; padding:10px 20px; background:#16a085; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🔑 사용자 URL 관리</a>
+                    <a href="/admin/discord" style="display:inline-block; padding:10px 20px; background:#5865F2; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🔔 디스코드 알림</a>
                     <a href="/feedback" style="display:inline-block; padding:10px 20px; background:#e67e22; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">💬 의견 보기</a>
                     <a href="/help" style="display:inline-block; padding:10px 20px; background:#27ae60; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">📘 사용 가이드</a>
                     <a href="/fsr-nodes" style="display:inline-block; padding:10px 20px; background:#d35400; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🛏️ FSR 노드 설정</a>
@@ -4213,6 +4328,188 @@ async def feedback_reply(request: Request, _: str = Depends(require_admin)):
     })
     _save_feedback_items(items)
     return RedirectResponse("/feedback", status_code=303)
+
+
+def _discord_settings_page_html(cfg, banner=""):
+    now_ts = datetime.now(timezone.utc).timestamp()
+    statuses = analyzer.get_device_statuses()
+    rows = ""
+    for sn in sorted(analyzer.DEVICE_INFO):
+        info = analyzer.DEVICE_INFO[sn]
+        if info.get("hidden"):
+            continue
+        ds = statuses.get(sn)
+        last_seen = ds.get("last_seen_ts") if isinstance(ds, dict) else None
+        if isinstance(last_seen, (int, float)):
+            age_sec = now_ts - last_seen
+            seen_txt = _format_ago(int(age_sec))
+            alerted = _discord_alerted.get(sn, False)
+            dot = "🔴" if alerted else "🟢"
+        else:
+            seen_txt, dot = "통신 이력 없음", "⚪"
+        name = html.escape(str(info.get("name") or sn))
+        loc = html.escape(str(info.get("location") or ""))
+        rows += (f'<tr><td style="padding:8px; border-top:1px solid #eee;">{dot}</td>'
+                 f'<td style="padding:8px; border-top:1px solid #eee;">{name}</td>'
+                 f'<td style="padding:8px; border-top:1px solid #eee; color:#78909c;">{loc}</td>'
+                 f'<td style="padding:8px; border-top:1px solid #eee; color:#78909c;">{seen_txt}</td></tr>')
+
+    webhook_val = html.escape(str(cfg.get("webhook_url") or ""))
+    threshold_val = int(cfg.get("threshold_minutes") or 30)
+    checked = "checked" if cfg.get("enabled") else ""
+
+    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<title>디스코드 알림 설정 · 돌봄기기 통합 대시보드</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ font-family:'Malgun Gothic',sans-serif; background:#f0f2f5; margin:0; padding:24px; color:#37474f; }}
+.wrap {{ max-width:640px; margin:0 auto; }}
+h1 {{ color:#1a237e; font-size:1.4em; }}
+.card {{ background:white; border-radius:14px; padding:24px; box-shadow:0 2px 8px rgba(0,0,0,0.06); margin-bottom:20px; }}
+label {{ display:block; font-weight:bold; margin:14px 0 6px; font-size:0.92em; }}
+input[type=url], input[type=number] {{ width:100%; padding:10px; border:1px solid #ddd; border-radius:8px;
+    font-size:1em; box-sizing:border-box; }}
+.hint {{ color:#90a4ae; font-size:0.82em; margin-top:4px; }}
+.row {{ display:flex; align-items:center; gap:8px; margin-top:16px; }}
+.btn {{ display:inline-block; padding:10px 22px; border:none; border-radius:8px; font-weight:bold;
+    font-size:1em; cursor:pointer; text-decoration:none; }}
+.btn-save {{ background:#1a73e8; color:white; }}
+.btn-test {{ background:#5865F2; color:white; margin-left:8px; }}
+.banner {{ padding:12px 16px; border-radius:8px; margin-bottom:16px; font-size:0.92em; }}
+.banner.ok {{ background:#e8f5e9; color:#1b5e20; }}
+.banner.err {{ background:#ffebee; color:#b71c1c; }}
+table {{ width:100%; border-collapse:collapse; font-size:0.9em; }}
+</style></head>
+<body><div class="wrap">
+<h1>🔔 디스코드 연결 끊김 알림</h1>
+{banner}
+<div class="card">
+    <form method="post" action="/admin/discord/save">
+        <label>Discord Webhook URL</label>
+        <input type="url" name="webhook_url" placeholder="https://discord.com/api/webhooks/..." value="{webhook_val}" required>
+        <div class="hint">디스코드 채널 설정 → 연동 → Webhook 만들기 → URL 복사해서 붙여넣으면 됩니다.</div>
+
+        <label>연결 끊김 판정 기준 (분)</label>
+        <input type="number" name="threshold_minutes" min="1" value="{threshold_val}" required>
+        <div class="hint">기기가 이 시간 동안 통신이 없으면 알림을 보냅니다. 나중에 언제든 이 화면에서 바꿀 수 있습니다.</div>
+
+        <div class="row">
+            <input type="checkbox" id="enabled" name="enabled" {checked} style="width:auto;">
+            <label for="enabled" style="margin:0;">알림 켜기</label>
+        </div>
+
+        <div class="row">
+            <button type="submit" class="btn btn-save">저장</button>
+        </div>
+    </form>
+    <form method="post" action="/admin/discord/test" style="display:inline;">
+        <button type="submit" class="btn btn-test">🧪 테스트 알림 보내기</button>
+    </form>
+    <form method="post" action="/admin/discord/baseline" style="display:inline;"
+          onsubmit="return confirm('지금 끊겨있는 기기는 전부 무시하고, 앞으로 새로 끊기는 기기만 알림을 받습니다. 계속할까요?');">
+        <button type="submit" class="btn" style="background:#78909c; color:white; margin-left:8px;">
+            🙈 지금 끊긴 건 무시하고 시작
+        </button>
+    </form>
+    <div class="hint" style="margin-top:8px;">
+        알림을 처음 켤 때 누르면, 이미 오래 끊겨있던 기기들 때문에 한꺼번에 알림이 쏟아지는 걸 막을 수 있습니다.
+        이후 새로 끊기는 기기만 알림이 옵니다.
+    </div>
+</div>
+
+<div class="card">
+    <b>현재 기기 상태</b> <span class="hint">(🔴 = 지금 알림이 나가 있는 기기)</span>
+    <table>
+        <tr><th style="text-align:left; padding:8px;"></th><th style="text-align:left; padding:8px;">기기</th>
+            <th style="text-align:left; padding:8px;">위치</th><th style="text-align:left; padding:8px;">마지막 통신</th></tr>
+        {rows}
+    </table>
+</div>
+
+<p><a href="/devices" style="color:#1a73e8; text-decoration:none;">← 장비 관리로 돌아가기</a></p>
+</div></body></html>"""
+
+
+# 관리자: 디스코드 연결 끊김 알림 설정 (Webhook URL·임계값)
+@app.get("/admin/discord", response_class=HTMLResponse)
+def admin_discord(request: Request, saved: int = 0, test: int = -1, baseline: int = -1,
+                   _: str = Depends(require_admin)):
+    cfg = _load_discord_config()
+    banner = ""
+    if saved:
+        banner = '<div class="banner ok">✅ 저장되었습니다. 다음 점검 주기(최대 1분)부터 반영됩니다.</div>'
+    elif test == 1:
+        banner = '<div class="banner ok">✅ 테스트 메시지를 보냈습니다. 디스코드 채널을 확인해보세요.</div>'
+    elif test == 0:
+        banner = '<div class="banner err">❌ 전송 실패 — Webhook URL을 다시 확인해주세요.</div>'
+    elif baseline >= 0:
+        banner = (f'<div class="banner ok">✅ 현재 끊겨있는 기기 {baseline}대는 무시하도록 표시했습니다. '
+                   '이 시점 이후 새로 끊기는 기기만 알림이 갑니다.</div>')
+    return HTMLResponse(_discord_settings_page_html(cfg, banner=banner))
+
+
+@app.post("/admin/discord/save")
+async def admin_discord_save(request: Request, _: str = Depends(require_admin)):
+    form = await request.form()
+    webhook_url = (form.get("webhook_url") or "").strip()
+    try:
+        threshold_minutes = max(1, int(form.get("threshold_minutes") or 30))
+    except ValueError:
+        threshold_minutes = 30
+    cfg = {
+        "webhook_url": webhook_url,
+        "threshold_minutes": threshold_minutes,
+        "enabled": form.get("enabled") == "on",
+    }
+    _save_discord_config(cfg)
+    return RedirectResponse("/admin/discord?saved=1", status_code=303)
+
+
+@app.post("/admin/discord/test")
+def admin_discord_test(_: str = Depends(require_admin)):
+    cfg = _load_discord_config()
+    ok = bool(cfg.get("webhook_url")) and _send_discord_message(
+        cfg["webhook_url"], "🧪 테스트 알림 — 돌봄기기 통합 대시보드에서 보냈습니다."
+    )
+    return RedirectResponse(f"/admin/discord?test={1 if ok else 0}", status_code=303)
+
+
+@app.post("/admin/discord/baseline")
+def admin_discord_baseline(_: str = Depends(require_admin)):
+    """'지금 끊겨있는 기기'를 전부 이미-알림-보냄 상태로 찍어둔다.
+    알림을 켤 때 오래전부터 끊겨있던 기기까지 한꺼번에 쏟아지는 걸 막고,
+    이 시점 이후 '새로' 끊기는 기기만 알림이 가게 하려는 용도."""
+    cfg = _load_discord_config()
+    threshold_sec = max(1, int(cfg.get("threshold_minutes") or 30)) * 60
+    marked = 0
+    for d in _discord_device_snapshot(threshold_sec):
+        if d["connected"] is False:
+            _discord_alerted[d["sn"]] = True
+            marked += 1
+        else:
+            _discord_alerted.pop(d["sn"], None)
+    return RedirectResponse(f"/admin/discord?baseline={marked}", status_code=303)
+
+
+# 디스코드 봇(discord_bot.py, 별도 프로세스)이 슬래시 명령어에 답할 때 쓰는 내부 API.
+# 봇 프로세스가 로그 파일을 다시 파싱하지 않도록, 이미 메모리에 떠 있는 상태를 그대로 내려준다.
+# 외부 노출 방지를 위해 localhost 요청만 허용한다 (인증 토큰 없이도 안전하도록).
+@app.get("/internal/discord/status")
+def internal_discord_status(request: Request):
+    client_host = request.client.host if request.client else None
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="localhost only")
+    cfg = _load_discord_config()
+    threshold_sec = max(1, int(cfg.get("threshold_minutes") or 30)) * 60
+    devices = _discord_device_snapshot(threshold_sec)
+    return JSONResponse({
+        "threshold_minutes": cfg.get("threshold_minutes"),
+        "total": len(devices),
+        "connected": sum(1 for d in devices if d["connected"] is True),
+        "disconnected": sum(1 for d in devices if d["connected"] is False),
+        "unknown": sum(1 for d in devices if d["connected"] is None),
+        "devices": devices,
+    })
 
 
 # 그룹(view) 편집 UI 용 — 기기 종류 태그. 대시보드 섹션과 같은 색을 써서 한눈에 구분된다.
