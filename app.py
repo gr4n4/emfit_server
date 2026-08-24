@@ -1565,6 +1565,8 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                     <a href="/admin/tokens" style="display:inline-block; padding:10px 20px; background:#16a085; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🔑 사용자 URL 관리</a>
                     <a href="/feedback" style="display:inline-block; padding:10px 20px; background:#e67e22; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">💬 의견 보기</a>
                     <a href="/help" style="display:inline-block; padding:10px 20px; background:#27ae60; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">📘 사용 가이드</a>
+                    <a href="/fsr-nodes" style="display:inline-block; padding:10px 20px; background:#d35400; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🛏️ FSR 노드 설정</a>
+                    <a href="/fsr-tune" style="display:inline-block; padding:10px 20px; background:#c0392b; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🎚️ FSR 실시간 튜닝</a>
                     <a href="/dashboard/raw" style="display:inline-block; padding:10px 20px; background:#7f8c8d; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🔎 원본 데이터</a>
                     <a href="/logout" style="display:inline-block; padding:10px 20px; background:#b0bec5; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🚪 로그아웃</a>
                 </p>
@@ -5019,6 +5021,11 @@ async def receive_fsr_data(request: Request):
         return JSONResponse({"status": "error", "message": f"log write failed: {e}"},
                             status_code=500)
 
+    try:
+        _fsr_last_update(record)
+    except Exception:
+        pass
+
     return {"status": "success", "source": "fsr", "device": str(data.get("deviceId"))}
 
 # ============================================================================
@@ -5039,6 +5046,8 @@ async def receive_fsr_data(request: Request):
 
 GW_CMD_FILE = "gw_commands.json"   # 대기·완료 명령 이력
 _gw_cmd_lock = threading.Lock()
+
+GW_CMD_SENT_TTL = 90 # jy 추가, gw_poll_command_new
 
 # 게이트웨이가 FSR 모드 노드의 실시간 값을 올려주는 곳.
 # 초당 1건이라 파일에 쓰면 금방 커지므로 메모리에만 둔다. 서버가 재시작되면
@@ -5121,6 +5130,13 @@ def _gw_cmd_add(mac, cmd, val, gw=""):
         _save_gw_cmds(data)
         return cid
 
+# 게이트웨이가 가져갔지만 결과 보고가 없는 명령을 언제 다시 내줄지.
+#
+# 노드는 딥슬립 주기(기본 poll 5초)만큼 늦게 받고, 게이트웨이도 최대
+# 30초 주기로 폴링한다. 여기에 재전송 여유를 더해 90초로 잡았다.
+# 더 짧으면 아직 전달 중인 명령을 중복 발행하고, 길면 게이트웨이가
+# 재부팅했을 때 사용자가 그만큼 오래 기다린다.
+
 
 @app.get("/jy01/cmd", response_class=PlainTextResponse)
 def gw_poll_command(gw: str = ""):
@@ -5134,20 +5150,69 @@ def gw_poll_command(gw: str = ""):
 
     한 번에 하나씩만 준다. 여러 개를 몰아주면 중간에 실패했을 때
     어디까지 적용됐는지 서버가 알 수 없다.
+
+    ★ 같은 노드에 대해서는 앞 명령의 결과 보고를 받기 전까지 다음 명령을
+      내주지 않는다.
+
+      게이트웨이는 노드당 대기 명령을 하나만 들고 있어서, 결과를 안 기다리고
+      연달아 내주면 앞의 것이 조용히 덮여 사라진다. 튜닝 화면에서 th1·th2·th3
+      을 차례로 누르는 것은 정상적인 사용 흐름인데, 이전 구현에서는 마지막
+      하나만 적용되고 나머지는 화면에 '대기'로 영원히 남았다.
+
+      노드가 다르면 서로 영향이 없으므로 그대로 진행한다.
+
+    ★ 가져간 지 GW_CMD_SENT_TTL 초가 지나도록 보고가 없으면 다시 대기로
+      되돌린다. 게이트웨이의 대기 명령은 RAM에만 있어 재부팅하면 사라지는데,
+      이 복구가 없으면 서버는 'sent' 상태로 멈춘 채 재발행하지 않는다.
     """
+    now = datetime.now(KST)
+
     with _gw_cmd_lock:
         data = _load_gw_cmds()
+        dirty = False
+
+        # 1) 응답 없이 오래된 sent 를 회수한다
+        for it in data["items"]:
+            if it["status"] != "sent":
+                continue
+            sent_at = it.get("sent_at")
+            if not sent_at:
+                it["status"] = "pending"
+                dirty = True
+                continue
+            try:
+                t = datetime.strptime(sent_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+            except ValueError:
+                it["status"] = "pending"
+                dirty = True
+                continue
+            if (now - t).total_seconds() > GW_CMD_SENT_TTL:
+                it["status"] = "pending"
+                it["retries"] = int(it.get("retries", 0)) + 1
+                dirty = True
+
+        # 2) 아직 결과를 기다리는 중인 노드는 건너뛴다
+        busy = {it["mac"] for it in data["items"] if it["status"] == "sent"}
+
         for it in data["items"]:
             if it["status"] != "pending":
                 continue
             if it.get("gw") and gw and it["gw"] != gw:
                 continue
+            if it["mac"] in busy:
+                continue
+
             it["status"] = "sent"
-            it["sent_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+            it["sent_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
             _save_gw_cmds(data)
             val = it["val"] if it["val"] is not None else 0
             return f"{it['mac']},{it['cmd']},{val},{it['id']}"
+
+        if dirty:
+            _save_gw_cmds(data)
+
     return "none"
+
 
 
 @app.post("/jy01/cmd/ack")
@@ -5255,7 +5320,12 @@ async def api_fsr_cmd(request: Request, _: str = Depends(require_admin)):
                 {"status": "error", "message": f"{label} 범위 {lo}~{hi}"},
                 status_code=400)
 
-    cid = _gw_cmd_add(mac, cmd, val, str(d.get("gw") or ""))
+    gw = str(d.get("gw") or "")
+    if not gw:
+        with _fsr_last_lock:
+            gw = str((_fsr_last.get(mac) or {}).get("gw") or "")
+
+    cid = _gw_cmd_add(mac, cmd, val, gw)
     return {"status": "success", "id": cid}
 
 
@@ -5398,6 +5468,267 @@ async function tick(){
 }
 tick(); setInterval(tick,1000);
 </script></body></html>"""
+
+# ============================================================================
+#  하트비트 원격 조정 — app.py 에 추가할 내용
+#
+#  기존 /fsr-tune 은 FSR 모드 노드만 다룬다. 값을 실시간으로 보면서 반복
+#  조정하는 화면이라 그게 맞다. 다만 사용자에게 전화해서 "버튼 3초 눌러
+#  주세요" 를 매번 부탁해야 한다.
+#
+#  이 화면은 반대다. 이미 아는 값을 조용히 한 번 넣는 용도.
+#  노드는 하트비트(기본 240초)마다 깨서 신호를 보내고, 게이트웨이는 그때
+#  대기 중인 명령을 함께 실어 보낸다. 사용자는 아무것도 하지 않아도 된다.
+#  대신 반영까지 최대 하트비트 주기만큼 걸리고, 결과 확인은 그다음
+#  하트비트에나 가능하다.
+#
+#  게이트웨이·노드 펌웨어 수정은 필요 없다. 명령 발행은 기존
+#  /api/fsr/cmd 를 그대로 쓴다.
+#
+#  ★ 단, 게이트웨이가 이벤트 JSON 에 mac/base/th/hyst/hb 를 실어 보내야
+#    한다. 그 버전으로 굽지 않았다면 이 화면에 노드가 뜨긴 하지만 현재
+#    설정값이 비어 있고 명령도 낼 수 없다 (MAC 을 모르기 때문).
+# ============================================================================
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  [1] receive_fsr_data() 안에 세 줄 추가
+#
+#      기존 코드에서 이 부분을 찾아
+#
+#          return {"status": "success", "source": "fsr", "device": str(data.get("deviceId"))}
+#
+#      바로 위에 아래 세 줄을 넣는다. (들여쓰기 4칸)
+#
+#          try:
+#              _fsr_last_update(record)
+#          except Exception:
+#              pass          # 화면용 부가기능이라 수신 자체를 막으면 안 된다
+# ────────────────────────────────────────────────────────────────────────────
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  [2] 아래 전체를 app.py 맨 아래 (`if __name__ == "__main__":` 앞) 에 붙여넣기
+# ────────────────────────────────────────────────────────────────────────────
+
+# 노드별 마지막 상태. 파일에 쓰지 않고 메모리에만 둔다 —
+# 원본은 이미 FSR_LOG_FILE 에 남고, 이건 화면 표시용 캐시일 뿐이다.
+_fsr_last = {}
+_fsr_last_lock = threading.Lock()
+
+
+def _fsr_last_update(record):
+    """POST /jy01 로 들어온 이벤트에서 노드 상태를 갱신한다.
+
+    mac 이 없으면 저장하지 않는다. 화면의 목적이 원격 조정인데 MAC 이
+    없으면 명령을 낼 수 없어서, 조정할 수 없는 카드를 띄우는 것은 오히려
+    혼란스럽다. (게이트웨이 펌웨어가 구버전이면 mac 이 없다)
+    """
+    mac = str(record.get("mac") or "").upper()
+    if not mac:
+        return
+
+    with _fsr_last_lock:
+        _fsr_last[mac] = {
+            "ts":    datetime.now(KST).timestamp(),
+            "at":    datetime.now(KST).strftime("%m-%d %H:%M:%S"),
+            "name":  str(record.get("deviceId") or ""),
+            "gw":    str(record.get("gw") or ""),
+            "event": str(record.get("event") or ""),
+            "fsr":   record.get("fsr")  or [0, 0, 0],
+            "base":  record.get("base") or [0, 0, 0],
+            "th":    record.get("th")   or [0, 0, 0],
+            "hyst":  record.get("hyst") or [0, 0, 0],
+            "mask":  int(record.get("mask") or 0),
+            "nhit":  int(record.get("nhit") or 1),
+            "hb":    int(record.get("hb") or 0),
+            "batt":  int(record.get("battery_pct") or 0),
+            "rssi":  int(record.get("rssi") or 0),
+            "drops": int(record.get("drops") or 0),
+        }
+
+
+@app.get("/api/fsr/nodes")
+def api_fsr_nodes(_: str = Depends(require_admin)):
+    """조정 화면이 주기적으로 읽어가는 노드 목록."""
+    now = datetime.now(KST).timestamp()
+    out = []
+
+    with _fsr_last_lock:
+        for mac, v in _fsr_last.items():
+            it = dict(v)
+            it["mac"] = mac
+            age = now - v["ts"]
+            it["age"] = int(age)
+
+            # 무소식 판정은 노드가 알려준 hb 에서 계산한다. 노드마다 hb 를
+            # 다르게 둘 수 있어 서버가 상수로 추측하면 멀쩡한 노드가 끊김으로
+            # 뜬다. 게이트웨이와 같은 배수(2.5)를 쓴다.
+            hb = v["hb"] or 240
+            it["stale"] = age > max(hb * 2.5, 60)
+            it["wait"]  = hb            # 명령 반영까지 최대 이만큼
+            out.append(it)
+
+    out.sort(key=lambda x: x["name"] or x["mac"])
+
+    with _gw_cmd_lock:
+        cmds = _load_gw_cmds()["items"]
+    pending = [c for c in cmds if c["status"] in ("pending", "sent")]
+    recent  = [c for c in cmds if c["status"] in ("done", "fail")][-10:]
+    return {"nodes": out, "pending": pending, "recent": list(reversed(recent))}
+
+
+@app.get("/fsr-nodes", response_class=HTMLResponse)
+def view_fsr_nodes(_: str = Depends(require_admin)):
+    return """<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FSR 노드 설정</title>
+<style>
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+      background:#eef1f5;margin:0;padding:16px;color:#222}
+ h1{font-size:20px;margin:0 0 4px}
+ .sub{color:#667;font-size:13px;margin:0 0 4px;line-height:1.6}
+ .warn{background:#fff8e1;border-left:4px solid #ffb300;padding:10px 12px;
+       border-radius:4px;font-size:13px;margin:12px 0;line-height:1.6}
+ .card{background:#fff;border-radius:8px;padding:16px;margin:12px 0;
+       box-shadow:0 1px 3px rgba(0,0,0,.08)}
+ .card.stale{opacity:.55;border-left:4px solid #d33}
+ .card.used{border-left:4px solid #2e7d32}
+ .hd{display:flex;justify-content:space-between;align-items:baseline;
+     flex-wrap:wrap;gap:8px;margin-bottom:10px}
+ .nm{font-size:17px;font-weight:600}
+ .meta{color:#778;font-size:12px}
+ table{width:100%;border-collapse:collapse;font-size:13px;margin:8px 0}
+ th,td{padding:5px 6px;text-align:right;border-bottom:1px solid #eee}
+ th:first-child,td:first-child{text-align:left;color:#667}
+ .hit{color:#2e7d32;font-weight:600}
+ .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+ .row label{font-size:12px;color:#556;min-width:74px}
+ input{width:78px;padding:6px;border:1px solid #ccd;border-radius:4px;font-size:14px}
+ button{padding:7px 13px;border:0;border-radius:4px;background:#3949ab;
+        color:#fff;font-size:13px;cursor:pointer}
+ button:hover{background:#283593}
+ button.sec{background:#607d8b}
+ button.sec:hover{background:#455a64}
+ .cl{font-size:13px;padding:5px 0;border-bottom:1px solid #f0f0f0}
+ .ok{color:#2e7d32}.ng{color:#c62828}.wt{color:#ef6c00}
+ .none{color:#889;text-align:center;padding:28px 0}
+</style></head><body>
+
+<h1>FSR 노드 설정</h1>
+<p class="sub">노드가 하트비트로 깰 때 설정이 반영됩니다. 사용자가 버튼을 누를 필요가 없습니다.</p>
+<div class="warn">
+ <b>반영까지 시간이 걸립니다.</b> 값을 보내면 노드가 다음에 깰 때까지 기다렸다가 적용됩니다
+ (보통 몇 분). 화면의 현재값도 그다음 신호가 와야 갱신됩니다.<br>
+ 값을 보면서 바로바로 맞춰야 한다면 <a href="/fsr-tune">실시간 튜닝 화면</a>을 쓰세요.
+</div>
+<p class="sub"><a href="/dashboard">← 대시보드</a></p>
+
+<div id="nodes"></div>
+
+<div class="card">
+ <div class="nm" style="font-size:15px">명령 이력</div>
+ <div id="cmds" style="margin-top:8px"></div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function mmss(s){ if(s<60) return s+'초 전';
+  if(s<3600) return Math.floor(s/60)+'분 전'; return Math.floor(s/3600)+'시간 전'; }
+
+async function send(mac,cmd,val){
+  const r=await fetch('/api/fsr/cmd',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mac:mac,cmd:cmd,val:val})});
+  const j=await r.json();
+  if(j.status!=='success'){ alert('실패: '+(j.message||'')); return; }
+  load();
+}
+function sendField(mac,cmd,id){
+  const el=document.getElementById(id);
+  const v=parseInt(el.value,10);
+  if(isNaN(v)){ alert('숫자를 입력하세요'); return; }
+  send(mac,cmd,v);
+}
+
+function nodeCard(n){
+  const hit=k=>(n.mask>>k)&1;
+  const cell=k=>{
+    const unset=(n.th[k]>=3300);
+    const det=unset?'-':(n.base[k]+n.th[k]);
+    return {cur:n.fsr[k], base:n.base[k], th:unset?'미설정':('+'+n.th[k]), det:det, on:hit(k)};
+  };
+  const c=[0,1,2].map(cell);
+  const cls='card'+(n.stale?' stale':'')+((!n.stale&&n.mask)?' used':'');
+  return `<div class="${cls}">
+   <div class="hd">
+     <div><span class="nm">${esc(n.name||n.mac)}</span>
+       <span class="meta"> ${esc(n.mac)} · ${esc(n.gw)}</span></div>
+     <div class="meta">${n.stale?'<b style="color:#c62828">응답 없음</b> · ':''}
+       ${esc(n.at)} (${mmss(n.age)}) · 배터리 ${n.batt}% · ${n.rssi}dBm
+       ${n.drops?' · <b style="color:#ef6c00">폐기 '+n.drops+'</b>':''}</div>
+   </div>
+   <table>
+    <tr><th>센서</th><th>1</th><th>2</th><th>3</th></tr>
+    <tr><td>현재</td>${c.map(x=>`<td class="${x.on?'hit':''}">${x.cur}</td>`).join('')}</tr>
+    <tr><td>기준</td>${c.map(x=>`<td>${x.base}</td>`).join('')}</tr>
+    <tr><td>임계</td>${c.map(x=>`<td>${x.th}</td>`).join('')}</tr>
+    <tr><td>감지선</td>${c.map(x=>`<td>${x.det}</td>`).join('')}</tr>
+   </table>
+   <div class="meta">해제 비율 ${n.hyst.join('/')}% · 판정 센서수 ${n.nhit}개
+     · 하트비트 ${n.hb}초 → 반영까지 최대 ${Math.ceil(n.wait/60)}분</div>
+
+   <div class="row">
+     <label>센서1 임계</label><input id="t1_${n.mac}" placeholder="${n.th[0]}">
+     <button onclick="sendField('${n.mac}','th1','t1_${n.mac}')">전송</button>
+     <label>센서2 임계</label><input id="t2_${n.mac}" placeholder="${n.th[1]}">
+     <button onclick="sendField('${n.mac}','th2','t2_${n.mac}')">전송</button>
+   </div>
+   <div class="row">
+     <label>센서3 임계</label><input id="t3_${n.mac}" placeholder="${n.th[2]}">
+     <button onclick="sendField('${n.mac}','th3','t3_${n.mac}')">전송</button>
+     <label>전체 임계</label><input id="ta_${n.mac}" placeholder="일괄">
+     <button onclick="sendField('${n.mac}','th','ta_${n.mac}')">전송</button>
+   </div>
+   <div class="row">
+     <label>해제 비율</label><input id="hy_${n.mac}" placeholder="${n.hyst[0]}">
+     <button onclick="sendField('${n.mac}','hyst','hy_${n.mac}')">전송</button>
+     <label>판정 센서수</label><input id="nh_${n.mac}" placeholder="${n.nhit}">
+     <button onclick="sendField('${n.mac}','nhit','nh_${n.mac}')">전송</button>
+   </div>
+   <div class="row">
+     <button class="sec" onclick="if(confirm('산정된 값을 실제 설정으로 반영합니다. 계속할까요?'))send('${n.mac}','apply',0)">산정값 적용</button>
+     <button class="sec" onclick="if(confirm('노드를 재부팅합니다. 계속할까요?'))send('${n.mac}','reboot',0)">재부팅</button>
+   </div>
+  </div>`;
+}
+
+function cmdLine(c){
+  const s={pending:['wt','대기'],sent:['wt','전달 중'],
+           done:['ok','완료'],fail:['ng','실패']}[c.status]||['','?'];
+  const v=(c.val===null||c.val===undefined)?'':(' = '+c.val);
+  return `<div class="cl"><span class="${s[0]}">[${s[1]}]</span>
+    ${esc(c.mac)} · ${esc(c.cmd)}${esc(v)}
+    <span class="meta"> ${esc(c.created||'')}${c.retries?' · 재시도 '+c.retries:''}</span></div>`;
+}
+
+async function load(){
+  try{
+    const r=await fetch('/api/fsr/nodes'); const j=await r.json();
+    $('#nodes').innerHTML = j.nodes.length
+      ? j.nodes.map(nodeCard).join('')
+      : '<div class="card"><div class="none">아직 신호를 받은 노드가 없습니다.<br>'
+        +'게이트웨이가 켜져 있고 노드가 등록되어 있는지 확인하세요.</div></div>';
+    const all=[...j.pending, ...j.recent];
+    $('#cmds').innerHTML = all.length ? all.map(cmdLine).join('')
+                                      : '<div class="meta">없음</div>';
+  }catch(e){ /* 일시적 오류는 다음 주기에 회복된다 */ }
+}
+load(); setInterval(load, 5000);
+</script></body></html>"""
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=80)
