@@ -16,7 +16,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.15.1"
+VERSION = "3.16.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -378,7 +378,7 @@ threading.Thread(target=_warmup_then_ready, daemon=True).start()
 # 서버 재시작 없이 다음 점검 주기(1분 이내)부터 반영된다.
 DISCORD_CHECK_INTERVAL_SEC = 60
 DISCORD_ALERT_STATE_FILE = "discord_alert_state.json"
-_DEFAULT_DISCORD_CONFIG = {"webhook_url": "", "threshold_minutes": 30, "enabled": False}
+_DEFAULT_DISCORD_CONFIG = {"webhook_url": "", "threshold_minutes": 30, "enabled": False, "device_overrides": {}}
 _discord_config_lock = threading.Lock()
 
 
@@ -435,7 +435,18 @@ def _send_discord_message(webhook_url, content):
         return False
 
 
-def _discord_device_snapshot(threshold_sec):
+def _discord_threshold_minutes(cfg, sn):
+    """기기별 임계값(device_overrides)이 있으면 그걸, 없으면 전역 기본값을 쓴다.
+    보고 주기가 원래 긴 기기(예: 30분 간격 게이트웨이)를 전역 기준(30분)에 맞춰
+    끊김/복구로 계속 플랩하는 걸 막기 위함 — 그 기기만 여유를 더 줄 수 있게."""
+    overrides = cfg.get("device_overrides") or {}
+    val = overrides.get(sn)
+    if isinstance(val, (int, float)) and val > 0:
+        return int(val)
+    return max(1, int(cfg.get("threshold_minutes") or 30))
+
+
+def _discord_device_snapshot(cfg):
     """숨기지 않은 기기 전체의 연결 상태 스냅샷.
     /admin/discord 설정 화면, 끊김 감시 루프, 디스코드 봇 API가 모두 이 함수 하나를 써서
     '연결됨' 판정 기준이 세 곳에서 어긋나지 않게 한다."""
@@ -452,6 +463,8 @@ def _discord_device_snapshot(threshold_sec):
         location = str(info.get("location") or "").strip()
         if location == "-":
             location = ""
+        threshold_minutes = _discord_threshold_minutes(cfg, sn)
+        threshold_sec = threshold_minutes * 60
         if isinstance(last_seen, (int, float)):
             age_sec = now_ts - last_seen
             connected = age_sec < threshold_sec
@@ -461,6 +474,7 @@ def _discord_device_snapshot(threshold_sec):
         out.append({
             "sn": sn, "name": name, "location": location,
             "connected": connected, "age_sec": age_sec, "last_seen_text": last_seen_text,
+            "threshold_minutes": threshold_minutes,
         })
     return out
 
@@ -469,9 +483,8 @@ def _discord_check_once():
     cfg = _load_discord_config()
     if not cfg.get("enabled") or not cfg.get("webhook_url"):
         return
-    threshold_sec = max(1, int(cfg.get("threshold_minutes") or 30)) * 60
 
-    for d in _discord_device_snapshot(threshold_sec):
+    for d in _discord_device_snapshot(cfg):
         if d["connected"] is None:
             continue  # 한 번도 통신한 적 없는 기기 — 판단 근거가 없으니 건너뜀
         sn = d["sn"]
@@ -4357,28 +4370,24 @@ async def feedback_reply(request: Request, _: str = Depends(require_admin)):
 
 
 def _discord_settings_page_html(cfg, banner=""):
-    now_ts = datetime.now(timezone.utc).timestamp()
-    statuses = analyzer.get_device_statuses()
+    default_minutes = max(1, int(cfg.get("threshold_minutes") or 30))
     rows = ""
-    for sn in sorted(analyzer.DEVICE_INFO):
-        info = analyzer.DEVICE_INFO[sn]
-        if info.get("hidden"):
-            continue
-        ds = statuses.get(sn)
-        last_seen = ds.get("last_seen_ts") if isinstance(ds, dict) else None
-        if isinstance(last_seen, (int, float)):
-            age_sec = now_ts - last_seen
-            seen_txt = _format_ago(int(age_sec))
-            alerted = _discord_alerted.get(sn, False)
-            dot = "🔴" if alerted else "🟢"
-        else:
-            seen_txt, dot = "통신 이력 없음", "⚪"
-        name = html.escape(str(info.get("name") or sn))
-        loc = html.escape(str(info.get("location") or ""))
+    for d in _discord_device_snapshot(cfg):
+        sn = d["sn"]
+        alerted = _discord_alerted.get(sn, False)
+        dot = "⚪" if d["connected"] is None else ("🔴" if alerted else "🟢")
+        name = html.escape(d["name"])
+        loc = html.escape(d["location"])
+        is_override = d["threshold_minutes"] != default_minutes
+        thr_val = d["threshold_minutes"] if is_override else ""
         rows += (f'<tr><td style="padding:8px; border-top:1px solid #eee;">{dot}</td>'
                  f'<td style="padding:8px; border-top:1px solid #eee;">{name}</td>'
                  f'<td style="padding:8px; border-top:1px solid #eee; color:#78909c;">{loc}</td>'
-                 f'<td style="padding:8px; border-top:1px solid #eee; color:#78909c;">{seen_txt}</td></tr>')
+                 f'<td style="padding:8px; border-top:1px solid #eee; color:#78909c;">{d["last_seen_text"]}</td>'
+                 f'<td style="padding:8px; border-top:1px solid #eee;">'
+                 f'<input type="number" name="thr_{html.escape(sn)}" min="1" value="{thr_val}" '
+                 f'placeholder="{default_minutes}(기본)" style="width:90px; padding:6px; border:1px solid #ddd; border-radius:6px;">'
+                 f'</td></tr>')
 
     webhook_val = html.escape(str(cfg.get("webhook_url") or ""))
     threshold_val = int(cfg.get("threshold_minutes") or 30)
@@ -4445,11 +4454,21 @@ table {{ width:100%; border-collapse:collapse; font-size:0.9em; }}
 
 <div class="card">
     <b>현재 기기 상태</b> <span class="hint">(🔴 = 지금 알림이 나가 있는 기기)</span>
+    <form method="post" action="/admin/discord/thresholds">
     <table>
         <tr><th style="text-align:left; padding:8px;"></th><th style="text-align:left; padding:8px;">기기</th>
-            <th style="text-align:left; padding:8px;">위치</th><th style="text-align:left; padding:8px;">마지막 통신</th></tr>
+            <th style="text-align:left; padding:8px;">위치</th><th style="text-align:left; padding:8px;">마지막 통신</th>
+            <th style="text-align:left; padding:8px;">알림 기준(분)</th></tr>
         {rows}
     </table>
+    <div class="hint" style="margin-top:8px;">
+        비워두면 위에서 설정한 기본값을 씁니다. 특정 기기가 원래 보고 주기가 길어서(예: 30분 간격 게이트웨이)
+        기본 기준과 자꾸 겹쳐 끊김/복구를 반복하면, 그 기기만 여유를 더 준 숫자를 넣어주세요.
+    </div>
+    <div class="row">
+        <button type="submit" class="btn btn-save">기기별 기준 저장</button>
+    </div>
+    </form>
 </div>
 
 <p><a href="/devices" style="color:#1a73e8; text-decoration:none;">← 장비 관리로 돌아가기</a></p>
@@ -4459,7 +4478,7 @@ table {{ width:100%; border-collapse:collapse; font-size:0.9em; }}
 # 관리자: 디스코드 연결 끊김 알림 설정 (Webhook URL·임계값)
 @app.get("/admin/discord", response_class=HTMLResponse)
 def admin_discord(request: Request, saved: int = 0, test: int = -1, baseline: int = -1,
-                   _: str = Depends(require_admin)):
+                   thresholds: int = 0, _: str = Depends(require_admin)):
     cfg = _load_discord_config()
     banner = ""
     if saved:
@@ -4471,6 +4490,8 @@ def admin_discord(request: Request, saved: int = 0, test: int = -1, baseline: in
     elif baseline >= 0:
         banner = (f'<div class="banner ok">✅ 현재 끊겨있는 기기 {baseline}대는 무시하도록 표시했습니다. '
                    '이 시점 이후 새로 끊기는 기기만 알림이 갑니다.</div>')
+    elif thresholds:
+        banner = '<div class="banner ok">✅ 기기별 알림 기준을 저장했습니다.</div>'
     return HTMLResponse(_discord_settings_page_html(cfg, banner=banner))
 
 
@@ -4482,13 +4503,36 @@ async def admin_discord_save(request: Request, _: str = Depends(require_admin)):
         threshold_minutes = max(1, int(form.get("threshold_minutes") or 30))
     except ValueError:
         threshold_minutes = 30
-    cfg = {
-        "webhook_url": webhook_url,
-        "threshold_minutes": threshold_minutes,
-        "enabled": form.get("enabled") == "on",
-    }
+    cfg = _load_discord_config()  # 기존 device_overrides 를 이 폼이 덮어쓰지 않도록 유지
+    cfg["webhook_url"] = webhook_url
+    cfg["threshold_minutes"] = threshold_minutes
+    cfg["enabled"] = form.get("enabled") == "on"
     _save_discord_config(cfg)
     return RedirectResponse("/admin/discord?saved=1", status_code=303)
+
+
+@app.post("/admin/discord/thresholds")
+async def admin_discord_thresholds(request: Request, _: str = Depends(require_admin)):
+    """기기별 알림 기준(분) 저장. 빈 값이면 그 기기는 전역 기본값을 쓴다(override 제거)."""
+    form = await request.form()
+    cfg = _load_discord_config()
+    overrides = {}
+    for key, raw in form.multi_items():
+        if not key.startswith("thr_"):
+            continue
+        sn = key[len("thr_"):]
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+        try:
+            minutes = int(raw)
+        except ValueError:
+            continue
+        if minutes > 0:
+            overrides[sn] = minutes
+    cfg["device_overrides"] = overrides
+    _save_discord_config(cfg)
+    return RedirectResponse("/admin/discord?thresholds=1", status_code=303)
 
 
 @app.post("/admin/discord/test")
@@ -4506,9 +4550,8 @@ def admin_discord_baseline(_: str = Depends(require_admin)):
     알림을 켤 때 오래전부터 끊겨있던 기기까지 한꺼번에 쏟아지는 걸 막고,
     이 시점 이후 '새로' 끊기는 기기만 알림이 가게 하려는 용도."""
     cfg = _load_discord_config()
-    threshold_sec = max(1, int(cfg.get("threshold_minutes") or 30)) * 60
     marked = 0
-    for d in _discord_device_snapshot(threshold_sec):
+    for d in _discord_device_snapshot(cfg):
         if d["connected"] is False:
             _discord_alerted[d["sn"]] = True
             marked += 1
@@ -4527,8 +4570,7 @@ def internal_discord_status(request: Request):
     if client_host not in ("127.0.0.1", "::1", "localhost"):
         raise HTTPException(status_code=403, detail="localhost only")
     cfg = _load_discord_config()
-    threshold_sec = max(1, int(cfg.get("threshold_minutes") or 30)) * 60
-    devices = _discord_device_snapshot(threshold_sec)
+    devices = _discord_device_snapshot(cfg)
     return JSONResponse({
         "threshold_minutes": cfg.get("threshold_minutes"),
         "total": len(devices),
