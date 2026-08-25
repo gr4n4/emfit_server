@@ -12,6 +12,7 @@ view_tokens.json
 mckare_apikey.txt
 discord_config.json
 discord_bot_token.txt
+discord_alert_state.json
 
 # 런타임 데이터 (젯슨에 살아있고, 사용자 건강 데이터 포함)
 emfit_data.jsonl

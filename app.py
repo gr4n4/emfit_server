@@ -16,7 +16,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.15.0"
+VERSION = "3.15.1"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -377,10 +377,34 @@ threading.Thread(target=_warmup_then_ready, daemon=True).start()
 # Webhook URL·임계값은 파일로 저장해서 /admin/discord 화면에서 바로 바꿀 수 있고,
 # 서버 재시작 없이 다음 점검 주기(1분 이내)부터 반영된다.
 DISCORD_CHECK_INTERVAL_SEC = 60
+DISCORD_ALERT_STATE_FILE = "discord_alert_state.json"
 _DEFAULT_DISCORD_CONFIG = {"webhook_url": "", "threshold_minutes": 30, "enabled": False}
 _discord_config_lock = threading.Lock()
+
+
+def _load_discord_alerted():
+    """파일로 저장해둔다 — 메모리에만 두면 서버 재시작(배포·크래시 등)마다
+    '이미 끊겨있던 기기'를 새로 끊긴 걸로 착각해 알림을 또 보낸다."""
+    if not os.path.exists(DISCORD_ALERT_STATE_FILE):
+        return {}
+    try:
+        with open(DISCORD_ALERT_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return {sn: True for sn, v in data.items() if v}
+    except Exception:
+        return {}
+
+
+def _save_discord_alerted():
+    try:
+        with open(DISCORD_ALERT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_discord_alerted, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[discord] 알림 상태 저장 실패: {e}", flush=True)
+
+
 # {sn: True}  끊김 알림을 이미 보낸 기기. 복구되면 지워서 다음에 또 끊기면 다시 보낸다.
-_discord_alerted = {}
+_discord_alerted = _load_discord_alerted()
 
 
 def _load_discord_config():
@@ -460,9 +484,11 @@ def _discord_check_once():
                 f"🔴 **연결 끊김** — {label}\n마지막 통신: {d['last_seen_text']}",
             )
             _discord_alerted[sn] = True
+            _save_discord_alerted()
         elif d["connected"] and was_alerted:
             _send_discord_message(cfg["webhook_url"], f"🟢 **연결 복구** — {label}")
             _discord_alerted.pop(sn, None)
+            _save_discord_alerted()
 
 
 def _discord_monitor_loop():
@@ -4488,6 +4514,7 @@ def admin_discord_baseline(_: str = Depends(require_admin)):
             marked += 1
         else:
             _discord_alerted.pop(d["sn"], None)
+    _save_discord_alerted()
     return RedirectResponse(f"/admin/discord?baseline={marked}", status_code=303)
 
 
