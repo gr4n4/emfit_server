@@ -16,7 +16,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.17.0"
+VERSION = "3.18.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -453,6 +453,11 @@ def _discord_threshold_minutes(cfg, sn):
     return max(1, int(cfg.get("threshold_minutes") or 30))
 
 
+# 기기 종류 표시 이름 — 대시보드(_V2_SECTIONS)와 같은 문구를 재사용해서 알림 메시지에 붙인다.
+# 병동처럼 여러 기기가 있고 사용자명이 겹치는 곳에서, 어느 종류 기기인지 메시지만 보고 구분하기 위함.
+_DISCORD_KIND_LABELS = {"emfit": "EMFIT QS", "radar": "AI Radar", "mckare": "McKare", "fsr": "돌봄기기 사용 감지"}
+
+
 def _discord_device_snapshot(cfg):
     """숨기지 않은 기기 전체의 연결 상태 스냅샷.
     /admin/discord 설정 화면, 끊김 감시 루프, 디스코드 봇 API가 모두 이 함수 하나를 써서
@@ -478,10 +483,12 @@ def _discord_device_snapshot(cfg):
             last_seen_text = _format_ago(int(age_sec))
         else:
             age_sec, connected, last_seen_text = None, None, "통신 이력 없음"
+        kind = _v2_kind(sn, None, ds)
         out.append({
             "sn": sn, "name": name, "location": location,
             "connected": connected, "age_sec": age_sec, "last_seen_text": last_seen_text,
             "threshold_minutes": threshold_minutes,
+            "kind": kind, "kind_label": _DISCORD_KIND_LABELS.get(kind, kind),
         })
     return out
 
@@ -496,10 +503,17 @@ def _discord_webhook_for(cfg, sn):
     return cfg.get("webhook_url") or ""
 
 
+# {sn: 처음 '끊긴 것 같다'고 감지한 시각(epoch)} — 아직 알림은 안 보낸, 확인 대기 중인 기기.
+# 재시작으로 이게 날아가도 최악의 경우 확인이 한 번 더 늦어질 뿐(다시 처음부터 재는 것뿐)이라
+# _discord_alerted 와 달리 파일로 저장하지 않는다 — 잘못된 방향(거짓 알림)으로 새지 않는 쪽.
+_discord_pending = {}
+
+
 def _discord_check_once():
     cfg = _load_discord_config()
     if not cfg.get("enabled") or not cfg.get("webhook_url"):
         return
+    now_ts = datetime.now(timezone.utc).timestamp()
 
     for d in _discord_device_snapshot(cfg):
         if d["connected"] is None:
@@ -509,19 +523,34 @@ def _discord_check_once():
         if not webhook_url:
             continue
         was_alerted = _discord_alerted.get(sn, False)
-        label = f"{d['name']} ({d['location']})" if d["location"] else d["name"]
+        label = f"({d['kind_label']}) {d['name']} ({d['location']})" if d["location"] else f"({d['kind_label']}) {d['name']}"
 
-        if not d["connected"] and not was_alerted:
+        if d["connected"]:
+            _discord_pending.pop(sn, None)  # 확인 대기 중이었다면 조용히 취소 — 알림 자체가 없었으니 복구 알림도 없음
+            if was_alerted:
+                _send_discord_message(webhook_url, f"🟢 **연결 복구** — {label}")
+                _discord_alerted.pop(sn, None)
+                _save_discord_alerted()
+            continue
+
+        if was_alerted:
+            continue  # 이미 끊김 알림 보낸 상태 — 복구될 때까지 조용히 대기
+
+        # 여기부터는 '지금 이 순간 끊긴 것처럼 보이는' 기기.
+        # 곧바로 알림을 보내지 않고, 같은 시간(threshold_minutes)만큼 더 지켜봐서
+        # 그사이 복구되면(하트비트 지연 등 일시적 현상) 알림 자체를 안 보낸다 — 양치기 소년 방지.
+        confirm_sec = d["threshold_minutes"] * 60
+        pending_since = _discord_pending.get(sn)
+        if pending_since is None:
+            _discord_pending[sn] = now_ts
+        elif now_ts - pending_since >= confirm_sec:
             _send_discord_message(
                 webhook_url,
                 f"🔴 **연결 끊김** — {label}\n마지막 통신: {d['last_seen_text']}",
             )
             _discord_alerted[sn] = True
             _save_discord_alerted()
-        elif d["connected"] and was_alerted:
-            _send_discord_message(webhook_url, f"🟢 **연결 복구** — {label}")
-            _discord_alerted.pop(sn, None)
-            _save_discord_alerted()
+            _discord_pending.pop(sn, None)
 
 
 def _discord_monitor_loop():
@@ -4482,7 +4511,9 @@ table {{ width:100%; border-collapse:collapse; font-size:0.9em; }}
 
         <label>연결 끊김 판정 기준 (분)</label>
         <input type="number" name="threshold_minutes" min="1" value="{threshold_val}" required>
-        <div class="hint">기기가 이 시간 동안 통신이 없으면 알림을 보냅니다. 나중에 언제든 이 화면에서 바꿀 수 있습니다.</div>
+        <div class="hint">기기가 이 시간 동안 통신이 없으면 '끊긴 것 같다'고 감지하고, 같은 시간만큼 더 지켜봐서
+            그래도 안 돌아오면 그때 알림을 보냅니다 (총 최대 기준×2 정도 걸림 — 일시적 지연으로 알림이 잘못 뜨는 걸 막기 위함).
+            나중에 언제든 이 화면에서 바꿀 수 있습니다.</div>
 
         <div class="row">
             <input type="checkbox" id="enabled" name="enabled" {checked} style="width:auto;">
@@ -4655,6 +4686,7 @@ def admin_discord_baseline(_: str = Depends(require_admin)):
     cfg = _load_discord_config()
     marked = 0
     for d in _discord_device_snapshot(cfg):
+        _discord_pending.pop(d["sn"], None)  # 확인 대기 중이던 것도 baseline 처리에 흡수
         if d["connected"] is False:
             _discord_alerted[d["sn"]] = True
             marked += 1
