@@ -16,7 +16,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.18.0"
+VERSION = "3.18.1"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -457,6 +457,11 @@ def _discord_threshold_minutes(cfg, sn):
 # 병동처럼 여러 기기가 있고 사용자명이 겹치는 곳에서, 어느 종류 기기인지 메시지만 보고 구분하기 위함.
 _DISCORD_KIND_LABELS = {"emfit": "EMFIT QS", "radar": "AI Radar", "mckare": "McKare", "fsr": "돌봄기기 사용 감지"}
 
+# connected=True 를 마지막으로 받은 뒤 하트비트 자체가 이만큼 안 오면, 그 값이 최신이라고 믿지 않는다.
+# (실측: 126일째 조용한 EMFIT 기기 중 다수가 여전히 connected=True 로 박혀 있었음 —
+#  하트비트 수신 경로 자체가 끊기면 이 필드도 그냥 마지막 값에 멈춰 선다.)
+_EMFIT_RADAR_HEARTBEAT_DEAD_SEC = 6 * 3600
+
 
 def _discord_device_snapshot(cfg):
     """숨기지 않은 기기 전체의 연결 상태 스냅샷.
@@ -477,13 +482,32 @@ def _discord_device_snapshot(cfg):
             location = ""
         threshold_minutes = _discord_threshold_minutes(cfg, sn)
         threshold_sec = threshold_minutes * 60
+        kind = _v2_kind(sn, None, ds)
+
         if isinstance(last_seen, (int, float)):
             age_sec = now_ts - last_seen
-            connected = age_sec < threshold_sec
             last_seen_text = _format_ago(int(age_sec))
         else:
-            age_sec, connected, last_seen_text = None, None, "통신 이력 없음"
-        kind = _v2_kind(sn, None, ds)
+            age_sec, last_seen_text = None, "통신 이력 없음"
+
+        if kind in ("emfit", "radar"):
+            # EMFIT/AI Radar 는 status_at 하트비트가 connected(bool)를 직접 보내준다.
+            # last_seen_ts(=하트비트 자체 도착 시각)로 시간 기준을 걸면, 사람이 침대에 없어서
+            # 하트비트 갱신이 뜸해진 것뿐인 '부재'까지 '끊김'으로 오탐한다 — 대시보드가
+            # 끊김과 부재를 다른 상태로 구분하는 것과 같은 이유로, 시간이 아니라 이 필드를 그대로 신뢰한다.
+            raw_connected = ds.get("connected") if isinstance(ds, dict) else None
+            heartbeat_dead = age_sec is not None and age_sec > _EMFIT_RADAR_HEARTBEAT_DEAD_SEC
+            if raw_connected is None:
+                connected = None
+            elif heartbeat_dead:
+                connected = False  # 하트비트 자체가 오래 끊겼다 — 마지막 값(True)을 더 안 믿는다
+            else:
+                connected = bool(raw_connected)
+        elif isinstance(last_seen, (int, float)):
+            connected = age_sec < threshold_sec
+        else:
+            connected = None
+
         out.append({
             "sn": sn, "name": name, "location": location,
             "connected": connected, "age_sec": age_sec, "last_seen_text": last_seen_text,
