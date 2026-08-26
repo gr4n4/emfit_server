@@ -16,7 +16,7 @@ import analyzer
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.16.0"
+VERSION = "3.17.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -378,7 +378,14 @@ threading.Thread(target=_warmup_then_ready, daemon=True).start()
 # 서버 재시작 없이 다음 점검 주기(1분 이내)부터 반영된다.
 DISCORD_CHECK_INTERVAL_SEC = 60
 DISCORD_ALERT_STATE_FILE = "discord_alert_state.json"
-_DEFAULT_DISCORD_CONFIG = {"webhook_url": "", "threshold_minutes": 30, "enabled": False, "device_overrides": {}}
+_DEFAULT_DISCORD_CONFIG = {
+    "webhook_url": "",          # 기본 채널 — 기기에 아래 channels 매핑이 없으면 여기로 감
+    "threshold_minutes": 30,
+    "enabled": False,
+    "device_overrides": {},     # {sn: 임계값(분)}
+    "channels": {},             # {채널이름: Webhook URL}  — 시설별 채널 등록
+    "device_channels": {},      # {sn: 채널이름}  — 없으면 기본 채널(webhook_url)로 감
+}
 _discord_config_lock = threading.Lock()
 
 
@@ -479,6 +486,16 @@ def _discord_device_snapshot(cfg):
     return out
 
 
+def _discord_webhook_for(cfg, sn):
+    """기기가 특정 채널(시설)에 배정돼 있으면 그 채널로, 아니면 기본 채널로."""
+    ch_name = (cfg.get("device_channels") or {}).get(sn)
+    if ch_name:
+        url = (cfg.get("channels") or {}).get(ch_name)
+        if url:
+            return url
+    return cfg.get("webhook_url") or ""
+
+
 def _discord_check_once():
     cfg = _load_discord_config()
     if not cfg.get("enabled") or not cfg.get("webhook_url"):
@@ -488,18 +505,21 @@ def _discord_check_once():
         if d["connected"] is None:
             continue  # 한 번도 통신한 적 없는 기기 — 판단 근거가 없으니 건너뜀
         sn = d["sn"]
+        webhook_url = _discord_webhook_for(cfg, sn)
+        if not webhook_url:
+            continue
         was_alerted = _discord_alerted.get(sn, False)
         label = f"{d['name']} ({d['location']})" if d["location"] else d["name"]
 
         if not d["connected"] and not was_alerted:
             _send_discord_message(
-                cfg["webhook_url"],
+                webhook_url,
                 f"🔴 **연결 끊김** — {label}\n마지막 통신: {d['last_seen_text']}",
             )
             _discord_alerted[sn] = True
             _save_discord_alerted()
         elif d["connected"] and was_alerted:
-            _send_discord_message(cfg["webhook_url"], f"🟢 **연결 복구** — {label}")
+            _send_discord_message(webhook_url, f"🟢 **연결 복구** — {label}")
             _discord_alerted.pop(sn, None)
             _save_discord_alerted()
 
@@ -4371,23 +4391,58 @@ async def feedback_reply(request: Request, _: str = Depends(require_admin)):
 
 def _discord_settings_page_html(cfg, banner=""):
     default_minutes = max(1, int(cfg.get("threshold_minutes") or 30))
+    channels = cfg.get("channels") or {}
+    device_channels = cfg.get("device_channels") or {}
+    channel_options_html = "".join(
+        f'<option value="{html.escape(name)}">{html.escape(name)}</option>' for name in sorted(channels)
+    )
+
     rows = ""
     for d in _discord_device_snapshot(cfg):
         sn = d["sn"]
+        esc_sn = html.escape(sn)
         alerted = _discord_alerted.get(sn, False)
         dot = "⚪" if d["connected"] is None else ("🔴" if alerted else "🟢")
         name = html.escape(d["name"])
         loc = html.escape(d["location"])
         is_override = d["threshold_minutes"] != default_minutes
         thr_val = d["threshold_minutes"] if is_override else ""
+        current_channel = device_channels.get(sn, "")
+        route_opts = f'<option value=""{" selected" if not current_channel else ""}>(기본 채널)</option>'
+        for ch_name in sorted(channels):
+            sel = " selected" if ch_name == current_channel else ""
+            route_opts += f'<option value="{html.escape(ch_name)}"{sel}>{html.escape(ch_name)}</option>'
         rows += (f'<tr><td style="padding:8px; border-top:1px solid #eee;">{dot}</td>'
                  f'<td style="padding:8px; border-top:1px solid #eee;">{name}</td>'
                  f'<td style="padding:8px; border-top:1px solid #eee; color:#78909c;">{loc}</td>'
                  f'<td style="padding:8px; border-top:1px solid #eee; color:#78909c;">{d["last_seen_text"]}</td>'
                  f'<td style="padding:8px; border-top:1px solid #eee;">'
-                 f'<input type="number" name="thr_{html.escape(sn)}" min="1" value="{thr_val}" '
-                 f'placeholder="{default_minutes}(기본)" style="width:90px; padding:6px; border:1px solid #ddd; border-radius:6px;">'
+                 f'<input type="number" name="thr_{esc_sn}" min="1" value="{thr_val}" '
+                 f'placeholder="{default_minutes}(기본)" style="width:80px; padding:6px; border:1px solid #ddd; border-radius:6px;">'
+                 f'</td>'
+                 f'<td style="padding:8px; border-top:1px solid #eee;">'
+                 f'<select name="route_{esc_sn}" style="padding:6px; border:1px solid #ddd; border-radius:6px;">{route_opts}</select>'
                  f'</td></tr>')
+
+    # 채널 관리 표 — 기존 채널 + 새로 추가할 빈 칸 3개
+    channel_rows = ""
+    for i, (ch_name, ch_url) in enumerate(sorted(channels.items())):
+        channel_rows += (
+            f'<tr><td style="padding:6px;"><input name="ch_name_{i}" value="{html.escape(ch_name)}" '
+            f'style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;"></td>'
+            f'<td style="padding:6px;"><input type="url" name="ch_url_{i}" value="{html.escape(ch_url)}" '
+            f'placeholder="https://discord.com/api/webhooks/..." '
+            f'style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;"></td></tr>'
+        )
+    n_existing = len(channels)
+    for i in range(n_existing, n_existing + 3):
+        channel_rows += (
+            f'<tr><td style="padding:6px;"><input name="ch_name_{i}" placeholder="예: A시설" '
+            f'style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;"></td>'
+            f'<td style="padding:6px;"><input type="url" name="ch_url_{i}" '
+            f'placeholder="https://discord.com/api/webhooks/..." '
+            f'style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;"></td></tr>'
+        )
 
     webhook_val = html.escape(str(cfg.get("webhook_url") or ""))
     threshold_val = int(cfg.get("threshold_minutes") or 30)
@@ -4398,7 +4453,8 @@ def _discord_settings_page_html(cfg, banner=""):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body {{ font-family:'Malgun Gothic',sans-serif; background:#f0f2f5; margin:0; padding:24px; color:#37474f; }}
-.wrap {{ max-width:640px; margin:0 auto; }}
+.wrap {{ max-width:760px; margin:0 auto; }}
+.tblwrap {{ overflow-x:auto; }}
 h1 {{ color:#1a237e; font-size:1.4em; }}
 .card {{ background:white; border-radius:14px; padding:24px; box-shadow:0 2px 8px rgba(0,0,0,0.06); margin-bottom:20px; }}
 label {{ display:block; font-weight:bold; margin:14px 0 6px; font-size:0.92em; }}
@@ -4453,20 +4509,36 @@ table {{ width:100%; border-collapse:collapse; font-size:0.9em; }}
 </div>
 
 <div class="card">
+    <b>시설별 채널</b>
+    <div class="hint">시설(그룹)마다 다른 Discord 채널로 알림을 보내고 싶으면, 그 채널의 Webhook URL을 이름 붙여서 등록하세요.
+        아래 기기 표에서 기기마다 어느 채널로 보낼지 고를 수 있습니다.</div>
+    <form method="post" action="/admin/discord/channels">
+    <div class="tblwrap"><table>
+        <tr><th style="text-align:left; padding:6px;">채널 이름</th><th style="text-align:left; padding:6px;">Webhook URL</th></tr>
+        {channel_rows}
+    </table></div>
+    <div class="row">
+        <button type="submit" class="btn btn-save">채널 저장</button>
+    </div>
+    </form>
+</div>
+
+<div class="card">
     <b>현재 기기 상태</b> <span class="hint">(🔴 = 지금 알림이 나가 있는 기기)</span>
-    <form method="post" action="/admin/discord/thresholds">
-    <table>
+    <form method="post" action="/admin/discord/devices">
+    <div class="tblwrap"><table>
         <tr><th style="text-align:left; padding:8px;"></th><th style="text-align:left; padding:8px;">기기</th>
             <th style="text-align:left; padding:8px;">위치</th><th style="text-align:left; padding:8px;">마지막 통신</th>
-            <th style="text-align:left; padding:8px;">알림 기준(분)</th></tr>
+            <th style="text-align:left; padding:8px;">알림 기준(분)</th><th style="text-align:left; padding:8px;">보낼 채널</th></tr>
         {rows}
-    </table>
+    </table></div>
     <div class="hint" style="margin-top:8px;">
-        비워두면 위에서 설정한 기본값을 씁니다. 특정 기기가 원래 보고 주기가 길어서(예: 30분 간격 게이트웨이)
+        알림 기준을 비워두면 위에서 설정한 기본값을 씁니다. 특정 기기가 원래 보고 주기가 길어서(예: 30분 간격 게이트웨이)
         기본 기준과 자꾸 겹쳐 끊김/복구를 반복하면, 그 기기만 여유를 더 준 숫자를 넣어주세요.
+        "보낼 채널"을 (기본 채널) 그대로 두면 맨 위 기본 Webhook으로 갑니다.
     </div>
     <div class="row">
-        <button type="submit" class="btn btn-save">기기별 기준 저장</button>
+        <button type="submit" class="btn btn-save">기기별 설정 저장</button>
     </div>
     </form>
 </div>
@@ -4478,7 +4550,7 @@ table {{ width:100%; border-collapse:collapse; font-size:0.9em; }}
 # 관리자: 디스코드 연결 끊김 알림 설정 (Webhook URL·임계값)
 @app.get("/admin/discord", response_class=HTMLResponse)
 def admin_discord(request: Request, saved: int = 0, test: int = -1, baseline: int = -1,
-                   thresholds: int = 0, _: str = Depends(require_admin)):
+                   thresholds: int = 0, channels_saved: int = 0, _: str = Depends(require_admin)):
     cfg = _load_discord_config()
     banner = ""
     if saved:
@@ -4491,7 +4563,9 @@ def admin_discord(request: Request, saved: int = 0, test: int = -1, baseline: in
         banner = (f'<div class="banner ok">✅ 현재 끊겨있는 기기 {baseline}대는 무시하도록 표시했습니다. '
                    '이 시점 이후 새로 끊기는 기기만 알림이 갑니다.</div>')
     elif thresholds:
-        banner = '<div class="banner ok">✅ 기기별 알림 기준을 저장했습니다.</div>'
+        banner = '<div class="banner ok">✅ 기기별 설정을 저장했습니다.</div>'
+    elif channels_saved:
+        banner = '<div class="banner ok">✅ 채널을 저장했습니다.</div>'
     return HTMLResponse(_discord_settings_page_html(cfg, banner=banner))
 
 
@@ -4511,28 +4585,57 @@ async def admin_discord_save(request: Request, _: str = Depends(require_admin)):
     return RedirectResponse("/admin/discord?saved=1", status_code=303)
 
 
-@app.post("/admin/discord/thresholds")
-async def admin_discord_thresholds(request: Request, _: str = Depends(require_admin)):
-    """기기별 알림 기준(분) 저장. 빈 값이면 그 기기는 전역 기본값을 쓴다(override 제거)."""
+@app.post("/admin/discord/devices")
+async def admin_discord_devices(request: Request, _: str = Depends(require_admin)):
+    """기기별 알림 기준(분)·보낼 채널 저장. 비워두거나 (기본 채널)이면 전역 기본값을 쓴다."""
     form = await request.form()
     cfg = _load_discord_config()
-    overrides = {}
+    channels = cfg.get("channels") or {}
+    overrides, device_channels = {}, {}
     for key, raw in form.multi_items():
-        if not key.startswith("thr_"):
-            continue
-        sn = key[len("thr_"):]
         raw = (raw or "").strip()
-        if not raw:
-            continue
-        try:
-            minutes = int(raw)
-        except ValueError:
-            continue
-        if minutes > 0:
-            overrides[sn] = minutes
+        if key.startswith("thr_"):
+            sn = key[len("thr_"):]
+            if not raw:
+                continue
+            try:
+                minutes = int(raw)
+            except ValueError:
+                continue
+            if minutes > 0:
+                overrides[sn] = minutes
+        elif key.startswith("route_"):
+            sn = key[len("route_"):]
+            if raw and raw in channels:
+                device_channels[sn] = raw
     cfg["device_overrides"] = overrides
+    cfg["device_channels"] = device_channels
     _save_discord_config(cfg)
     return RedirectResponse("/admin/discord?thresholds=1", status_code=303)
+
+
+@app.post("/admin/discord/channels")
+async def admin_discord_channels(request: Request, _: str = Depends(require_admin)):
+    """시설별 채널(이름 → Webhook URL) 저장. 이름이 바뀌면 기기 배정도 새 이름으로 안 따라가니
+    이름을 통째로 바꾸기보다는 URL만 갈아끼우는 걸 권장 — 화면에 안내 문구로도 표시."""
+    form = await request.form()
+    cfg = _load_discord_config()
+    old_channels = cfg.get("channels") or {}
+    pairs = {}
+    idx = 0
+    while f"ch_name_{idx}" in form or f"ch_url_{idx}" in form:
+        name = (form.get(f"ch_name_{idx}") or "").strip()
+        url = (form.get(f"ch_url_{idx}") or "").strip()
+        if name and url:
+            pairs[name] = url
+        idx += 1
+    cfg["channels"] = pairs
+    # 이름이 사라진(삭제되거나 변경된) 채널을 가리키던 기기 배정은 기본 채널로 되돌린다 —
+    # 존재하지 않는 채널 이름을 참조한 채로 두면 알림이 조용히 씹힌다.
+    device_channels = cfg.get("device_channels") or {}
+    cfg["device_channels"] = {sn: ch for sn, ch in device_channels.items() if ch in pairs}
+    _save_discord_config(cfg)
+    return RedirectResponse("/admin/discord?channels_saved=1", status_code=303)
 
 
 @app.post("/admin/discord/test")
