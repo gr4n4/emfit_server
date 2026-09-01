@@ -7,16 +7,17 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from fastapi import FastAPI, Request, Query, HTTPException, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, RedirectResponse, JSONResponse
-import json, os, uvicorn, threading, io, zipfile, html, secrets, hmac, hashlib, time
+import json, os, uvicorn, threading, io, zipfile, html, secrets, hmac, hashlib, time, re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import pandas as pd
 import requests
 import analyzer
+from nrcarec_alert import send_alert, should_send
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.18.1"
+VERSION = "3.18.2"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -457,10 +458,20 @@ def _discord_threshold_minutes(cfg, sn):
 # 병동처럼 여러 기기가 있고 사용자명이 겹치는 곳에서, 어느 종류 기기인지 메시지만 보고 구분하기 위함.
 _DISCORD_KIND_LABELS = {"emfit": "EMFIT QS", "radar": "AI Radar", "mckare": "McKare", "fsr": "돌봄기기 사용 감지"}
 
-# connected=True 를 마지막으로 받은 뒤 하트비트 자체가 이만큼 안 오면, 그 값이 최신이라고 믿지 않는다.
-# (실측: 126일째 조용한 EMFIT 기기 중 다수가 여전히 connected=True 로 박혀 있었음 —
-#  하트비트 수신 경로 자체가 끊기면 이 필드도 그냥 마지막 값에 멈춰 선다.)
-_EMFIT_RADAR_HEARTBEAT_DEAD_SEC = 6 * 3600
+
+def _nrcarec_patient_context(sn):
+    """Radar SN 배정 정보에서 NRCarec 알림의 호실/이름을 만든다."""
+    info = analyzer.DEVICE_INFO.get(sn) or {}
+    location = str(info.get("location") or "").strip()
+    name = str(info.get("name") or "").strip()
+    if location == "-":
+        location = ""
+
+    room_match = re.search(r"(\d+)\s*호?", location) or re.search(r"(\d+)\s*호?", name)
+    room = room_match.group(1) if room_match else ""
+    if room:
+        name = re.sub(rf"^\s*{re.escape(room)}\s*호?\s*", "", name).strip()
+    return room, name or "사용자"
 
 
 def _discord_device_snapshot(cfg):
@@ -481,7 +492,6 @@ def _discord_device_snapshot(cfg):
         if location == "-":
             location = ""
         threshold_minutes = _discord_threshold_minutes(cfg, sn)
-        threshold_sec = threshold_minutes * 60
         kind = _v2_kind(sn, None, ds)
 
         if isinstance(last_seen, (int, float)):
@@ -490,21 +500,14 @@ def _discord_device_snapshot(cfg):
         else:
             age_sec, last_seen_text = None, "통신 이력 없음"
 
-        if kind in ("emfit", "radar"):
-            # EMFIT/AI Radar 는 status_at 하트비트가 connected(bool)를 직접 보내준다.
-            # last_seen_ts(=하트비트 자체 도착 시각)로 시간 기준을 걸면, 사람이 침대에 없어서
-            # 하트비트 갱신이 뜸해진 것뿐인 '부재'까지 '끊김'으로 오탐한다 — 대시보드가
-            # 끊김과 부재를 다른 상태로 구분하는 것과 같은 이유로, 시간이 아니라 이 필드를 그대로 신뢰한다.
-            raw_connected = ds.get("connected") if isinstance(ds, dict) else None
-            heartbeat_dead = age_sec is not None and age_sec > _EMFIT_RADAR_HEARTBEAT_DEAD_SEC
-            if raw_connected is None:
-                connected = None
-            elif heartbeat_dead:
-                connected = False  # 하트비트 자체가 오래 끊겼다 — 마지막 값(True)을 더 안 믿는다
-            else:
-                connected = bool(raw_connected)
-        elif isinstance(last_seen, (int, float)):
-            connected = age_sec < threshold_sec
+        raw_connected = ds.get("connected") if isinstance(ds, dict) else None
+        raw_fault = bool(ds.get("fault")) if isinstance(ds, dict) else False
+        if raw_connected is not None:
+            # Discord alerts are based only on device-reported state, not elapsed
+            # communication time. A quiet device can mean absence or idle use.
+            connected = bool(raw_connected)
+        elif kind == "fsr" and raw_fault:
+            connected = False
         else:
             connected = None
 
@@ -535,7 +538,7 @@ _discord_pending = {}
 
 def _discord_check_once():
     cfg = _load_discord_config()
-    if not cfg.get("enabled") or not cfg.get("webhook_url"):
+    if not cfg.get("enabled"):
         return
     now_ts = datetime.now(timezone.utc).timestamp()
 
@@ -552,9 +555,9 @@ def _discord_check_once():
         if d["connected"]:
             _discord_pending.pop(sn, None)  # 확인 대기 중이었다면 조용히 취소 — 알림 자체가 없었으니 복구 알림도 없음
             if was_alerted:
-                _send_discord_message(webhook_url, f"🟢 **연결 복구** — {label}")
-                _discord_alerted.pop(sn, None)
-                _save_discord_alerted()
+                if _send_discord_message(webhook_url, f"🟢 **연결 복구** — {label}"):
+                    _discord_alerted.pop(sn, None)
+                    _save_discord_alerted()
             continue
 
         if was_alerted:
@@ -568,13 +571,13 @@ def _discord_check_once():
         if pending_since is None:
             _discord_pending[sn] = now_ts
         elif now_ts - pending_since >= confirm_sec:
-            _send_discord_message(
+            if _send_discord_message(
                 webhook_url,
                 f"🔴 **연결 끊김** — {label}\n마지막 통신: {d['last_seen_text']}",
-            )
-            _discord_alerted[sn] = True
-            _save_discord_alerted()
-            _discord_pending.pop(sn, None)
+            ):
+                _discord_alerted[sn] = True
+                _save_discord_alerted()
+                _discord_pending.pop(sn, None)
 
 
 def _discord_monitor_loop():
@@ -4455,7 +4458,8 @@ def _discord_settings_page_html(cfg, banner=""):
         sn = d["sn"]
         esc_sn = html.escape(sn)
         alerted = _discord_alerted.get(sn, False)
-        dot = "⚪" if d["connected"] is None else ("🔴" if alerted else "🟢")
+        dot = "⚪" if d["connected"] is None else ("🔴" if d["connected"] is False else "🟢")
+        alert_state = "발송됨" if alerted else "-"
         name = html.escape(d["name"])
         loc = html.escape(d["location"])
         is_override = d["threshold_minutes"] != default_minutes
@@ -4469,6 +4473,7 @@ def _discord_settings_page_html(cfg, banner=""):
                  f'<td style="padding:8px; border-top:1px solid #eee;">{name}</td>'
                  f'<td style="padding:8px; border-top:1px solid #eee; color:#78909c;">{loc}</td>'
                  f'<td style="padding:8px; border-top:1px solid #eee; color:#78909c;">{d["last_seen_text"]}</td>'
+                 f'<td style="padding:8px; border-top:1px solid #eee; color:#78909c;">{alert_state}</td>'
                  f'<td style="padding:8px; border-top:1px solid #eee;">'
                  f'<input type="number" name="thr_{esc_sn}" min="1" value="{thr_val}" '
                  f'placeholder="{default_minutes}(기본)" style="width:80px; padding:6px; border:1px solid #ddd; border-radius:6px;">'
@@ -4530,13 +4535,13 @@ table {{ width:100%; border-collapse:collapse; font-size:0.9em; }}
 <div class="card">
     <form method="post" action="/admin/discord/save">
         <label>Discord Webhook URL</label>
-        <input type="url" name="webhook_url" placeholder="https://discord.com/api/webhooks/..." value="{webhook_val}" required>
-        <div class="hint">디스코드 채널 설정 → 연동 → Webhook 만들기 → URL 복사해서 붙여넣으면 됩니다.</div>
+        <input type="url" name="webhook_url" placeholder="https://discord.com/api/webhooks/..." value="{webhook_val}">
+        <div class="hint">기본 채널로 쓸 Webhook URL입니다. 모든 기기를 시설별 채널에 배정했다면 비워둘 수 있습니다.</div>
 
-        <label>연결 끊김 판정 기준 (분)</label>
+        <label>끊김 신고 확인 시간 (분)</label>
         <input type="number" name="threshold_minutes" min="1" value="{threshold_val}" required>
-        <div class="hint">기기가 이 시간 동안 통신이 없으면 '끊긴 것 같다'고 감지하고, 같은 시간만큼 더 지켜봐서
-            그래도 안 돌아오면 그때 알림을 보냅니다 (총 최대 기준×2 정도 걸림 — 일시적 지연으로 알림이 잘못 뜨는 걸 막기 위함).
+        <div class="hint">통신 시간이 오래됐다는 이유만으로는 알림을 보내지 않습니다.
+            기기가 직접 끊김 상태를 보낸 뒤, 이 시간 동안 계속 끊김이면 알림을 보냅니다.
             나중에 언제든 이 화면에서 바꿀 수 있습니다.</div>
 
         <div class="row">
@@ -4579,17 +4584,18 @@ table {{ width:100%; border-collapse:collapse; font-size:0.9em; }}
 </div>
 
 <div class="card">
-    <b>현재 기기 상태</b> <span class="hint">(🔴 = 지금 알림이 나가 있는 기기)</span>
+    <b>현재 기기 상태</b> <span class="hint">(🟢 = 연결 신고, 🔴 = 끊김 신고, ⚪ = 신고 이력 없음)</span>
     <form method="post" action="/admin/discord/devices">
     <div class="tblwrap"><table>
         <tr><th style="text-align:left; padding:8px;"></th><th style="text-align:left; padding:8px;">기기</th>
             <th style="text-align:left; padding:8px;">위치</th><th style="text-align:left; padding:8px;">마지막 통신</th>
+            <th style="text-align:left; padding:8px;">알림 상태</th>
             <th style="text-align:left; padding:8px;">알림 기준(분)</th><th style="text-align:left; padding:8px;">보낼 채널</th></tr>
         {rows}
     </table></div>
     <div class="hint" style="margin-top:8px;">
-        알림 기준을 비워두면 위에서 설정한 기본값을 씁니다. 특정 기기가 원래 보고 주기가 길어서(예: 30분 간격 게이트웨이)
-        기본 기준과 자꾸 겹쳐 끊김/복구를 반복하면, 그 기기만 여유를 더 준 숫자를 넣어주세요.
+        알림 기준을 비워두면 위에서 설정한 기본값을 씁니다. 특정 기기가 끊김 신고 후 복구 신호를 늦게 보내는 편이면,
+        그 기기만 여유를 더 준 숫자를 넣어주세요.
         "보낼 채널"을 (기본 채널) 그대로 두면 맨 위 기본 Webhook으로 갑니다.
     </div>
     <div class="row">
@@ -5233,6 +5239,8 @@ async def receive_data(request: Request):
         
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+        analyzer.ingest_realtime_record(data)
             
         return {"status": "success"}
     except Exception as e:
@@ -5273,6 +5281,25 @@ async def receive_radar_data(request: Request):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"log write failed: {e}")
+
+    analyzer.ingest_realtime_record(record)
+
+    # ── NRCarec 경보 ──────────────────────────────────────────────
+    # BED 모델의 POS(3=걸터앉음, 4=낙상), FALL 모델의 pose(4=낙상)를 본다.
+    # 레이더가 1초마다 보내므로 should_send 로 반복 발송을 막는다.
+    try:
+        _pos = record.get("POS") if is_bed else record.get("pose")
+        _pos = int(_pos) if _pos is not None else None
+        _kind = {3: "bedside", 4: "fall"}.get(_pos)
+        # FALL 모델에는 걸터앉음이 없다(2=재실/4=낙상/5=자리비움).
+        if _kind and not (is_fall and _kind == "bedside"):
+            _sn = record.get("MAC") or record.get("macAddress") or "radar"
+            if should_send(_sn, _kind):
+                _room, _patient_name = _nrcarec_patient_context(_sn)
+                send_alert(_kind, room=_room, patient_name=_patient_name, device_id=_sn)
+    except Exception as _e:
+        # 알림이 실패해도 센서 수신은 계속돼야 한다.
+        print(f"[NRCarec] 경보 발송 실패: {_e}")
 
     return {
         "status": "success",
@@ -5359,6 +5386,8 @@ async def receive_mckare_data(request: Request):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
         return JSONResponse({"statusCode": 500, "message": f"log write failed: {e}"}, status_code=500)
+
+    analyzer.ingest_realtime_record(record)
 
     # McKare 규격에 맞춘 201 Created 응답 (statusCode/message 형식도 문서와 동일하게)
     return JSONResponse({"statusCode": 201, "message": "created"}, status_code=201)
@@ -5545,6 +5574,8 @@ async def receive_fsr_data(request: Request):
         # 저장 실패는 반드시 5xx 로 알려야 보드가 재전송할 수 있다.
         return JSONResponse({"status": "error", "message": f"log write failed: {e}"},
                             status_code=500)
+
+    analyzer.ingest_realtime_record(record)
 
     try:
         _fsr_last_update(record)

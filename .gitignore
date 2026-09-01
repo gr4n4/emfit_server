@@ -43,3 +43,10 @@ logs/
 .idea/
 *.swp
 .DS_Store
+
+# 패치 스크립트가 남기는 백업
+app.py.bak_*
+
+# NRCarec 서비스 계정 키 — 절대 커밋 금지
+*firebase-adminsdk*.json
+nrcarec-key.json

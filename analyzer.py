@@ -532,6 +532,20 @@ def get_device_statuses():
     return dict(_device_status)
 
 
+def ingest_realtime_record(record):
+    """방금 수신한 payload를 현재 상태 캐시에 즉시 반영한다.
+
+    대시보드 조회가 로그를 파싱할 때까지 기다리면 디스코드 알림 기준이 오래된
+    상태에 머물 수 있다. 저장은 app.py가 이미 끝낸 뒤 호출하므로, 여기서는
+    화면/알림이 보는 최신 연결 상태만 같은 파서 경로로 갱신한다.
+    """
+    try:
+        line = json.dumps(record, ensure_ascii=False)
+    except Exception:
+        return
+    _process_line(line, {})
+
+
 def _store_radar_record(storage, radar):
     """정규화된 AI Radar 1건을 공통 저장소와 연결상태에 반영."""
     sn = radar["sn"]
@@ -661,8 +675,9 @@ def _store_fsr_record(storage, fsr):
         fault = bool(prev.get("fault"))
 
     _device_status[sn] = {
-        # 이벤트 기반이라 '조용함'이 정상이다. 전송이 왔다는 것 자체가 살아있다는 뜻.
-        "connected": True,
+        # 이벤트 기반이라 '조용함'이 정상이다. 다만 펌웨어가 fault/disconnect 를
+        # 직접 보낸 경우는 그 신고 자체를 끊김으로 본다.
+        "connected": not fault,
         "status_code": None,
         "last_seen_ts": int(ts),
         "status_since_ts": int(ts),
