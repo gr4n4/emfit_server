@@ -42,6 +42,13 @@ def _dot(connected):
     return {True: "🟢", False: "🔴"}.get(connected, "⚪")
 
 
+def _format_device_line(d):
+    """예: 🟢 김돌봄(우리집, EMFIT QS) - 방금 — 위치·기기종류를 괄호 안에 같이 보여준다."""
+    tag_parts = [p for p in (d.get("location"), d.get("kind_label")) if p]
+    tag = f"({', '.join(tag_parts)})" if tag_parts else ""
+    return f"{_dot(d['connected'])} {d['name']}{tag} - {d['last_seen_text']}"
+
+
 client = discord.Client(intents=discord.Intents.default())
 tree = app_commands.CommandTree(client)
 
@@ -63,10 +70,7 @@ async def status_command(interaction: discord.Interaction):
 
     offline = [d for d in data["devices"] if d["connected"] is False]
     if offline:
-        msg += "\n\n" + "\n".join(
-            f"🔴 {d['name']}" + (f" ({d['location']})" if d["location"] else "") + f" — {d['last_seen_text']}"
-            for d in offline
-        )
+        msg += "\n\n" + "\n".join(_format_device_line(d) for d in offline)
     await interaction.response.send_message(msg)
 
 
@@ -78,11 +82,7 @@ async def detail_command(interaction: discord.Interaction):
         await interaction.response.send_message(f"⚠️ 대시보드 서버에 연결하지 못했습니다: {e}", ephemeral=True)
         return
 
-    lines = [
-        f"{_dot(d['connected'])} {d['name']}" + (f" ({d['location']})" if d["location"] else "")
-        + f" — {d['last_seen_text']}"
-        for d in data["devices"]
-    ]
+    lines = [_format_device_line(d) for d in data["devices"]]
     body = "\n".join(lines) if lines else "등록된 기기가 없습니다."
     if len(body) > 1900:  # 디스코드 메시지 2000자 제한
         body = body[:1900] + "\n… (기기가 많아 일부 생략)"
@@ -125,13 +125,9 @@ def _make_channel_command(cmd_name, channel_name):
         if unknown_n:
             msg += f" · ⚪ 이력없음 {unknown_n}"
 
-        offline = [d for d in devices if d["connected"] is False]
-        if offline:
-            msg += "\n\n" + "\n".join(
-                f"🔴 {d['name']}" + (f" ({d['location']})" if d["location"] else "") + f" — {d['last_seen_text']}"
-                for d in offline
-            )
-        elif total == 0:
+        if devices:
+            msg += "\n\n" + "\n".join(_format_device_line(d) for d in devices)
+        else:
             msg += "\n\n이 채널에 배정된 기기가 없습니다. /admin/discord 에서 배정해주세요."
         await interaction.response.send_message(msg)
 
