@@ -11,6 +11,7 @@ app.py 가 이미 메모리에 들고 있는 상태를 /internal/discord/status(
 실행: venv/bin/python discord_bot.py  (systemd 서비스로 상시 실행 권장)
 토큰: discord_bot_token.txt 파일에서 읽는다 (git에 올리지 않음).
 """
+import asyncio
 import os
 import re
 
@@ -137,13 +138,24 @@ def _make_channel_command(cmd_name, channel_name):
     tree.command(name=cmd_name, description=f"{channel_name} 기기 연결 현황")(handler)
 
 
-def _register_facility_commands():
-    """/admin/discord 에 등록된 시설(채널) 목록으로 /A시설 같은 명령어를 동적으로 만든다."""
-    try:
-        data = _fetch_status()
-    except Exception as e:
-        print(f"[discord_bot] 시설별 명령어 등록 건너뜀(상태 조회 실패): {e}", flush=True)
-        return
+async def _register_facility_commands(retries=20, delay_sec=3):
+    """/admin/discord 에 등록된 시설(채널) 목록으로 /A시설 같은 명령어를 동적으로 만든다.
+
+    봇과 대시보드(emfit.service)를 거의 동시에 재시작하면, 대시보드가 600MB+ 로그를
+    파싱하는 동안 이 API가 아직 안 떠 있을 수 있다 — 그래서 바로 포기하지 않고 잠깐씩
+    쉬며 재시도한다(기본 20회 × 3초 = 최대 1분 정도 기다림)."""
+    data = None
+    for attempt in range(1, retries + 1):
+        try:
+            data = _fetch_status()
+            break
+        except Exception as e:
+            if attempt == retries:
+                print(f"[discord_bot] 시설별 명령어 등록 실패(재시도 {retries}회 소진): {e}", flush=True)
+                return
+            print(f"[discord_bot] 대시보드 응답 대기 중... ({attempt}/{retries}) {e}", flush=True)
+            await asyncio.sleep(delay_sec)
+
     seen_names = {"현황", "상세보기"}  # 고정 명령어와 겹치면 등록이 통째로 실패하니 미리 막는다
     for channel_name in data.get("channels") or []:
         cmd_name = _slugify_command_name(channel_name)
@@ -157,7 +169,7 @@ def _register_facility_commands():
 
 @client.event
 async def on_ready():
-    _register_facility_commands()
+    await _register_facility_commands()
     await tree.sync()
     print(f"[discord_bot] 로그인 완료: {client.user} — 슬래시 명령어 등록됨", flush=True)
 
