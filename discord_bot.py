@@ -4,10 +4,16 @@ app.py(대시보드)와는 별도 프로세스로 돈다. 기기 데이터를 �
 app.py 가 이미 메모리에 들고 있는 상태를 /internal/discord/status(localhost 전용)로
 불러다 쓴다 — 봇 하나 띄우자고 500MB+ 로그 파일을 또 파싱하지 않기 위함.
 
+/admin/discord 에 등록해둔 시설별 채널(예: A시설, B시설) 이름으로
+/A시설 같은 명령어도 봇 시작 시 자동으로 만들어진다 — 그 시설 기기만 걸러서 보여줌.
+새 시설을 추가했으면 봇을 한 번 재시작해야 명령어가 새로 생긴다.
+
 실행: venv/bin/python discord_bot.py  (systemd 서비스로 상시 실행 권장)
 토큰: discord_bot_token.txt 파일에서 읽는다 (git에 올리지 않음).
 """
 import os
+import re
+
 import discord
 import requests
 from discord import app_commands
@@ -82,8 +88,76 @@ async def detail_command(interaction: discord.Interaction):
     await interaction.response.send_message(f"📋 **전체 기기 목록** ({data['total']}대)\n\n{body}")
 
 
+# 디스코드 슬래시 명령어 이름 규칙: 소문자·숫자·유니코드 문자·하이픈·밑줄만, 1~32자, 공백 불가.
+# 한글은 대소문자 구분이 없어 그대로 써도 되지만, 공백·길이는 안전하게 다듬는다.
+_CMD_NAME_RE = re.compile(r"[^\w\-]", re.UNICODE)
+
+
+def _slugify_command_name(name):
+    slug = _CMD_NAME_RE.sub("_", name.strip()).strip("_-").lower()
+    return slug[:32] or None
+
+
+def _make_channel_command(cmd_name, channel_name):
+    """시설(채널) 하나를 담당하는 슬래시 명령어를 만들어 tree 에 등록한다.
+
+    channel_name 을 함수 인자로 받아 클로저로 갇히게 하는 게 핵심 — 반복문 안에서
+    바로 만들면 모든 명령어가 마지막 채널 이름 하나만 참조하게 되는 흔한 실수를 피한다.
+    """
+    async def handler(interaction: discord.Interaction):
+        try:
+            data = _fetch_status()
+        except Exception as e:
+            await interaction.response.send_message(f"⚠️ 대시보드 서버에 연결하지 못했습니다: {e}", ephemeral=True)
+            return
+
+        devices = [d for d in data["devices"] if d.get("channel") == channel_name]
+        total = len(devices)
+        connected_n = sum(1 for d in devices if d["connected"] is True)
+        disconnected_n = sum(1 for d in devices if d["connected"] is False)
+        unknown_n = sum(1 for d in devices if d["connected"] is None)
+
+        msg = (
+            f"📍 **{channel_name} 현황**\n"
+            f"전체 {total}대 · 🟢 연결 {connected_n} · 🔴 끊김 {disconnected_n}"
+        )
+        if unknown_n:
+            msg += f" · ⚪ 이력없음 {unknown_n}"
+
+        offline = [d for d in devices if d["connected"] is False]
+        if offline:
+            msg += "\n\n" + "\n".join(
+                f"🔴 {d['name']}" + (f" ({d['location']})" if d["location"] else "") + f" — {d['last_seen_text']}"
+                for d in offline
+            )
+        elif total == 0:
+            msg += "\n\n이 채널에 배정된 기기가 없습니다. /admin/discord 에서 배정해주세요."
+        await interaction.response.send_message(msg)
+
+    tree.command(name=cmd_name, description=f"{channel_name} 기기 연결 현황")(handler)
+
+
+def _register_facility_commands():
+    """/admin/discord 에 등록된 시설(채널) 목록으로 /A시설 같은 명령어를 동적으로 만든다."""
+    try:
+        data = _fetch_status()
+    except Exception as e:
+        print(f"[discord_bot] 시설별 명령어 등록 건너뜀(상태 조회 실패): {e}", flush=True)
+        return
+    seen_names = {"현황", "상세보기"}  # 고정 명령어와 겹치면 등록이 통째로 실패하니 미리 막는다
+    for channel_name in data.get("channels") or []:
+        cmd_name = _slugify_command_name(channel_name)
+        if not cmd_name or cmd_name in seen_names:
+            print(f"[discord_bot] 채널 '{channel_name}' → 명령어 이름을 만들 수 없어 건너뜀(중복 또는 빈 이름)", flush=True)
+            continue
+        seen_names.add(cmd_name)
+        _make_channel_command(cmd_name, channel_name)
+        print(f"[discord_bot] /{cmd_name} → '{channel_name}' 채널 전용 명령어 등록", flush=True)
+
+
 @client.event
 async def on_ready():
+    _register_facility_commands()
     await tree.sync()
     print(f"[discord_bot] 로그인 완료: {client.user} — 슬래시 명령어 등록됨", flush=True)
 

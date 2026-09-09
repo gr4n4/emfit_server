@@ -17,7 +17,7 @@ from nrcarec_alert import send_alert, should_send
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.18.2"
+VERSION = "3.19.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -516,6 +516,7 @@ def _discord_device_snapshot(cfg):
             "connected": connected, "age_sec": age_sec, "last_seen_text": last_seen_text,
             "threshold_minutes": threshold_minutes,
             "kind": kind, "kind_label": _DISCORD_KIND_LABELS.get(kind, kind),
+            "channel": (cfg.get("device_channels") or {}).get(sn) or None,
         })
     return out
 
@@ -4743,6 +4744,8 @@ def internal_discord_status(request: Request):
         "disconnected": sum(1 for d in devices if d["connected"] is False),
         "unknown": sum(1 for d in devices if d["connected"] is None),
         "devices": devices,
+        # 봇이 시설별(/A시설 등) 슬래시 명령어를 동적으로 등록할 때 씀.
+        "channels": sorted((cfg.get("channels") or {}).keys()),
     })
 
 
