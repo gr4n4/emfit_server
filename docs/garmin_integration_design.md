@@ -392,9 +392,13 @@ oauth2 access 가 만료된 상태에서 성공했으므로 **oauth1 으로 교�
    윈도우 `dashboard.py` 를 같은 계정으로 동시 운영하면 한쪽 파일이 낡아 401이 난다.
    윈도우 `token/` 폴더는 손대지 않는 백업으로만 둔다.
 3. **복사는 무해하다.** `scp` 자체는 유효성에 영향이 없다. 바뀌는 건 *사용해서 갱신될 때*뿐.
-4. **`refresh_token_expires_at` 을 화면에 노출한다.** 갱신할 때마다 미래로 밀리므로, `/devices` 나 카드
-   상세에 `토큰 유효: 2026-10-10` 형태로 표시하면 oauth1 만료일을 몰라도 안전 여부를 눈으로 확인할 수 있다.
-   이 날짜가 **7일 이내로 다가오면** = 수집이 2~3주 멈췄다는 뜻 → 디스코드 알림.
+4. ~~`refresh_token_expires_at` 을 화면에 노출한다~~ → **철회 (2026-09-14 구현 시점 판단).**
+   garth 0.5.x 는 그 refresh token 을 **쓰지 않는다**(oauth1 으로만 교환). 따라서 그 날짜는 실제
+   안전 여부와 무관해서, 화면에 띄우면 오히려 '아직 10월까지 괜찮다'는 잘못된 안심을 준다.
+   - 대신 채택한 방식: **폴링이 성공했다는 사실 자체가 oauth1 생존 증명**이다(매 실행마다 교환하므로).
+     실패하면 폴러가 `auth_error` 를 올리고, 디스코드로 `🔧 토큰 갱신 필요` 가 즉시 간다.
+   - 여기에 더해, 디스코드 판정은 저장된 `connected` 가 아니라 **마지막 동기화 시각**으로 다시 잰다.
+     폴러 프로세스 자체가 죽어 아무 보고도 없는 경우까지 잡기 위함 (§6 구현 메모).
 5. **복구 절차** (장기 중단 후 토큰이 죽은 경우): 윈도우에서 해당 계정 재로그인 → 토큰 폴더 scp → 폴러 재시작.
 
 ---
@@ -420,10 +424,28 @@ oauth2 access 가 만료된 상태에서 성공했으므로 **oauth1 으로 교�
 |---|---|---|---|
 | ~~1. PoC~~ **✅ 2026-09-14 완료** | 0004 계정으로 조회 성공 | oauth1 생존 확인 · 지표 가용성 실측(§3) · 토큰 저장 문제 발견(§9) | 없음 |
 | ~~1-b. 원본 JSON 확보~~ **✅ 2026-09-14 완료** | `fetch_garmin_raw.py` 로 0004·0005 2일치 수집 (`garmin_raw/`) | 컬럼 매핑 확정(§5) · steps/pushes 규명(§3) · 중복 폴링 문제 발견(§5) · 수면 단계 확인(§12) | 없음 |
-| 2. 파서·저장 | `garmin_parser.py` + `_store_garmin_record` + `/garmin` + 폴러 젯슨 배치 | `garmin_data.jsonl` 에 데이터 축적 | 로그 파일 1개 추가 |
-| 3. 화면 | 카드 섹션 + 전용 렌더러 + V2 섹션 | 대시보드에 워치 카드 | 대시보드 변경 |
-| 4. 알림·리포트 | 디스코드 기준(24h) + 토큰 만료 감지 + `_Garmin.csv` | 완성 | 알림 규칙 추가 |
-| 5. 문서 | MANUAL.md 기기 표·수신 경로·트러블슈팅, CHANGELOG, `VERSION` → 3.20.0 | — | — |
+| ~~2. 파서·저장~~ **✅ 완료** | `garmin_parser.py` · `garmin_poller.py` · `_store_garmin_record` · `POST /garmin` | 커밋 `9ba7ee5` | 로그 파일 1개 추가 |
+| ~~3. 화면~~ **✅ 완료** | 카드 섹션 + 전용 렌더러 + V2 섹션 + 상세페이지 | 커밋 `e2935d8` | 대시보드 변경 |
+| ~~4. 알림·리포트~~ **✅ 완료** | 디스코드 기준 + 토큰 만료 감지 + `_Garmin.csv` | 커밋 `e84e9f2` | 알림 규칙 추가 |
+| ~~5. 문서~~ **✅ 완료** | MANUAL · CHANGELOG · VERSION_HISTORY, `VERSION` → **3.20.0** | — | — |
+| **6. 젯슨 배포** | 패키지 설치 → 토큰 이전 → systemd timer → 회귀 확인 | **← 다음 할 일** | 실서버 |
+
+### 6단계 배포 절차 (예정)
+```bash
+# 1) 패키지 (젯슨 venv)
+~/emfit_server/venv/bin/pip install "garminconnect==0.2.38" "garth>=0.5.17,<0.6.0"
+
+# 2) 토큰 이전 (윈도우에서) — 원본은 젯슨 한 곳에만 두는 것이 원칙(§9)
+scp -O -r token/.garmin_example-account-000* operator@jetson-host:~/
+#    젯슨에서: chmod 700 ~/.garmin_example-account-*; chmod 600 ~/.garmin_example-account-*/*
+
+# 3) 코드 전송 — 다섯 파일이 한 세트다 (하나라도 빠지면 import 실패로 앱이 안 켜진다)
+scp -O app.py analyzer.py garmin_parser.py garmin_poller.py operator@jetson-host:/opt/monitoring_server/
+
+# 4) 재시작 전 검사 → 통과할 때만 재시작 (MANUAL §6.7)
+# 5) 폴러 수동 1회: python3 garmin_poller.py --all-accounts --dry-run  → 이상 없으면 --dry-run 빼고 실행
+# 6) systemd timer 등록 (30~60분 주기), 카드 확인, 기존 기기 회귀 확인
+```
 
 > **1단계가 가장 중요하다.** 실제 응답 JSON 구조를 확보하기 전에 파서를 쓰면 추측이 된다.
 > McKare 이미지 규격을 몰라 세 가지 방식을 모두 받아둬야 했던 상황을 반복하지 않기 위함.

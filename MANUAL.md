@@ -1,9 +1,9 @@
 # 돌봄기기 통합 관제 서버 매뉴얼
 
-EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) 네 종류 센서 데이터를 수집·관제하고
-리포트·알림을 제공하는 서버의 운영 및 사용 문서.
+EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) · Garmin 워치 다섯 종류 데이터를
+수집·관제하고 리포트·알림을 제공하는 서버의 운영 및 사용 문서.
 
-> 기준 버전 **v3.19.2** (2026-09-10). 기술 변경 내역은 [CHANGELOG.md](CHANGELOG.md),
+> 기준 버전 **v3.20.0** (2026-09-14). 기술 변경 내역은 [CHANGELOG.md](CHANGELOG.md),
 > 개발 여정 요약은 [VERSION_HISTORY.md](VERSION_HISTORY.md), 코드 작업 규칙은 [CLAUDE.md](CLAUDE.md) 참고.
 
 ---
@@ -35,10 +35,16 @@ EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) 네 종류 센�
 센서가 HTTP POST 로 보내는 생체·재실·사용 데이터를 받아 파일에 쌓고,
 ① 실시간 관제 대시보드 ② 날짜별 CSV 리포트 ③ 디스코드 끊김 알림 ④ NRCarec 낙상 경보를 제공한다.
 
+> **Garmin 워치만 예외다.** 워치는 폰을 거쳐 Garmin 클라우드까지만 가고 서버로 직접 보내지
+> 못해서, 젯슨에서 `garmin_poller.py` 가 주기적으로 **당겨온다**. 그래서 수 시간 지연이 정상이다.
+
 ### 1.2 데이터 흐름
 
 ```
-[EMFIT QS]  [AI Radar]  [McKare]  [ESP32 사용감지]
+[EMFIT QS]  [AI Radar]  [McKare]  [ESP32 사용감지]        [Garmin 워치]
+                                                              │ (폰 경유)
+                                                      [Garmin 클라우드]
+                                                              ↑ 폴링(30~60분)
      └───────────┴──── HTTP POST ──┴───────────┘
                         │
                         ▼
@@ -51,7 +57,9 @@ EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) 네 종류 센�
         │   ├─ emfit_data.jsonl         ← EMFIT QS
         │   ├─ radar_data.jsonl         ← AI Radar
         │   ├─ mckare_data.jsonl        ← McKare (+ mckare_images/)
-        │   └─ fsr_data.jsonl           ← 사용감지 센서
+        │   ├─ fsr_data.jsonl           ← 사용감지 센서
+        │   └─ garmin_data.jsonl        ← Garmin 워치 (폴러가 넣어줌)
+        ├─ systemd `emfit-garmin-poller`→ Garmin 클라우드 조회 → POST /garmin
         └─ systemd `emfit-discord-bot`  → 디스코드 슬래시 명령어 봇
                         │
         ┌───────────────┼───────────────┐
@@ -68,6 +76,7 @@ EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) 네 종류 센�
 | AI Radar (라닉스 RMR602A) | `POST /radar` | `radar_data.jsonl` | 1~50초 | 없음 |
 | McKare (VSR22 / AI 110) | `POST /mckare` | `mckare_data.jsonl`, `mckare_images/` | 기기 설정 | ApiKey (파일 있을 때만) |
 | 돌봄기기 사용감지 (ESP32 FSR) | `POST /jy01` | `fsr_data.jsonl` | **주기 없음 — 사용 시작/종료 때만** | 없음 |
+| **Garmin 워치** | `POST /garmin` (**localhost 전용**) | `garmin_data.jsonl` | 폴러가 30~60분마다 조회 | 계정별 OAuth 토큰 |
 
 ### 1.4 현재 등록된 기기
 
@@ -82,6 +91,7 @@ EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) 네 종류 센�
 | EMFIT-DEMO-04 | 사용자-D | 사용자-D님 가정 | 뇌성마비 | EMFIT QS |
 | A1B2C3D4E5F8 | AI Radar | - | 일반 | AI Radar |
 | fb-A3F2 | 돌봄기기 1 | - | 일반 | 사용감지(FSR) |
+| garmin-example-account-03 … | (폴러 가동 후 자동 등록) | - | 일반 | Garmin 워치 |
 
 > **기기 정보는 `/devices` 화면에서 수정한다.** 값은 `device_info.json` 에 저장되며,
 > 코드(`analyzer.py` 의 `_DEFAULT_DEVICE_INFO`)는 파일이 아예 없을 때 쓰는 초기값일 뿐이다.
@@ -116,6 +126,7 @@ EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) 네 종류 센�
 | ❤️ **EMFIT QS** | 심박 · 호흡 · 움직임 등 생체정보 중심 |
 | 📡 **AI Radar** | 누움 · 앉음 · 걸터앉음 · 자리비움 · 낙상 등 자세정보 중심 |
 | 🔘 **돌봄기기 사용 감지** | 압력 센서 · 사용 중/미사용 · 배터리 잔량 (등록된 기기가 있을 때만 표시) |
+| ⌚ **Garmin 워치** | 안정시 심박 · 활동 · 수면 (등록된 계정이 있을 때만 표시) |
 
 - 화면 오른쪽 위 요약: `N / M 연결됨 · EMFIT n대 · Radar n대 · 사용감지 n대`
 - **7일 이상 통신이 없는 기기**는 각 구역 아래 `💤 비활성 기기` 로 따로 모인다.
@@ -176,6 +187,22 @@ AI Radar 카드는 `🏃 ACT` 자리에 `🧭 자세`(누움/앉음/걸터앉음
 > ⚠️ **조용한 것만으로는 경고하지 않는다.** 사용감지 센서는 하루 종일 안 쓰는 게 정상일 수 있어서,
 > 위 세 가지 확실한 근거가 있을 때만 '확인 필요'를 띄운다. 배터리 표시는 15% 이하 🪫 빨강, 30% 이하 주황.
 
+**Garmin 워치**
+
+| 아이콘 | 상태 | 판정 기준 |
+|---|---|---|
+| 🟢 | 동기화 정상 | 마지막 동기화가 24시간 이내 |
+| 🟡 | 동기화 지연 | 24~72시간 — 폰 앱에서 동기화 확인 |
+| 🔴 | 미동기화 | 72시간 초과 — 워치 착용·충전 확인 |
+| 🔧 | 토큰 갱신 필요 | 계정 인증 실패 — **관리자가 재로그인해야 풀린다** |
+
+> ⚠️ **'동기화: 3시간 전'은 정상이다.** 워치는 폰을 거쳐 클라우드로 올라오므로 수십 분~수 시간
+> 지연이 당연하다. 카드에 어느 날짜 값인지도 같이 뜬다(`동기화: 4시간 전 (09-13)`) —
+> 워치가 아직 오늘 것을 올리지 않았으면 어제의 온전한 값을 보여준다.
+>
+> 카드 가운데 칸은 사람에 따라 **`🚶 걸음` / `🦽 밀기` / `🛋 좌식`** 으로 자동으로 바뀐다.
+> Garmin 이 걸음과 밀기를 상호 배타로 집계해서, 휠체어를 쓰면 걸음이 아예 안 잡히기 때문이다.
+
 ### 2.5 측정 vs 통신 — 두 가지 시각의 차이
 
 - **측정 시각**: 마지막으로 HR/RR/ACT(또는 자세) 값을 받은 시각
@@ -222,6 +249,7 @@ AI Radar 카드는 `🏃 ACT` 자리에 `🧭 자세`(누움/앉음/걸터앉음
 - 데이터 없는 날짜는 자동으로 빠진다.
 - **AI Radar 는 하루에 두 파일**이 나온다 — `..._Radar-BED.csv`(자세 7종 + 생체)와
   `..._Radar-FALL.csv`(자세 3종 + 감지 인원). 측정 성격이 달라 섞지 않는다.
+- **Garmin 워치는 `..._Garmin.csv`** 로 나온다. 2분 간격 심박 행 + 하루 한 줄의 일별 요약이 들어 있다.
 - CSV 는 BOM 붙은 UTF-8 이라 엑셀에서 한글이 깨지지 않는다.
 
 ---
@@ -244,6 +272,11 @@ AI Radar 카드는 `🏃 ACT` 자리에 `🧭 자세`(누움/앉음/걸터앉음
 
 AI Radar 는 자세·낙상·감지인원·Radar모델(bed/fall) 컬럼이, McKare 는 재실코드·체온이,
 사용감지는 사용중·배터리 관련 컬럼이 추가로 채워진다. 해당 형식이 쓰지 않는 컬럼은 파일에서 빠진다.
+
+**Garmin 워치**는 안정시심박·최저/최고심박·호흡수·산소포화도·걸음수(또는 밀기)·이동거리·
+좌식/활동/고강도(분)·스트레스·바디배터리 컬럼과, **Emfit 과 같은 이름의 수면 컬럼**
+(수면점수·총수면(분)·깊은수면(분)·REM수면(분)·얕은수면(분)·각성시간(분))을 채운다.
+같은 사람의 침대 센서 수면과 워치 수면을 같은 컬럼에서 바로 대조하려고 일부러 이름을 맞췄다.
 
 ### 4.2 유형별 데이터
 
@@ -277,12 +310,17 @@ AI Radar 는 자세·낙상·감지인원·Radar모델(bed/fall) 컬럼이, McKa
 | EMFIT QS · AI Radar | 하트비트에 실려오는 `connected` 값. 단 하트비트 자체가 **6시간** 넘게 없으면 끊김으로 본다 |
 | 사용감지(FSR) | 펌웨어가 보낸 이상(fault/disconnect) 이벤트 |
 | McKare | 끊김 신고 수단이 없어 **무소식만으로 알림을 만들지 않는다** |
+| Garmin 워치 | **마지막 동기화가 24시간 초과**. 확인 대기는 기본 120분(폴링 주기가 길어서) |
 
 > 이유: EMFIT·Radar 는 사람이 침대에 없으면 하트비트가 원래 뜸하게 온다. "시간이 지났다"로 판정하면
 > 멀쩡한 기기가 끊김으로 잡힌다(병동 실증에서 확인). 반대로 `connected` 만 믿으면 수신 경로가 죽어
 > `true` 로 멈춘 기기는 영영 알림이 안 간다 — 그래서 6시간 안전장치를 함께 둔다.
 
 알림 메시지 예: `🔴 (EMFIT QS) A시설 1 - 돌봄자 (A시설 1) 연결이 끊겼습니다`
+
+**Garmin 토큰이 만료되면 다른 메시지로 온다**:
+`🔧 토큰 갱신 필요 — (Garmin 워치) A시설1 사용자-A님` + `Garmin 재로그인이 필요합니다`.
+전원·네트워크 문제가 아니라 **관리자가 재로그인해야만 풀리는** 경우라 제목부터 구분한다.
 
 ### 5.2 디스코드 봇 슬래시 명령어
 
@@ -322,12 +360,15 @@ ssh operator@jetson-host
 | 서비스 | 역할 |
 |---|---|
 | `emfit` | FastAPI 대시보드·수집 서버 (포트 8080) |
+| `emfit-garmin-poller` | Garmin 클라우드 조회 → `/garmin` 전송 (systemd timer, 30~60분 주기) |
 | `emfit-discord-bot` | 디스코드 슬래시 명령어 봇 |
 
 ```bash
 sudo systemctl status emfit                 # 상태 확인
 sudo systemctl restart emfit                # 재시작 (코드 수정 반영)
 sudo systemctl restart emfit-discord-bot    # 봇만 재시작 (시설 명령어 갱신)
+systemctl list-timers emfit-garmin-poller   # Garmin 수집 타이머 상태·다음 실행 시각
+sudo systemctl start emfit-garmin-poller    # Garmin 수집 즉시 1회 실행
 systemctl is-active emfit                   # 한 단어 상태
 ```
 
@@ -350,6 +391,7 @@ tail -f ~/emfit_server/emfit_data.jsonl      # EMFIT
 tail -f ~/emfit_server/radar_data.jsonl      # AI Radar
 tail -f ~/emfit_server/mckare_data.jsonl     # McKare
 tail -f ~/emfit_server/fsr_data.jsonl        # 사용감지
+tail -f ~/emfit_server/garmin_data.jsonl     # Garmin 워치
 
 tail -f ~/emfit_server/emfit_data.jsonl | grep --line-buffered EMFIT-DEMO-04   # 특정 기기만
 du -h ~/emfit_server/*.jsonl                                            # 파일 크기
@@ -367,6 +409,9 @@ du -h ~/emfit_server/*.jsonl                                            # 파일
 ├─ radar_parser.py         # AI Radar payload 해석 (BED/FALL 두 형식)
 ├─ mckare_parser.py        # McKare(VSR22) payload 해석
 ├─ fsr_parser.py           # 사용감지(ESP32) payload 해석
+├─ garmin_parser.py        # Garmin 워치 payload 해석
+├─ garmin_poller.py        # Garmin 클라우드 수집기 (timer 로 주기 실행)
+├─ garmin_poll_state.json  # 계정별 '마지막 전송 심박 시각' (증분 전송용)
 ├─ discord_bot.py          # 디스코드 봇 (별도 프로세스)
 ├─ nrcarec_alert.py        # NRCarec 낙상 경보 전송
 ├─ *_data.jsonl            # 기기별 수집 로그 (append-only)
@@ -468,21 +513,31 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/dashboard   # 200
 대시보드가 아직 워밍업 중이면 봇이 최대 1분간 재시도하므로, 로그(`journalctl -u emfit-discord-bot`)에
 `시설별 명령어 등록 실패` 가 찍혔으면 대시보드가 준비된 뒤 다시 재시작한다.
 
-### 7.6 리포트가 너무 느림
+### 7.6 Garmin 워치 데이터가 안 들어옴
+
+1. 타이머가 살아 있는지: `systemctl list-timers emfit-garmin-poller`
+2. 수동으로 한 번 돌려본다: `sudo systemctl start emfit-garmin-poller` 후
+   `journalctl -u emfit-garmin-poller -n 30 --no-pager`
+3. 로그가 `로그인 실패` 면 **토큰 만료**다 → 윈도우에서 재로그인 후 토큰 폴더를 다시 올려야 한다
+4. `새 데이터 없음` 만 반복되면 정상일 수 있다 — 워치가 폰과 동기화되지 않으면 서버가 받을 것도 없다.
+   대상자에게 폰의 Garmin Connect 앱을 한 번 열어달라고 요청한다
+5. 카드가 🔴 인데 폴러 로그는 정상이면, 워치를 착용하지 않았거나 충전 중일 가능성이 크다
+
+### 7.7 리포트가 너무 느림
 
 최초 파싱 30초~수 분은 정상이고, 그 후엔 증분 파싱이라 즉시 응답한다. 재시작할 때마다 최초 파싱이 다시 일어난다.
 
-### 7.7 서비스가 계속 죽음 / 재시작 반복
+### 7.8 서비스가 계속 죽음 / 재시작 반복
 
 - `sudo journalctl -u emfit -n 50 --no-pager` 에서 Traceback 확인
 - 흔한 원인: 파서 파일 누락(한 세트로 안 올림), JSON/문법 오류, 패키지 미설치
 - venv 확인: `source ~/emfit_server/venv/bin/activate && pip list`
 
-### 7.8 젯슨 전원이 자꾸 나감
+### 7.9 젯슨 전원이 자꾸 나감
 
 어댑터 스펙 확인(USB-C PD 65W 권장) → 저전력 모드 `sudo nvpmodel -m 2`(7W) → UPS/PD 보조배터리 고려
 
-### 7.9 디스크 용량 부족
+### 7.10 디스크 용량 부족
 
 - `df -h` 로 확인, `du -h ~/emfit_server/*.jsonl` 로 큰 파일 찾기
 - **로그 로테이션이 없다.** 커지면 월별 분리를 고려한다. AI Radar 는 1초 주기로 보내면 하루 20MB 이상 쌓인다.
@@ -505,6 +560,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/dashboard   # 200
 | AI Radar | 같음. MAC 이 바뀌면 새 기기로 뜨므로 옛 기기는 `/devices`·`assignments.json` 에서 정리 |
 | 사용감지(FSR) | 처음 데이터가 오면 자동 등록(`돌봄기기 XXXX`) → `/devices` 에서 이름·설치장소 수정. 무한 증가를 막는 자동 등록 상한 20대 |
 | McKare | `POST /mckare` 로 데이터가 오면 등록됨. 전용 대시보드 구역은 `/dashboard2` 에만 있다 |
+| **Garmin 워치** | 계정 토큰 폴더를 젯슨의 `~/.garmin_example-account-<번호>` 에 올리면, 다음 수집 주기에 `Garmin example-account-05` 로 자동 등록된다 → `/devices` 에서 이름·위치 지정 |
 
 `/devices` 에서 삭제는 안 된다. 쓰지 않는 기본 등록을 지우려면 `assignments.json` 에서 해당 줄을 지우고 재시작한다.
 
@@ -517,10 +573,12 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/dashboard   # 200
 
 ```bash
 mkdir -p ~/backup
-for f in emfit radar mckare fsr; do
+for f in emfit radar mckare fsr garmin; do
   cp ~/emfit_server/${f}_data.jsonl ~/backup/${f}_data_$(date +%Y%m%d).jsonl 2>/dev/null
 done
 cp ~/emfit_server/{device_info.json,assignments.json} ~/backup/
+# Garmin 토큰 — oauth1 은 재발급이 불가능한 유일한 자산이라 따로 챙긴다
+cp -r ~/.garmin_example-account-* ~/backup/garmin_tokens_$(date +%Y%m%d)/
 ```
 또는 외부 NAS/클라우드로 rsync·scp 주기 전송을 cron 에 설정한다.
 
@@ -547,6 +605,14 @@ sudo systemctl daemon-reload
   대상자의 수면 단계 분류에 실패하는 것으로 추정 — **총수면 값만 신뢰 가능**하다.
 - **McKare 는 기존 대시보드(`/dashboard`)에 전용 구역이 없다.** 등록하면 SN 모양(12자리 MAC) 때문에
   AI Radar 구역에 섞여 보인다. 전용 구역은 `/dashboard2` 에 있다.
+- **Garmin 은 실시간이 아니다.** 워치 → 폰 → 클라우드 → 서버 폴링(30~60분) 구조라 수 시간 지연이
+  정상이다. 낙상·이상 감지 같은 즉시 대응 용도로는 쓸 수 없고, 활동·수면 추세 용도다.
+- **Garmin 접근은 비공식 경로다.** 공식 앱과 같은 OAuth 를 흉내내는 라이브러리(`garminconnect` +
+  `garth`)를 쓰며, `garth` 는 **유지보수가 중단된 상태**다. Garmin 이 인증 방식을 바꾸면 고쳐줄
+  주체가 없다. 서비스화 단계에서는 Garmin 공식 Health API(파트너 계약) 검토가 필요하다.
+- **Garmin 토큰은 약 1년 주기로 재로그인이 필요하다.** 만료되면 대상자 폰으로 다시 로그인해야
+  하고(2FA 포함), 젯슨에서는 할 수 없다 — 윈도우에서 발급해 토큰 폴더를 올리는 절차를 써야 한다.
+  만료 시 디스코드로 `🔧 토큰 갱신 필요` 알림이 간다.
 - 세션 서명키가 부팅마다 새로 만들어져 **재시작하면 전원 로그아웃**된다.
 
 ---
