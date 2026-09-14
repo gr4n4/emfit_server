@@ -19,6 +19,8 @@ emfit_data.jsonl
 radar_data.jsonl
 mckare_data.jsonl
 fsr_data.jsonl
+garmin_data.jsonl
+garmin_poll_state.json
 mckare_image_log.jsonl
 mckare_images/
 feedback.jsonl

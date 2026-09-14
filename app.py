@@ -32,9 +32,12 @@ MCKARE_IMAGE_DIR = "mckare_images"
 MCKARE_IMAGE_LOG = "mckare_image_log.jsonl"   # 이미지 목록(메타데이터)만
 MCKARE_IMAGE_MAX_BYTES = 10 * 1024 * 1024     # 한 장 상한 — 이상하게 큰 요청 차단
 FSR_LOG_FILE = "fsr_data.jsonl"  # ESP32 압력 사용감지 센서(돌봄기기 부착) 이벤트
+# Garmin 워치 — 유일하게 '기기가 보내지 않는' 종류다. 워치는 폰을 거쳐 Garmin
+# 클라우드까지만 가므로, garmin_poller.py 가 당겨와 /garmin 으로 넣어준다.
+GARMIN_LOG_FILE = "garmin_data.jsonl"
 # 대시보드·리포트가 읽어야 할 로그 파일 전체. 기기 종류가 늘면 여기에 추가.
 # 원본을 나눠두면 한쪽 데이터가 커져도 다른 쪽 조회 속도에 영향을 주지 않는다.
-DATA_FILES = [LOG_FILE, RADAR_LOG_FILE, MCKARE_LOG_FILE, FSR_LOG_FILE]
+DATA_FILES = [LOG_FILE, RADAR_LOG_FILE, MCKARE_LOG_FILE, FSR_LOG_FILE, GARMIN_LOG_FILE]
 FEEDBACK_FILE = "feedback.jsonl"
 TOKENS_FILE = "device_tokens.json"
 VIEW_TOKENS_FILE = "view_tokens.json"  # 그룹(여러 기기 묶음) 보기 토큰
@@ -600,7 +603,9 @@ async def _maintenance_gate(request: Request, call_next):
     데이터 수신은 점검 중에도 받아 데이터 유실을 막는다."""
     if not _SERVER_READY:
         # McKare 표준 경로는 여러 개라 아래 목록과 합쳐서 판단한다.
-        receive_paths = ({"/", "/radar", "/jy01"}
+        # /garmin 도 포함 — 폴러가 워밍업 중에 보낸 데이터를 버리면 그 주기는 통째로
+        # 유실된다 (다음 폴링까지 30~60분을 기다려야 한다).
+        receive_paths = ({"/", "/radar", "/jy01", "/garmin"}
                          | set(_MCKARE_PATHS) | set(_MCKARE_IMAGE_PATHS))
         if not (request.method == "POST" and request.url.path in receive_paths):
             return HTMLResponse(_maintenance_page_html(), status_code=503,
@@ -3420,6 +3425,7 @@ async def view_dashboard_raw(request: Request, file: str = Query(None),
     labels = {
         LOG_FILE: "EMFIT QS", RADAR_LOG_FILE: "AI Radar",
         MCKARE_LOG_FILE: "McKare", FSR_LOG_FILE: "사용감지",
+        GARMIN_LOG_FILE: "Garmin 워치",
         MCKARE_IMAGE_LOG: "McKare 이미지 목록",
     }
     if file not in viewable:
@@ -5586,6 +5592,46 @@ async def receive_fsr_data(request: Request):
         pass
 
     return {"status": "success", "source": "fsr", "device": str(data.get("deviceId"))}
+
+
+# ── Garmin 워치 수신 ──────────────────────────────────────────────────
+# 다른 경로와 달리 **기기가 아니라 우리 폴러(garmin_poller.py)가 호출한다.**
+# 워치는 폰을 거쳐 Garmin 클라우드까지만 가므로 서버로 직접 보낼 방법이 없다.
+# 그래서 젯슨의 폴러가 클라우드에서 당겨와 이 경로로 넣고, 그 뒤부터는 다른
+# 센서와 똑같은 길(로그 적재 → ingest_realtime_record)을 탄다.
+#
+# 외부에 열지 않는다 — 내부 폴러만 쓰는 경로라 /internal/discord/status 와 같은
+# 방식으로 localhost 로 제한한다. (다른 수신 경로는 기기가 외부에서 들어와야 해서
+# 열어둘 수밖에 없지만, 여기는 그럴 이유가 없다)
+@app.post("/garmin")
+async def receive_garmin_data(request: Request):
+    client_host = request.client.host if request.client else None
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="localhost only")
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "message": "invalid JSON"}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({"status": "error", "message": "JSON object required"}, status_code=400)
+
+    record = dict(data)
+    record["server_received_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    record["data_source"] = "garmin"
+
+    try:
+        with open(GARMIN_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"log write failed: {e}"},
+                            status_code=500)
+
+    analyzer.ingest_realtime_record(record)
+
+    return {"status": "success", "source": "garmin",
+            "device": str(record.get("sn") or record.get("account") or "")}
+
 
 # ============================================================================
 #  원격 FSR 튜닝 — app.py 맨 아래 (`if __name__ == "__main__":` 앞) 에 붙여넣기

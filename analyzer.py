@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from radar_parser import parse_radar_payload
 from mckare_parser import parse_mckare_payload
 from fsr_parser import parse_fsr_payload
+from garmin_parser import parse_garmin_payload
 
 # KST 고정 오프셋(+09:00). 한국은 현재 서머타임이 없어 'Asia/Seoul' 과 동일하며,
 # 행마다 pandas Timestamp 를 만드는 것보다 표준 datetime 이 10배 이상 빠르다.
@@ -76,6 +77,14 @@ KIND_FSR = "fsr"
 # 자동 등록 상한 — /jy01 은 인증이 없어서, 장난성 요청으로 기기 목록이
 # 무한히 불어나지 않도록 막아둔다. 실제로 늘릴 일이 있으면 이 값을 올리면 된다.
 _FSR_AUTO_REGISTER_LIMIT = 20
+
+# Garmin 워치. 계정 하나가 기기 하나다 (SN = garmin-<계정>).
+KIND_GARMIN = "garmin"
+_GARMIN_AUTO_REGISTER_LIMIT = 20
+# 마지막 '동기화' 이후 이만큼 지나면 끊김으로 본다.
+# ⚠️ 다른 기기의 30분 기준을 쓰면 안 된다 — 워치는 폰을 거쳐 클라우드로 올라오므로
+#    수십 분~수 시간 지연이 정상이다. 이관받은 garmin 대시보드도 24h/72h 를 쓴다.
+GARMIN_SYNC_STALE_SEC = 24 * 3600
 
 # 대상자 그룹 — 여기 리스트에만 추가하면 기기 정보·이전 폼의 선택지와 검증에 자동 반영된다.
 GROUPS = ["일반", "뇌성마비", "척수손상", "근육병", "발달장애"]
@@ -501,6 +510,14 @@ def add_to_storage(storage, sn, ts, dtype, extra):
             # 사용감지 센서는 생체신호를 아예 측정하지 않는다. 사용 여부와 배터리가
             # 전부라 HR/RR/ACT 칸을 만들지 않는다 (만들면 CSV 에 빈 컬럼만 남는다).
             default_fields = {"상태설명": ""}
+        elif dtype == "Garmin":
+            # 워치 심박 시계열(2분 간격). 호흡·산소포화도는 일별 값이라 여기 없다.
+            default_fields = {"심박수(HR)": None, "상태설명": ""}
+        elif dtype == "Garmin일별":
+            # 하루 한 줄짜리 요약. 어떤 지표가 오는지는 계정·기기마다 달라서
+            # (휠체어 사용자는 걸음 대신 밀기, SpO2 없는 계정도 있다) 고정 칸을 만들지 않고
+            # 값이 온 컬럼만 extra 로 채운다.
+            default_fields = {"상태설명": ""}
         else:
             default_fields = {
                 "심박수(HR)": None, "호흡수(RR)": None, "활동량(ACT)": None,
@@ -692,6 +709,133 @@ def _store_fsr_record(storage, fsr):
     }
 
 
+def _ensure_garmin_device(sn, account=None):
+    """새 Garmin 계정의 데이터가 들어오면 배정을 하나 만들어준다.
+
+    FSR 과 같은 이유 — 이게 없으면 데이터는 쌓이는데 화면에는 안 보인다.
+    계정을 추가할 때 서버 코드를 고치지 않아도 되게 하는 장치이고,
+    이름(예: 'A시설1 사용자-A님')은 /devices 화면에서 붙이면 된다."""
+    if sn in DEVICE_INFO:
+        return
+    if sn in _RETIRED_SNS:
+        return
+    if not re.fullmatch(r"garmin-[A-Za-z0-9][A-Za-z0-9_.-]{1,48}", sn):
+        return
+    auto_count = sum(1 for a in ASSIGNMENTS if a.get("auto") == "garmin")
+    if auto_count >= _GARMIN_AUTO_REGISTER_LIMIT:
+        print(f"[analyzer] Garmin 자동 등록 상한({_GARMIN_AUTO_REGISTER_LIMIT}) 도달 — {sn} 건너뜀", flush=True)
+        return
+    ASSIGNMENTS.append({
+        "id": f"{sn}-1",
+        "sn": sn,
+        "user": f"Garmin {account or sn}",
+        "location": "-",
+        "group": DEFAULT_GROUP,
+        "start": None,
+        "end": None,
+        "kind": KIND_GARMIN,   # SN 모양으로 추측하지 않게 배정에 박아둔다
+        "auto": "garmin",
+    })
+    try:
+        _save_assignments()
+    except Exception as e:
+        print(f"[analyzer] Garmin 자동 등록 저장 실패({sn}): {e}", flush=True)
+    _rebuild_assign_index()
+    _rebuild_device_info()
+    print(f"[analyzer] Garmin 기기 자동 등록: {sn}", flush=True)
+
+
+def _kst_parts(ts):
+    """epoch → (날짜, 시간) KST 문자열. add_to_storage 와 같은 규칙으로 계산한다.
+    저장 전에 중복 여부를 판단하려면 저장될 키를 미리 알아야 한다."""
+    epoch = float(ts)
+    try:
+        dt = datetime.fromtimestamp(epoch, _UTC).astimezone(_KST)
+    except (ValueError, OverflowError, OSError):
+        dt = datetime.fromtimestamp(epoch / 1000, _UTC).astimezone(_KST)
+    return dt.strftime('%Y-%m-%d'), dt.strftime('%H:%M:%S')
+
+
+def _store_garmin_record(storage, g):
+    """정규화된 Garmin 1건을 공통 저장소와 연결상태에 반영.
+
+    ⚠️ 다른 센서에 없는 문제를 여기서 처리한다: Garmin 은 같은 날짜를 폴링할 때마다
+    그날 데이터를 통째로 다시 준다. 폴러가 증분만 보내도, 재시작·백필·과거 날짜
+    재조회 때는 중복이 들어온다. 그래서 저장 직전에 한 번 더 거른다."""
+    sn = g["sn"]
+
+    # 남의 기기 SN 을 덮어쓰지 않도록 방어 (FSR 과 같은 이유).
+    existing = DEVICE_INFO.get(sn)
+    if existing is not None and existing.get("kind") != KIND_GARMIN:
+        print(f"[analyzer] Garmin 기록 거부 — {sn} 은 이미 다른 종류의 기기로 등록됨", flush=True)
+        return
+
+    _ensure_garmin_device(sn, g.get("account"))
+
+    # ── 심박 시계열 (2분 간격) ──────────────────────────────────
+    # 이미 저장된 시각은 건너뛴다. 날짜별로 한 번만 집합을 만들어 쓴다
+    # (행마다 전체를 훑으면 재파싱 때 O(n²) 가 된다).
+    seen_by_date = {}
+    for ts, bpm in g.get("hr") or []:
+        date_key, time_str = _kst_parts(ts)
+        seen = seen_by_date.get(date_key)
+        if seen is None:
+            seen = {r.get("시간(KST)") for r in storage.get((sn, date_key), [])
+                    if r.get("유형") == "Garmin"}
+            seen_by_date[date_key] = seen
+        if time_str in seen:
+            continue
+        seen.add(time_str)
+        add_to_storage(storage, sn, ts, "Garmin", {
+            "심박수(HR)": bpm,
+            "상태설명": "Garmin 심박",
+        })
+
+    # ── 일별 요약 ───────────────────────────────────────────────
+    # 부분 동기화된 값(예: 오전 6시까지의 걸음 13)이 나중에 완전한 값으로 바뀐다.
+    # 그러므로 같은 날짜의 기존 요약 행은 지우고 최신 것으로 갈아끼운다.
+    daily, daily_ts = g.get("daily"), g.get("daily_ts")
+    if daily and daily_ts:
+        date_key, _ = _kst_parts(daily_ts)
+        rows = storage.get((sn, date_key))
+        if rows:
+            storage[(sn, date_key)] = [r for r in rows if r.get("유형") != "Garmin일별"]
+        extra = dict(daily)
+        extra["상태설명"] = "Garmin 일별요약"
+        add_to_storage(storage, sn, daily_ts, "Garmin일별", extra)
+
+    # ── 연결 상태 ───────────────────────────────────────────────
+    prev = _device_status.get(sn) or {}
+    now_ts = datetime.now(_KST).timestamp()
+
+    # '마지막 동기화 시각'이 이 기기의 통신 시각이다. 폴링한 시각이 아니다 —
+    # 폴링 시각을 쓰면 워치가 꺼져 있어도 매번 '방금 통신함'으로 보인다.
+    candidates = [c for c in (g.get("last_sync_ts"),
+                              (g["hr"][-1][0] if g.get("hr") else None),
+                              prev.get("last_seen_ts")) if c]
+    last_seen = max(candidates) if candidates else now_ts
+
+    auth_error = g.get("auth_error")
+    if auth_error:
+        # 인증 실패는 '워치를 안 찼다'와 완전히 다른 문제다. 사람이 개입해야 하는
+        # 유일한 경우라 따로 표시해서 화면·알림이 구분할 수 있게 한다.
+        connected = False
+    else:
+        connected = (now_ts - last_seen) <= GARMIN_SYNC_STALE_SEC
+
+    _device_status[sn] = {
+        "connected": connected,
+        "status_code": None,
+        "last_seen_ts": int(last_seen),
+        "status_since_ts": int(last_seen),
+        "server_received_at": g.get("server_received_at"),
+        "source": "garmin",
+        "account": g.get("account"),
+        "auth_error": auth_error,
+        "polled_at_ts": int(now_ts),   # 서버가 마지막으로 조회를 시도한 시각
+    }
+
+
 def _process_line(line, storage):
     if not line:
         return
@@ -716,6 +860,13 @@ def _process_line(line, storage):
                 "status_since_ts": item.get("statussince"),
                 "server_received_at": received_at,
             }
+        return
+
+    # Garmin 은 폴러가 data_source='garmin' 태그를 찍어 보내므로 순서와 무관하게
+    # 확실히 갈린다. 가장 싼 판별이라 앞에 둔다.
+    garmin = parse_garmin_payload(row)
+    if garmin is not None:
+        _store_garmin_record(storage, garmin)
         return
 
     # AI Radar 데이터는 Emfit과 필드 이름이 완전히 다르므로 별도 해석기로 분리한다.
