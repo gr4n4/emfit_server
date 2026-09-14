@@ -17,7 +17,7 @@ from nrcarec_alert import send_alert, should_send
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.20.0"
+VERSION = "3.21.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -392,7 +392,15 @@ _DEFAULT_DISCORD_CONFIG = {
     "device_overrides": {},     # {sn: 임계값(분)}
     "channels": {},             # {채널이름: Webhook URL}  — 시설별 채널 등록
     "device_channels": {},      # {sn: 채널이름}  — 없으면 기본 채널(webhook_url)로 감
+    # 배터리 알림 — 끊김과 성격이 다르다. 끊김은 '이미 벌어진 일'이지만 배터리는
+    # 미리 알아야 교체할 수 있는 값이라, 바닥나기 전에 알리는 게 목적이다.
+    "battery_alert_enabled": True,
+    "battery_threshold_pct": 20,
 }
+# 교체·충전 후 기준을 살짝 넘나들며 알림이 반복되지 않도록, 복구는 기준보다
+# 이만큼 더 올라와야 인정한다 (사용 중에는 전압이 눌려 값이 오르내린다).
+DISCORD_BATTERY_RECOVER_MARGIN = 5
+DISCORD_BATTERY_STATE_FILE = "discord_battery_state.json"
 _discord_config_lock = threading.Lock()
 
 
@@ -419,6 +427,37 @@ def _save_discord_alerted():
 
 # {sn: True}  끊김 알림을 이미 보낸 기기. 복구되면 지워서 다음에 또 끊기면 다시 보낸다.
 _discord_alerted = _load_discord_alerted()
+
+
+def _load_discord_batt_alerted():
+    """배터리 부족 알림을 이미 보낸 기기. 끊김 상태와 파일을 나눠둔다 —
+    한쪽 파일이 깨져도 다른 쪽 알림은 계속 제 기능을 하게."""
+    if not os.path.exists(DISCORD_BATTERY_STATE_FILE):
+        return {}
+    try:
+        with open(DISCORD_BATTERY_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return {sn: True for sn, v in data.items() if v}
+    except Exception:
+        return {}
+
+
+def _save_discord_batt_alerted():
+    try:
+        with open(DISCORD_BATTERY_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_discord_batt_alerted, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[discord] 배터리 알림 상태 저장 실패: {e}", flush=True)
+
+
+_discord_batt_alerted = _load_discord_batt_alerted()
+
+
+def _discord_battery_threshold(cfg):
+    try:
+        return max(1, min(99, int(cfg.get("battery_threshold_pct") or 20)))
+    except (TypeError, ValueError):
+        return 20
 
 
 def _load_discord_config():
@@ -544,10 +583,17 @@ def _discord_device_snapshot(cfg):
         else:
             connected = None
 
+        # 배터리 — 범위 밖(-1 등)은 '측정 불가'라는 뜻이지 방전이 아니다.
+        # 배터리 회로가 없는 보드가 -1 을 보내는데, 그걸 0% 로 읽으면 멀쩡한 센서가
+        # 매번 배터리 부족 알림을 만든다.
+        raw_batt = ds.get("battery_pct") if isinstance(ds, dict) else None
+        battery_pct = int(raw_batt) if isinstance(raw_batt, (int, float)) and 0 <= raw_batt <= 100 else None
+
         out.append({
             "sn": sn, "name": name, "location": location,
             "connected": connected, "age_sec": age_sec, "last_seen_text": last_seen_text,
             "threshold_minutes": threshold_minutes, "reason": reason,
+            "battery_pct": battery_pct,
             "kind": kind, "kind_label": _DISCORD_KIND_LABELS.get(kind, kind),
             "channel": (cfg.get("device_channels") or {}).get(sn) or None,
         })
@@ -570,13 +616,54 @@ def _discord_webhook_for(cfg, sn):
 _discord_pending = {}
 
 
+def _discord_battery_check(cfg, devices):
+    """배터리가 기준 이하로 떨어진 기기를 알린다.
+
+    끊김 알림과 달리 '확인 대기(디바운스)'를 두지 않는다. 끊김은 잠깐 지연됐다가
+    복구되는 일이 흔해서 지켜볼 이유가 있지만, 배터리 잔량은 순간적으로 튀었다가
+    돌아오는 값이 아니다. 대신 기준선을 오르내리며 알림이 반복되지 않도록
+    복구 쪽에만 여유(DISCORD_BATTERY_RECOVER_MARGIN)를 준다."""
+    if not cfg.get("battery_alert_enabled", True):
+        return
+    thr = _discord_battery_threshold(cfg)
+
+    for d in devices:
+        pct = d.get("battery_pct")
+        if pct is None:          # 배터리를 보고하지 않는 기기는 대상이 아니다
+            continue
+        sn = d["sn"]
+        webhook_url = _discord_webhook_for(cfg, sn)
+        if not webhook_url:
+            continue
+        was_alerted = _discord_batt_alerted.get(sn, False)
+        label = f"({d['kind_label']}) {d['name']} ({d['location']})" if d["location"] else f"({d['kind_label']}) {d['name']}"
+
+        if pct <= thr and not was_alerted:
+            if _send_discord_message(
+                webhook_url,
+                f"🪫 **배터리 부족** — {label}\n남은 배터리: **{pct}%** (기준 {thr}%)\n→ 배터리 교체가 필요합니다",
+            ):
+                _discord_batt_alerted[sn] = True
+                _save_discord_batt_alerted()
+        elif was_alerted and pct >= thr + DISCORD_BATTERY_RECOVER_MARGIN:
+            if _send_discord_message(
+                webhook_url,
+                f"🔋 **배터리 회복** — {label}\n남은 배터리: {pct}%",
+            ):
+                _discord_batt_alerted.pop(sn, None)
+                _save_discord_batt_alerted()
+
+
 def _discord_check_once():
     cfg = _load_discord_config()
     if not cfg.get("enabled"):
         return
     now_ts = datetime.now(timezone.utc).timestamp()
 
-    for d in _discord_device_snapshot(cfg):
+    devices = _discord_device_snapshot(cfg)
+    _discord_battery_check(cfg, devices)
+
+    for d in devices:
         if d["connected"] is None:
             continue  # 한 번도 통신한 적 없는 기기 — 판단 근거가 없으니 건너뜀
         sn = d["sn"]
@@ -4815,6 +4902,8 @@ def _discord_settings_page_html(cfg, banner=""):
     webhook_val = html.escape(str(cfg.get("webhook_url") or ""))
     threshold_val = int(cfg.get("threshold_minutes") or 30)
     checked = "checked" if cfg.get("enabled") else ""
+    battery_val = _discord_battery_threshold(cfg)
+    batt_checked = "checked" if cfg.get("battery_alert_enabled", True) else ""
 
     return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
 <title>디스코드 알림 설정 · 돌봄기기 통합 대시보드</title>
@@ -4854,9 +4943,21 @@ table {{ width:100%; border-collapse:collapse; font-size:0.9em; }}
             기기가 직접 끊김 상태를 보낸 뒤, 이 시간 동안 계속 끊김이면 알림을 보냅니다.
             나중에 언제든 이 화면에서 바꿀 수 있습니다.</div>
 
+        <label>배터리 부족 기준 (%)</label>
+        <input type="number" name="battery_threshold_pct" min="1" max="99" value="{battery_val}" required>
+        <div class="hint">배터리를 보고하는 기기(사용감지 센서)가 이 값 <b>이하</b>로 떨어지면 알림을 보냅니다.
+            교체·충전해서 <b>기준 + {DISCORD_BATTERY_RECOVER_MARGIN}%</b> 이상으로 올라오면 회복 알림이 가고,
+            그다음부터 다시 알림을 받을 수 있는 상태가 됩니다.
+            <br>디스코드에서 <code>/배터리</code> 명령으로 언제든 전체 잔량을 확인할 수 있습니다.</div>
+
         <div class="row">
             <input type="checkbox" id="enabled" name="enabled" {checked} style="width:auto;">
             <label for="enabled" style="margin:0;">알림 켜기</label>
+        </div>
+
+        <div class="row">
+            <input type="checkbox" id="batt_enabled" name="battery_alert_enabled" {batt_checked} style="width:auto;">
+            <label for="batt_enabled" style="margin:0;">배터리 알림 켜기</label>
         </div>
 
         <div class="row">
@@ -4948,10 +5049,16 @@ async def admin_discord_save(request: Request, _: str = Depends(require_admin)):
         threshold_minutes = max(1, int(form.get("threshold_minutes") or 30))
     except ValueError:
         threshold_minutes = 30
+    try:
+        battery_pct = max(1, min(99, int(form.get("battery_threshold_pct") or 20)))
+    except ValueError:
+        battery_pct = 20
     cfg = _load_discord_config()  # 기존 device_overrides 를 이 폼이 덮어쓰지 않도록 유지
     cfg["webhook_url"] = webhook_url
     cfg["threshold_minutes"] = threshold_minutes
     cfg["enabled"] = form.get("enabled") == "on"
+    cfg["battery_threshold_pct"] = battery_pct
+    cfg["battery_alert_enabled"] = form.get("battery_alert_enabled") == "on"
     _save_discord_config(cfg)
     return RedirectResponse("/admin/discord?saved=1", status_code=303)
 
@@ -5048,6 +5155,9 @@ def internal_discord_status(request: Request):
     devices = _discord_device_snapshot(cfg)
     return JSONResponse({
         "threshold_minutes": cfg.get("threshold_minutes"),
+        # 봇의 /배터리 명령이 '기준 이하'를 표시하는 데 쓴다.
+        "battery_threshold_pct": _discord_battery_threshold(cfg),
+        "battery_alert_enabled": bool(cfg.get("battery_alert_enabled", True)),
         "total": len(devices),
         "connected": sum(1 for d in devices if d["connected"] is True),
         "disconnected": sum(1 for d in devices if d["connected"] is False),
