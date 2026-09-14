@@ -745,6 +745,52 @@ def _ensure_garmin_device(sn, account=None):
     print(f"[analyzer] Garmin 기기 자동 등록: {sn}", flush=True)
 
 
+# 카드가 보여주는 핵심 지표들. 몇 개나 채워졌는지로 '쓸 만한 요약'인지 판단한다.
+_GARMIN_DAILY_KEYS = ("안정시심박", "총수면(분)", "수면점수", "걸음수", "밀기", "좌식(분)")
+# 아무리 알찬 옛 요약이라도 이만큼 지나면 최신 날짜에 자리를 내준다.
+_GARMIN_DAILY_MAX_STALE_DAYS = 7
+
+
+def _garmin_daily_score(daily):
+    """요약의 충실도. 자정 직후에는 '걸음 13' 하나만 든 껍데기가 오는데,
+    그걸 어제의 온전한 값과 같은 급으로 취급하면 매일 아침 카드가 텅 빈다."""
+    if not isinstance(daily, dict):
+        return 0
+    return sum(1 for k in _GARMIN_DAILY_KEYS if k in daily)
+
+
+def _garmin_days_between(a, b):
+    try:
+        da = datetime.strptime(a, "%Y-%m-%d")
+        db = datetime.strptime(b, "%Y-%m-%d")
+        return abs((da - db).days)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _garmin_pick_daily(prev_daily, prev_date, new_daily, new_date):
+    """카드에 쓸 요약 고르기 — '내용이 충실한, 가능한 한 최근 날짜'.
+
+    이관받은 garmin 대시보드도 같은 접근이다(find_recent_data_date — 최근 8일 중
+    데이터가 있는 첫 날짜를 보여준다). 워치는 동기화가 하루 이상 밀리는 일이 흔해서
+    '오늘 것'을 고집하면 정작 볼 것이 없다."""
+    if not new_daily:
+        return prev_daily, prev_date
+    if not prev_daily:
+        return new_daily, new_date
+
+    # 옛 데이터를 너무 오래 붙잡고 있지 않는다 — 워치가 죽은 채로 지난주 값을
+    # 계속 보여주면 상태(🔴 미동기화)와 숫자가 따로 논다.
+    if _garmin_days_between(new_date, prev_date) > _GARMIN_DAILY_MAX_STALE_DAYS:
+        return new_daily, new_date
+
+    new_score, prev_score = _garmin_daily_score(new_daily), _garmin_daily_score(prev_daily)
+    if new_score != prev_score:
+        return (new_daily, new_date) if new_score > prev_score else (prev_daily, prev_date)
+    # 충실도가 같으면 최신 날짜.
+    return (new_daily, new_date) if (new_date or "") >= (prev_date or "") else (prev_daily, prev_date)
+
+
 def _kst_parts(ts):
     """epoch → (날짜, 시간) KST 문자열. add_to_storage 와 같은 규칙으로 계산한다.
     저장 전에 중복 여부를 판단하려면 저장될 키를 미리 알아야 한다."""
@@ -823,6 +869,9 @@ def _store_garmin_record(storage, g):
     else:
         connected = (now_ts - last_seen) <= GARMIN_SYNC_STALE_SEC
 
+    picked_daily, picked_date = _garmin_pick_daily(
+        prev.get("daily"), prev.get("daily_date"), daily, g.get("date"))
+
     _device_status[sn] = {
         "connected": connected,
         "status_code": None,
@@ -833,6 +882,12 @@ def _store_garmin_record(storage, g):
         "account": g.get("account"),
         "auth_error": auth_error,
         "polled_at_ts": int(now_ts),   # 서버가 마지막으로 조회를 시도한 시각
+        # 카드가 쓸 일별 요약을 여기에도 실어둔다.
+        # get_latest_states() 는 기기당 '가장 최근 한 줄'만 주는데, 요약이 안 바뀐
+        # 주기에는 심박 행이 최신이라 카드에 안정시심박·걸음·수면이 비어버린다.
+        # 상태 캐시에 들고 있으면 어느 행이 최신이든 카드가 같은 값을 본다.
+        "daily": picked_daily,
+        "daily_date": picked_date,
     }
 
 

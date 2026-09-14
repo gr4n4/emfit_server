@@ -78,6 +78,9 @@ DEVICE_BLOCKS = {
     "radar":  ["postures", "hr", "rr", "posture"],
     "mckare": ["presence", "hr", "rr", "temp"],
     "fsr":    ["usage", "daily"],
+    # 워치는 2분 간격 심박과 일별 수면 요약을 준다. 호흡·활동량은 일별 값이라
+    # 시계열 그래프로 그릴 것이 없어 블록을 만들지 않는다.
+    "garmin": ["summary", "hr"],
 }
 # 블록 순서 환경설정에서 허용하는 전체 블록 목록 (viewer 단위라 기기 종류와 무관하게 저장됨).
 # 화면에 없는 블록 id 는 프런트에서 그냥 무시되므로 한 목록으로 관리해도 안전하다.
@@ -459,7 +462,8 @@ def _discord_threshold_minutes(cfg, sn):
 
 # 기기 종류 표시 이름 — 대시보드(_V2_SECTIONS)와 같은 문구를 재사용해서 알림 메시지에 붙인다.
 # 병동처럼 여러 기기가 있고 사용자명이 겹치는 곳에서, 어느 종류 기기인지 메시지만 보고 구분하기 위함.
-_DISCORD_KIND_LABELS = {"emfit": "EMFIT QS", "radar": "AI Radar", "mckare": "McKare", "fsr": "돌봄기기 사용 감지"}
+_DISCORD_KIND_LABELS = {"emfit": "EMFIT QS", "radar": "AI Radar", "mckare": "McKare",
+                        "fsr": "돌봄기기 사용 감지", "garmin": "Garmin 워치"}
 
 
 def _nrcarec_patient_context(sn):
@@ -764,6 +768,158 @@ def _is_radar_device(sn, state=None, ds=None):
     return len(compact) == 12 and all(c in "0123456789ABCDEF" for c in compact)
 
 
+def _is_garmin_device(sn, state=None, ds=None):
+    """Garmin 워치 판별. ⚠️ _is_radar_device 보다 먼저 확인해야 한다.
+
+    SN 을 'garmin-<계정>' 으로 만들어 12자리 16진수와 겹치지 않게 해뒀지만,
+    판정은 등록 정보의 kind 를 먼저 본다 — 데이터가 아직 안 들어온 계정도
+    올바른 섹션에 뜨게 하기 위함이다 (FSR 과 같은 이유)."""
+    if (analyzer.DEVICE_INFO.get(sn) or {}).get("kind") == analyzer.KIND_GARMIN:
+        return True
+    if isinstance(state, dict) and state.get("유형") in ("Garmin", "Garmin일별"):
+        return True
+    if isinstance(ds, dict) and ds.get("source") == "garmin":
+        return True
+    return str(sn or "").startswith("garmin-")
+
+
+# ── Garmin 워치 상태 판정 기준 ───────────────────────────────────────
+# 워치는 폰을 거쳐 Garmin 클라우드로 올라온다. 서버가 보는 것은 '마지막 동기화 시각'
+# 하나뿐이고, 수십 분~수 시간 지연이 **정상**이다. 다른 기기의 10분·30분 기준을
+# 그대로 쓰면 멀쩡한 워치가 전부 끊김으로 뜬다.
+# 24h/72h 기준은 이관받은 garmin 대시보드가 쓰던 값을 그대로 따른다.
+GARMIN_SYNC_OK_SEC = 24 * 3600
+GARMIN_SYNC_LATE_SEC = 72 * 3600
+
+
+def _garmin_status(ds, now_ts):
+    """(라벨, 아이콘, 배경, 테두리, 글자색, 사유) — 사유는 손봐야 할 때만 채운다."""
+    if not isinstance(ds, dict):
+        return "수신 기록 없음", "❓", "#f5f7f9", "#cfd8dc", "#78909c", ""
+
+    # 인증 실패는 '워치를 안 찼다'와 전혀 다른 문제다. 사람이 개입해야 하는
+    # 유일한 경우라 다른 상태와 절대 섞지 않는다.
+    if ds.get("auth_error"):
+        return ("토큰 갱신 필요", "🔧", "#ffcdd2", "#e57373", "#b71c1c",
+                "Garmin 재로그인 필요")
+
+    last_seen = ds.get("last_seen_ts")
+    if not isinstance(last_seen, (int, float)):
+        return "동기화 기록 없음", "❓", "#f5f7f9", "#cfd8dc", "#78909c", ""
+
+    age = max(0, now_ts - last_seen)
+    if age <= GARMIN_SYNC_OK_SEC:
+        return "동기화 정상", "🟢", "#e8f5e9", "#66bb6a", "#1b5e20", ""
+    if age <= GARMIN_SYNC_LATE_SEC:
+        return ("동기화 지연", "🟡", "#fff8e1", "#ffca28", "#e65100",
+                "폰 앱에서 동기화 확인")
+    return ("미동기화", "🔴", "#ffcdd2", "#e57373", "#b71c1c",
+            "워치 착용·충전 확인")
+
+
+def _garmin_activity_cell(daily):
+    """가운데 칸 — 걸음 / 밀기 / 좌식 중 그 사람에게 맞는 것 하나.
+
+    걸음(totalSteps)과 밀기(totalPushes)는 상호 배타다. 휠체어를 쓰면 걸음이
+    아예 안 잡히고 밀기로 집계된다(2026-09-14 실측). 걸음 칸을 고정으로 두면
+    돌봄받는 분 카드는 늘 '0' 이 되어 아무것도 말해주지 않는다."""
+    d = daily if isinstance(daily, dict) else {}
+    steps, pushes = d.get("걸음수"), d.get("밀기")
+    if isinstance(steps, (int, float)):
+        return "🚶 걸음", f"{int(steps):,}"
+    if isinstance(pushes, (int, float)):
+        return "🦽 밀기", f"{int(pushes):,}"
+    sedentary = d.get("좌식(분)")
+    if isinstance(sedentary, (int, float)):
+        return "🛋 좌식", f"{sedentary / 60:.1f}h"
+    return "🚶 활동", "-"
+
+
+def _render_garmin_card(sn, info, state, ds, now, link_suffix=""):
+    """Garmin 워치 카드 — 안정시 심박 · 활동 · 수면 + 마지막 동기화.
+
+    HR/RR/ACT 3칸 형식을 쓰지 않는다. 워치가 주는 값 중 돌봄 맥락에서 의미 있는 것은
+    안정시 심박·활동량·수면이고, 실시간 호흡·활동량은 워치가 재지 않거나 일별 값이다."""
+    location_text = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
+    name = html.escape(str(info['name']))
+    now_ts = now.timestamp()
+
+    label, icon, bg, border, fg, reason = _garmin_status(ds, now_ts)
+    daily = (ds or {}).get("daily") if isinstance(ds, dict) else None
+    daily = daily if isinstance(daily, dict) else {}
+
+    resting = daily.get("안정시심박")
+    resting_txt = f"{int(resting)}" if isinstance(resting, (int, float)) else "-"
+    act_label, act_value = _garmin_activity_cell(daily)
+    sleep_min = daily.get("총수면(분)")
+    sleep_txt = f"{sleep_min / 60:.1f}h" if isinstance(sleep_min, (int, float)) else "-"
+
+    last_seen = (ds or {}).get("last_seen_ts") if isinstance(ds, dict) else None
+    sync_txt = (_format_ago(max(0, int(now_ts - last_seen)))
+                if isinstance(last_seen, (int, float)) else "기록 없음")
+
+    # 어느 날짜의 값인지 — 워치는 지연이 커서 '어제 것'을 보고 있을 때가 잦다.
+    daily_date = (ds or {}).get("daily_date") if isinstance(ds, dict) else None
+    date_txt = f" ({daily_date[5:]})" if isinstance(daily_date, str) and len(daily_date) >= 10 else ""
+
+    reason_html = (
+        f'<div style="text-align:center; margin-top:4px; font-size:0.82em; '
+        f'font-weight:bold; color:{fg};">→ {html.escape(reason)}</div>'
+        if reason else ""
+    )
+
+    score = daily.get("수면점수")
+    sub_bits = []
+    if isinstance(score, (int, float)):
+        sub_bits.append(f"수면점수 {int(score)}")
+    rr = daily.get("호흡수(RR)")
+    if isinstance(rr, (int, float)):
+        sub_bits.append(f"호흡 {rr:g}")
+    spo2 = daily.get("산소포화도")
+    if isinstance(spo2, (int, float)):
+        sub_bits.append(f"SpO₂ {spo2:g}%")
+    sub_html = (f'<div style="text-align:center; margin-top:6px; font-size:0.78em; '
+                f'color:#546e7a;">{html.escape(" · ".join(sub_bits))}</div>'
+                if sub_bits else "")
+
+    return f"""
+    <a href="/device/{sn}{link_suffix}" style="display:block; text-decoration:none; color:inherit;">
+    <div style="background:{bg}; padding:16px; border-radius:14px; border:2px solid {border}; transition:transform 0.1s;" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+            <div>
+                <div style="font-size:0.85em; color:#455a64;">{location_text}</div>
+                <div style="font-size:1.3em; font-weight:bold; color:#1a237e;">{name}<span style="display:inline-block; margin-left:6px; padding:2px 7px; border-radius:10px; background:#ef6c00; color:white; font-size:0.55em; vertical-align:middle;">Garmin</span></div>
+            </div>
+            <div style="font-size:1.8em;">{icon}</div>
+        </div>
+        <div style="display:flex; justify-content:space-between; margin-top:14px; padding:14px 4px; background:rgba(255,255,255,0.85); border-radius:10px;">
+            <div style="text-align:center; flex:1;">
+                <div style="font-size:0.7em; color:#c0392b; font-weight:bold;">❤️ 안정</div>
+                <div style="font-weight:bold; font-size:2em; color:#212121; line-height:1.1;">{resting_txt}</div>
+            </div>
+            <div style="text-align:center; flex:1; border-left:1px solid #ddd; border-right:1px solid #ddd;">
+                <div style="font-size:0.7em; color:#e67e22; font-weight:bold;">{act_label}</div>
+                <div style="font-weight:bold; font-size:1.6em; color:#212121; line-height:1.35;">{act_value}</div>
+            </div>
+            <div style="text-align:center; flex:1;">
+                <div style="font-size:0.7em; color:#5e35b1; font-weight:bold;">😴 수면</div>
+                <div style="font-weight:bold; font-size:2em; color:#212121; line-height:1.1;">{sleep_txt}</div>
+            </div>
+        </div>
+        <div style="text-align:center; margin-top:12px; font-size:1.05em; font-weight:bold; color:{fg};">
+            {icon} {label}
+        </div>
+        {reason_html}
+        {sub_html}
+        <div style="text-align:center; margin-top:6px; font-size:0.8em; color:#455a64;">
+            동기화: {sync_txt}{date_txt}
+        </div>
+        <div style="text-align:center; margin-top:6px; color:#90a4ae; font-size:0.65em;">{sn}</div>
+    </div>
+    </a>
+    """
+
+
 # ── 사용감지 센서 상태 판정 기준 ─────────────────────────────────────
 # 원칙: '센서 확인 필요'는 **근거가 있을 때만** 띄운다.
 #
@@ -939,6 +1095,11 @@ def _card_sort_key(sn, state, ds, now):
     사용감지 센서는 생체값이 없어 아래 ACT 기준이 통하지 않으므로 따로 판정한다.
     순서: 센서 확인 필요 → 사용 중 → 미사용 → 판정 대기
     (대시보드 전체 원칙과 같다 — 손봐야 할 것이 위로, 조용한 것이 아래로)"""
+    if _is_garmin_device(sn, state, ds):
+        # 토큰 문제가 가장 위 — 사람이 손대야만 풀린다. 그다음 미동기화·지연 순.
+        label = _garmin_status(ds, now.timestamp())[0]
+        return ({"토큰 갱신 필요": -2, "미동기화": 0, "동기화 지연": 1,
+                 "동기화 정상": 4}.get(label, 2), sn)
     if _is_fsr_device(sn, state, ds):
         label = _fsr_status(state, ds, now.timestamp())[0] if state is not None else None
         return ({"센서 확인 필요": -1, "사용 중": 2, "미사용": 3}.get(label, 1), sn)
@@ -1230,6 +1391,8 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
     # _is_radar_device 가 레이더로 오인할 수 있어서 순서가 중요하다.
     def _kind(sn):
         state, ds = latest.get(sn), statuses.get(sn)
+        if _is_garmin_device(sn, state, ds):
+            return "garmin"
         if _is_fsr_device(sn, state, ds):
             return "fsr"
         return "radar" if _is_radar_device(sn, state, ds) else "emfit"
@@ -1237,9 +1400,11 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
     emfit_active = [sn for sn in active_sns if _kind(sn) == "emfit"]
     radar_active = [sn for sn in active_sns if _kind(sn) == "radar"]
     fsr_active = [sn for sn in active_sns if _kind(sn) == "fsr"]
+    garmin_active = [sn for sn in active_sns if _kind(sn) == "garmin"]
     emfit_inactive = [sn for sn in inactive_sns if _kind(sn) == "emfit"]
     radar_inactive = [sn for sn in inactive_sns if _kind(sn) == "radar"]
     fsr_inactive = [sn for sn in inactive_sns if _kind(sn) == "fsr"]
+    garmin_inactive = [sn for sn in inactive_sns if _kind(sn) == "garmin"]
 
     emfit_section = ""
     if sn_filter is None or emfit_active or emfit_inactive:
@@ -1263,10 +1428,22 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
             render=_render_fsr_card,
         )
 
+    garmin_section = ""
+    if garmin_active or garmin_inactive:
+        garmin_section = _render_device_section(
+            "Garmin 워치", "⌚",
+            # 지연이 정상이라는 사실을 화면에 적어둔다 — 안 적으면 '동기화: 3시간 전'을
+            # 보고 고장으로 오인해 문의가 들어온다.
+            "안정시 심박 · 활동 · 수면 — 폰을 거쳐 올라오므로 수 시간 지연이 정상입니다",
+            garmin_active, garmin_inactive, latest, statuses, now, link_suffix, "#ef6c00",
+            render=_render_garmin_card,
+        )
+
     total = len(visible_sns)
     emfit_count = len(emfit_active) + len(emfit_inactive)
     radar_count = len(radar_active) + len(radar_inactive)
     fsr_count = len(fsr_active) + len(fsr_inactive)
+    garmin_count = len(garmin_active) + len(garmin_inactive)
     summary_parts = [f'<b style="color:#2e7d32;">{connected_count}</b> / {total} 연결됨']
     if sn_filter is None or emfit_count:
         summary_parts.append(f'<span style="color:#546e7a;">EMFIT {emfit_count}대</span>')
@@ -1274,12 +1451,15 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
         summary_parts.append(f'<span style="color:#6a1b9a;">Radar {radar_count}대</span>')
     if fsr_count:
         summary_parts.append(f'<span style="color:#00695c;">사용감지 {fsr_count}대</span>')
+    if garmin_count:
+        summary_parts.append(f'<span style="color:#ef6c00;">워치 {garmin_count}대</span>')
     summary_html = ' · '.join(summary_parts)
 
     return {
         "emfit_section": emfit_section,
         "radar_section": radar_section,
         "fsr_section": fsr_section,
+        "garmin_section": garmin_section,
         "summary": summary_html,
         "now": now.strftime('%Y-%m-%d %H:%M:%S'),
     }
@@ -1355,8 +1535,69 @@ def _render_fsr_card_v2(sn, info, state, ds, now, link_suffix=""):
     </a>"""
 
 
+def _render_garmin_card_v2(sn, info, state, ds, now, link_suffix=""):
+    """신규 디자인 Garmin 카드 — 안정시 심박 · 활동 · 수면.
+    판정은 V1 과 같은 _garmin_status 를 쓴다 (두 화면이 어긋나지 않게)."""
+    loc = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
+    name = html.escape(str(info['name']))
+    now_ts = now.timestamp()
+
+    label, _icon, _bg, _bd, _fg, reason = _garmin_status(ds, now_ts)
+    tint = {"동기화 정상": "st-live", "동기화 지연": "st-absent",
+            "미동기화": "st-off", "토큰 갱신 필요": "st-danger"}.get(label, "st-absent")
+    tag_icon = {"토큰 갱신 필요": "i-alert", "미동기화": "i-clock"}.get(label, "i-pulse")
+    hero_color = {"동기화 정상": "#ef6c00", "동기화 지연": "#e2b52f",
+                  "미동기화": "#c23a52", "토큰 갱신 필요": "#c23a52"}.get(label, "#ef6c00")
+
+    last_seen = ds.get("last_seen_ts") if isinstance(ds, dict) else None
+    last_txt = (f"동기화 {_format_ago(max(0, int(now_ts - last_seen)))}"
+                if isinstance(last_seen, (int, float)) else "동기화 기록 없음")
+
+    daily = (ds or {}).get("daily") if isinstance(ds, dict) else None
+    daily = daily if isinstance(daily, dict) else {}
+    if not daily:
+        return f"""
+        <a href="/device/{sn}{link_suffix}" class="v2card st-inact">
+          <div class="v2-top"><div><div class="v2-loc">{loc}</div><div class="v2-who">{name}</div></div>
+            <span class="v2-tag"><svg><use href="#i-clock"/></svg>데이터 없음</span></div>
+          <div class="v2-empty">수신 기록 없음</div>
+          <div class="v2-foot"><span>{sn}</span><span class="conn off">{last_txt}</span></div>
+        </a>"""
+
+    def cell(css, icon, value, unit):
+        return (f'<div class="v2-vital {css}"><div class="vic"><svg class="pic"><use href="#{icon}"/></svg></div>'
+                f'<div class="vnum num">{value}</div><div class="vunit">{unit}</div></div>')
+
+    cells = ""
+    resting = daily.get("안정시심박")
+    if isinstance(resting, (int, float)):
+        cells += cell("v-hr", "i-heart", int(resting), "안정 HR")
+    act_label, act_value = _garmin_activity_cell(daily)
+    if act_value != "-":
+        cells += cell("v-act", "i-act", act_value, html.escape(act_label.split(" ", 1)[-1]))
+    sleep_min = daily.get("총수면(분)")
+    if isinstance(sleep_min, (int, float)):
+        cells += cell("v-rr", "i-bed", f"{sleep_min / 60:.1f}", "수면(h)")
+
+    score = daily.get("수면점수")
+    hero_sub = html.escape(reason) if reason else (
+        f"수면점수 {int(score)}" if isinstance(score, (int, float)) else "Garmin 워치")
+
+    return f"""
+    <a href="/device/{sn}{link_suffix}" class="v2card {tint}">
+      <div class="v2-top"><div><div class="v2-loc">{loc}</div><div class="v2-who">{name}</div></div>
+        <span class="v2-tag"><svg class="pic"><use href="#{tag_icon}"/></svg>{html.escape(label)}</span></div>
+      <div class="v2-hero"><div class="v2-big" style="background:{hero_color}"><svg class="pic"><use href="#i-pulse"/></svg></div>
+        <div><div class="v2-hlabel">{html.escape(label)}</div><div class="v2-hsub">{hero_sub}</div></div></div>
+      <div class="v2-vitals">{cells}</div>
+      <div class="v2-foot"><span>{last_txt}</span><span>{sn}</span></div>
+    </a>"""
+
+
 def _render_card_v2(sn, info, state, ds, now, link_suffix=""):
     """신규 디자인 카드 1개. 상태 판정은 기존 _render_card 와 동일 규칙."""
+    if _is_garmin_device(sn, state, ds):
+        return _render_garmin_card_v2(sn, info, state, ds, now, link_suffix)
     if _is_fsr_device(sn, state, ds):
         return _render_fsr_card_v2(sn, info, state, ds, now, link_suffix)
     is_radar = _is_radar_device(sn, state, ds)
@@ -1488,6 +1729,9 @@ def _render_inactive_card_v2(sn, info, ds, now, link_suffix=""):
 
 
 def _v2_kind(sn, state, ds):
+    # Garmin 을 먼저 — 다른 판정과 겹치지 않게 kind/접두사로 확실히 가른다.
+    if _is_garmin_device(sn, state, ds):
+        return "garmin"
     if isinstance(state, dict) and state.get("유형") == "McKare":
         return "mckare"
     if isinstance(ds, dict) and ds.get("source") == "mckare":
@@ -1505,6 +1749,7 @@ _V2_SECTIONS = [
     ("radar", "AI Radar", "침대 위 레이더 · 자세 · 낙상 감지", "#7c5cd6", "i-radar"),
     ("mckare", "McKare", "천장·벽 레이더 · 구간 재실 · 체온", "#1fa39c", "i-temp"),
     ("fsr", "돌봄기기 사용 감지", "압력 센서 · 사용 중/미사용 · 배터리 잔량", "#00897b", "i-act"),
+    ("garmin", "Garmin 워치", "안정시 심박 · 활동 · 수면 — 수 시간 지연이 정상", "#ef6c00", "i-pulse"),
 ]
 
 
@@ -1549,7 +1794,8 @@ def _build_cards_payload_v2(sn_filter=None, view_token=""):
             continue
         if not act_l and not inact_l:
             continue
-        render_fn = _render_fsr_card_v2 if key == "fsr" else _render_card_v2
+        render_fn = {"fsr": _render_fsr_card_v2,
+                     "garmin": _render_garmin_card_v2}.get(key, _render_card_v2)
         cards = "\n".join(
             render_fn(sn, analyzer.DEVICE_INFO[sn], latest.get(sn), statuses.get(sn), now, link_suffix)
             for sn in act_l) or '<p class="v2-none">활성 기기가 없습니다.</p>'
@@ -1793,6 +2039,9 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                 <div id="fsr-section">
                     {p['fsr_section']}
                 </div>
+                <div id="garmin-section">
+                    {p['garmin_section']}
+                </div>
 
                 <p class="nav-buttons" style="text-align:center; margin-top:30px;">
                     <a href="/reports" style="display:inline-block; padding:10px 20px; background:#1a73e8; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">📊 리포트 다운로드</a>
@@ -1823,6 +2072,7 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                         document.getElementById('emfit-section').innerHTML = d.emfit_section;
                         document.getElementById('radar-section').innerHTML = d.radar_section;
                         document.getElementById('fsr-section').innerHTML = d.fsr_section;
+                        document.getElementById('garmin-section').innerHTML = d.garmin_section;
                         document.getElementById('header-summary').innerHTML = d.summary;
                         document.getElementById('clock').textContent = d.now;
                     }} catch (e) {{}}
@@ -1902,6 +2152,9 @@ def view_group_dashboard(request: Request):
                 <div id="fsr-section">
                     {p['fsr_section']}
                 </div>
+                <div id="garmin-section">
+                    {p['garmin_section']}
+                </div>
 
                 <p class="nav-buttons" style="text-align:center; margin-top:30px;">
                     <a href="/help" style="display:inline-block; padding:10px 20px; background:#27ae60; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">📘 사용 가이드</a>
@@ -1924,6 +2177,7 @@ def view_group_dashboard(request: Request):
                         document.getElementById('emfit-section').innerHTML = d.emfit_section;
                         document.getElementById('radar-section').innerHTML = d.radar_section;
                         document.getElementById('fsr-section').innerHTML = d.fsr_section;
+                        document.getElementById('garmin-section').innerHTML = d.garmin_section;
                         document.getElementById('header-summary').innerHTML = d.summary;
                         document.getElementById('clock').textContent = d.now;
                     }} catch (e) {{}}
@@ -2291,7 +2545,10 @@ def api_device_timeseries(
                     continue
                 epoch = int(full_dt.timestamp())
 
-                if rtype == "Summary":
+                # Garmin 일별요약도 같은 길로 보낸다 — 수면 컬럼 이름을 Emfit 의
+                # '수면종료요약'과 똑같이 맞춰뒀기 때문에 그대로 재사용된다.
+                # (같은 사람의 침대 센서 수면과 워치 수면을 같은 화면에서 대조하려는 목적)
+                if rtype in ("Summary", "Garmin일별"):
                     s = {}
                     for k in ["수면점수", "총수면(분)", "얕은수면(분)", "REM수면(분)", "깊은수면(분)", "각성시간(분)"]:
                         if k in row.index:
@@ -4759,6 +5016,7 @@ def internal_discord_status(request: Request):
 _VIEW_KIND_TAG = {
     "emfit": ("EMFIT", "#e05575"), "radar": ("Radar", "#7c5cd6"),
     "mckare": ("McKare", "#1fa39c"), "fsr": ("사용감지", "#00897b"),
+    "garmin": ("Garmin", "#ef6c00"),
 }
 
 
