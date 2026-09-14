@@ -242,13 +242,31 @@ FSR의 `_ensure_fsr_device()` 패턴을 그대로 따른다:
   빈 `mfa_expiration_timestamp`). oauth1 수명은 Garmin 서버만 안다 — 파일로는 알 수 없다.
   라이브러리 README는 "약 1년"이라 적고 있고, 이 프로젝트 작업 시점(2026년 3~5월)으로 보면 2027년 3~5월경 추정.
 
-### ⏰ 실질적 데드라인: 2026-10-10
-| 시점 | 상황 |
-|---|---|
-| ~10월 10일 | 폴러를 **한 번이라도** 돌리면 refresh token으로 갱신되고, 갱신된 토큰이 또 30일 창을 연다 → 이후 계속 굴러감 |
-| 이후 | refresh 창이 닫힘. oauth1으로 새로 받아야 하고, oauth1까지 만료면 **대상자 폰으로 재로그인(2FA 포함)** 필요 |
+### ⚠️ 갱신은 oauth1 을 통해서만 일어난다 (garth 0.8.0 실제 구현 확인, 2026-09-14)
 
-→ **PoC를 10월 초 전에 한 번 돌리는 것으로 토큰 검증·갱신을 함께 해결한다.** 별도 테스트는 하지 않는다.
+```python
+# garth.Client.refresh_oauth2()
+assert self.oauth1_token, "OAuth1 token is required for OAuth2 refresh"
+self.oauth2_token = sso.exchange(self.oauth1_token, self)   # ← oauth1 으로 교환
+...
+if self._garth_home:
+    self.dump(self._garth_home, oauth2_only=True)           # ← 갱신본을 파일에 자동 저장
+```
+
+즉 **토큰 파일에 있는 30일짜리 `refresh_token` 은 garth 가 쓰지 않는다.** 갱신 경로는 oauth1 하나뿐이다.
+따라서:
+
+| | |
+|---|---|
+| oauth1 살아있음 | 실행할 때마다 oauth2 가 새로 발급되고 **파일이 자동으로 덮어써진다** → 계속 굴러감 |
+| oauth1 만료 | `GarthHTTPError` → **대상자 폰으로 재로그인(2FA 포함)** 필요. 우회로 없음 |
+
+- oauth2 access 토큰은 이미 만료 상태(09-11/09-12)이므로, **다음 조회는 반드시 oauth1 을 거친다.**
+  → **PoC 한 번이 곧 oauth1 생존 검증이다.** 파일만 봐서는 알 수 없고, 이 방법 외에 확인 수단이 없다.
+- 뒤집어 보면 9월 10~11일에 oauth2 가 발급된 기록은 **그날 oauth1 이 살아있었다는 직접 증거**다.
+  (그 발급 자체가 oauth1 교환의 결과이므로)
+- 갱신이 파일을 덮어쓰므로, **최초 실행 전에 토큰 폴더를 1회 백업**해 둔다. oauth1 은 재발급이 불가능한
+  유일한 자산이다.
 
 ### 운영 규칙
 1. **토큰 원본은 젯슨 한 곳.** `/home/operator/.garmin_example-account-*`, `chmod 600`, **`.gitignore` 에 먼저 추가**(비밀 정보).
@@ -302,3 +320,10 @@ FSR의 `_ensure_fsr_device()` 패턴을 그대로 따른다:
 4. **공식 API 전환** — 현재 라이브러리는 **비공식 Connect 접근**이다(공식 앱과 같은 OAuth를 흉내내는 방식).
    약관·차단 리스크와 계정별 토큰 관리 부담이 있다. 실증을 넘어 서비스화한다면 Garmin 공식
    Health/Wellness API(파트너 계약 + 웹훅 push) 검토가 필요하다 — 계약 조건은 미확인.
+   - ⚠️ **2026-09-14 확인: 인증을 담당하는 `garth` 가 deprecated 되었다** (import 시
+     `Garth is deprecated and no longer maintained` 경고 — https://github.com/matin/garth/discussions/222).
+     당장 동작은 하지만 Garmin 이 인증 방식을 바꾸면 고쳐줄 주체가 없다. 공식 API 검토의 근거가 하나 늘었다.
+
+5. **garth 버전** — `garminconnect` 0.2.38 은 `garth>=0.5.17,<0.6.0` 을 요구한다. 이 PC 에는 **0.8.0** 이
+   설치돼 있다(2026-09-14). 동작 여부는 미확인이므로, PoC 실패 시 원인을 토큰 문제와 혼동하지 않도록
+   **선언된 범위로 핀 고정**한 상태에서 먼저 돌린다: `pip install "garth>=0.5.17,<0.6.0"`
