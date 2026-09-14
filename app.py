@@ -4210,6 +4210,7 @@ def view_devices(request: Request, saved: int = 0, handover: int = 0, _: str = D
     _KIND_TAG = {
         "emfit":  ("EMFIT", "#e05575"), "radar": ("Radar", "#7c5cd6"),
         "mckare": ("McKare", "#1fa39c"), "fsr":   ("사용감지", "#00897b"),
+        "garmin": ("Garmin", "#ef6c00"),
     }
     kind_counts = {}
     entries = []
