@@ -1,9 +1,9 @@
-# 돌봄기기 통합 관제 서버
+# 돌봄기기 통합 모니터링 서버
 
 돌봄 대상자에게 설치된 **다섯 종류의 기기**에서 생체·재실·활동 데이터를 모아,
 실시간 관제 화면 · 날짜별 리포트 · 이상 알림을 제공하는 서버.
 
-A시설를 비롯한 실증 현장에서 24시간 가동 중이다 (Jetson Orin Nano, systemd).
+여러 실증 현장에서 24시간 가동할 수 있도록 구성돼 있다 (Jetson 계열 장비, systemd).
 
 ```
 [침대 매트] [레이더] [천장 레이더] [압력 센서] [손목 워치]
@@ -80,6 +80,15 @@ pip install "garminconnect==0.2.38" "garth>=0.5.17,<0.6.0"   # Garmin 수집기�
 
 uvicorn app:app --host 0.0.0.0 --port 8080
 ```
+
+운영 주소와 관리자 계정은 소스에 적지 않고 환경변수로 설정한다:
+
+```bash
+export EMFIT_EXTERNAL_BASE="https://monitoring.example.com"
+export EMFIT_ADMIN_USER="admin"
+```
+
+실제 호스트·계정·대상자·기기 식별자는 공개 문서나 코드 예시에 넣지 않는다.
 
 > `python app.py` 로 직접 띄우면 포트 80을 쓴다. 운영은 systemd 가 uvicorn 8080 으로 띄운다.
 > 최초 기동 시 로그 전체를 파싱하느라 30초~수 분이 걸리고, 그동안에도 **센서 수신은 계속된다.**

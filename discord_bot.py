@@ -5,7 +5,7 @@ app.py 가 이미 메모리에 들고 있는 상태를 /internal/discord/status(
 불러다 쓴다 — 봇 하나 띄우자고 500MB+ 로그 파일을 또 파싱하지 않기 위함.
 
 /admin/discord 에 등록해둔 시설별 채널(예: A시설, B시설) 이름으로
-/A시설 같은 명령어도 봇 시작 시 자동으로 만들어진다 — 그 시설 기기만 걸러서 보여줌.
+/a시설 같은 명령어도 봇 시작 시 자동으로 만들어진다 — 그 시설 기기만 걸러서 보여줌.
 새 시설을 추가했으면 봇을 한 번 재시작해야 명령어가 새로 생긴다.
 
 실행: venv/bin/python discord_bot.py  (systemd 서비스로 상시 실행 권장)
@@ -195,7 +195,7 @@ def _make_channel_command(cmd_name, channel_name):
 
 
 async def _register_facility_commands(retries=20, delay_sec=3):
-    """/admin/discord 에 등록된 시설(채널) 목록으로 /A시설 같은 명령어를 동적으로 만든다.
+    """/admin/discord 에 등록된 시설(채널) 목록으로 /a시설 같은 명령어를 동적으로 만든다.
 
     봇과 대시보드(emfit.service)를 거의 동시에 재시작하면, 대시보드가 600MB+ 로그를
     파싱하는 동안 이 API가 아직 안 떠 있을 수 있다 — 그래서 바로 포기하지 않고 잠깐씩

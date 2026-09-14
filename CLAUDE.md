@@ -1,4 +1,4 @@
-# CLAUDE.md — Emfit 돌봄 모니터링 서버
+# CLAUDE.md — 돌봄기기 통합 모니터링 서버
 
 이 파일은 Claude Code 가 이 저장소에서 작업할 때 먼저 읽는 안내다.
 사람이 읽는 문서는 [MANUAL.md](MANUAL.md)(운영 매뉴얼), [CHANGELOG.md](CHANGELOG.md)(기술 변경 이력),
@@ -8,11 +8,11 @@
 
 ## 1. 무엇을 하는 코드인가
 
-침대·레이더·압력 센서가 HTTP POST 로 보내는 돌봄 대상자 생체·재실 데이터를 받아서
+침대 센서·레이더·압력 센서가 HTTP POST 로 보내고 웨어러블 수집기가 가져오는 돌봄 대상자 생체·재실·활동 데이터를 받아서
 append-only JSONL 로 쌓고, 실시간 관제 대시보드 · 일별 CSV 리포트 · 디스코드 알림을 제공하는
-FastAPI 서버. A시설 등에서 실증 운영 중이다.
+FastAPI 기반 통합 모니터링 서버다.
 
-기기 종류 4가지 — 각각 수신 경로와 로그 파일이 분리돼 있다:
+기기 종류 5가지 — 각각 수신 경로와 로그 파일이 분리돼 있다:
 
 | 종류 | 수신 경로 | 로그 파일 | 파서 |
 |---|---|---|---|
@@ -20,19 +20,20 @@ FastAPI 서버. A시설 등에서 실증 운영 중이다.
 | AI Radar (라닉스 RMR602A) | `POST /radar` | `radar_data.jsonl` | [radar_parser.py](radar_parser.py) |
 | McKare VSR22 / AI 110 | `POST /mckare`, `/mckare` 이미지 | `mckare_data.jsonl`, `mckare_images/` | [mckare_parser.py](mckare_parser.py) |
 | ESP32 압력 사용감지 (돌봄기기 부착) | `POST /jy01` | `fsr_data.jsonl` | [fsr_parser.py](fsr_parser.py) |
+| Garmin 워치 | 로컬 수집기가 `POST /garmin` | `garmin_data.jsonl` | [garmin_parser.py](garmin_parser.py) |
 
 **다루는 데이터는 환자 건강정보다.** 로그·리포트·토큰 파일을 커밋하거나 외부로 내보내지 않는다(§5-1).
 
 ---
 
-## 2. 실행과 배포 — 이 폴더는 "원본 보관소", 운영은 젯슨
+## 2. 실행과 배포 — 로컬 저장소와 운영 서버를 분리
 
 | | 위치 |
 |---|---|
-| 코드 원본 (윈도우, 이 저장소) | `C:\path\to\monitoring_server` |
-| 운영 서버 | Jetson Orin Nano `operator@jetson-host` : `/opt/monitoring_server/` |
+| 코드 원본 | 이 Git 저장소 (`<LOCAL_REPOSITORY_PATH>`) |
+| 운영 서버 | Jetson 계열 장비 `<JETSON_USER>@<JETSON_HOST>` : `<APP_DIR>` |
 | 서비스 | `emfit.service` (uvicorn, 포트 8080) · `emfit-discord-bot.service` (봇) |
-| 외부 접속 | `http://monitoring.example.com` (공유기 80 → 8080 포워딩) |
+| 외부 접속 | 환경변수 `EMFIT_EXTERNAL_BASE` 로 설정 (`https://monitoring.example.com` 등) |
 | GitHub | `gr4n4/emfit_server` (`main`) |
 
 배포는 **"복사 → 앱 안 멈추고 검사 → 통과할 때만 재시작"** 순서를 지킨다. 상세 절차는
@@ -40,18 +41,18 @@ FastAPI 서버. A시설 등에서 실증 운영 중이다.
 
 ```powershell
 # 1) 윈도우에서 전송 (같이 고친 파일은 반드시 한 번에 — import 짝이 깨지면 앱이 안 켜진다)
-scp -O app.py analyzer.py operator@jetson-host:/opt/monitoring_server/
+scp -O app.py analyzer.py <JETSON_USER>@<JETSON_HOST>:<APP_DIR>/
 ```
 ```bash
 # 2) 젯슨에서 재시작 전 검사 — 이 시점에도 기존 앱은 그대로 돌고 있다
-cd ~/emfit_server
+cd <APP_DIR>
 grep '^VERSION' app.py
 python3 -c "import ast; [ast.parse(open(f,encoding='utf-8').read()) for f in ['app.py','analyzer.py']]; print('문법 OK')"
 # 3) 통과하면 재시작 → 확인
 sudo systemctl restart emfit && sleep 5 && systemctl is-active emfit
 # 4) 회귀 확인: 기존 기기 카드 수·통신 시각 갱신 여부까지 본다
 ```
-되돌리기용으로 배포 전 `~/backup/pre_<버전>/` 에 `app.py`·`analyzer.py`·`assignments.json` 을 복사해 둔다.
+되돌리기용으로 배포 전 `<BACKUP_DIR>/pre_<버전>/` 에 `app.py`·`analyzer.py`·`assignments.json` 을 복사해 둔다.
 
 작업 시 알아둘 점:
 - 재시작하면 **수백 MB 로그 전체 재파싱에 30초~수 분** 걸린다. 그동안 `_maintenance_gate`
@@ -115,6 +116,8 @@ sudo systemctl restart emfit && sleep 5 && systemctl is-active emfit
 `*_리포트.csv`, `device_tokens.json`, `view_tokens.json`, `admin_password.txt`, `mckare_apikey.txt`,
 `discord_config.json`, `discord_bot_token.txt`, `*firebase-adminsdk*.json`, `mckare_images/`, `logs/`.
 새 비밀·데이터 파일을 만들면 같은 커밋에서 `.gitignore` 에 먼저 추가한다.
+운영 호스트·IP·계정·대상자·시설·실기기 식별자도 공개 문서나 소스 예시에 직접 적지 않고,
+환경변수·gitignore 대상 설정 파일 또는 명확한 예시 플레이스홀더를 사용한다.
 
 ### 5-2. 버전 표기는 항상 한 세트
 코드를 고치면 `VERSION` ([app.py:20](app.py#L20))과 [CHANGELOG.md](CHANGELOG.md) 를 **같이** 올린다.
@@ -157,7 +160,7 @@ CHANGELOG 는 "무엇을 고쳤는지"와 함께 **왜 그렇게 판단했는지
 - 대시보드·리포트에 **인증이 필요한 화면과 없는 수신 경로가 섞여 있다.** 라우트를 추가할 때
   `Depends(require_admin)` 또는 `_require_device_access` 중 무엇이 맞는지 반드시 판단한다.
 - 세션 서명키는 부팅 시 1회 생성(`_SESSION_SECRET`)이라 **재시작하면 모두 로그아웃**된다.
-- EMFIT-DEMO-04(뇌성마비 대상자)는 Emfit 알고리즘이 수면 단계 분류에 실패해 REM/깊은수면이 대부분 0이다.
+- 일부 대상자는 Emfit 알고리즘이 수면 단계 분류에 실패해 REM/깊은수면이 대부분 0일 수 있다.
   총수면 값만 신뢰 가능 — 리포트 로직에서 이 값을 근거로 계산하지 않는다.
 - 로컬에 `emfit_data.jsonl`(86MB)·`radar_data.jsonl`(44MB)가 있다. 전체 grep/읽기를 피하고
   `tail` 이나 필터로 접근한다.

@@ -1,16 +1,16 @@
-# 돌봄기기 통합 관제 서버 매뉴얼
+# 돌봄기기 통합 모니터링 서버 매뉴얼
 
 EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) · Garmin 워치 다섯 종류 데이터를
 수집·관제하고 리포트·알림을 제공하는 서버의 운영 및 사용 문서.
 
-> 기준 버전 **v3.21.0** (2026-09-14). 기술 변경 내역은 [CHANGELOG.md](CHANGELOG.md),
+> 기준 버전 **v3.21.1** (2026-09-14). 기술 변경 내역은 [CHANGELOG.md](CHANGELOG.md),
 > 개발 여정 요약은 [VERSION_HISTORY.md](VERSION_HISTORY.md), 코드 작업 규칙은 [CLAUDE.md](CLAUDE.md) 참고.
 
 ---
 
 ## 0. 빠른 링크
 
-기본 주소: `http://monitoring.example.com` — **아래 화면은 모두 관리자 로그인이 필요하다** (§2.1).
+기본 주소: 배포 시 `EMFIT_EXTERNAL_BASE`로 설정한 주소(예: `https://monitoring.example.com`) — **아래 화면은 모두 관리자 로그인이 필요하다** (§2.1).
 
 | 화면 | 주소 | 용도 |
 |---|---|---|
@@ -48,11 +48,11 @@ EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) · Garmin 워�
      └───────────┴──── HTTP POST ──┴───────────┘
                         │
                         ▼
-        [DDNS: monitoring.example.com]
-        [집 공유기 TP-Link] 외부80 → 내부8080 포트포워딩
+        [공개 주소: monitoring.example.com]
+        [라우터/리버스 프록시] 외부 HTTPS → 내부 서비스
                         │
                         ▼
-        [Jetson Orin Nano: JETSON_HOST]
+        [Jetson 계열 운영 장비: JETSON_HOST]
         ├─ systemd `emfit`              → FastAPI(app.py) + 분석(analyzer.py)
         │   ├─ emfit_data.jsonl         ← EMFIT QS
         │   ├─ radar_data.jsonl         ← AI Radar
@@ -78,20 +78,16 @@ EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) · Garmin 워�
 | 돌봄기기 사용감지 (ESP32 FSR) | `POST /jy01` | `fsr_data.jsonl` | **주기 없음 — 사용 시작/종료 때만** | 없음 |
 | **Garmin 워치** | `POST /garmin` (**localhost 전용**) | `garmin_data.jsonl` | 폴러가 30~60분마다 조회 | 계정별 OAuth 토큰 |
 
-### 1.4 현재 등록된 기기
+### 1.4 등록 기기 예시
 
-`device_info.json` 기준 (2026-09-10):
+실제 등록 정보는 공개 저장소가 아닌 `device_info.json`에서 관리한다:
 
 | 기기 SN | 이름 | 위치 | 그룹 | 종류 |
 |---|---|---|---|---|
-| EMFIT-DEMO-02 | A시설 1 - 돌봄자 | A시설 1 | 일반 | EMFIT QS |
-| EMFIT-DEMO-05 | A시설 1 - 돌봄받는자 | A시설 1 | 일반 | EMFIT QS |
-| EMFIT-DEMO-01 | A시설 2 - 돌봄자 | A시설 2 | 일반 | EMFIT QS |
-| EMFIT-DEMO-03 | A시설 2 - 돌봄받는자 | A시설 2 | 일반 | EMFIT QS |
-| EMFIT-DEMO-04 | 사용자-D | 사용자-D님 가정 | 뇌성마비 | EMFIT QS |
-| A1B2C3D4E5F8 | AI Radar | - | 일반 | AI Radar |
-| fb-A3F2 | 돌봄기기 1 | - | 일반 | 사용감지(FSR) |
-| garmin-example-account-03 … | (폴러 가동 후 자동 등록) | - | 일반 | Garmin 워치 |
+| EMFIT-DEMO-01 | 사용자 A | A시설 101호 | 일반 | EMFIT QS |
+| RADAR-DEMO-01 | AI Radar | A시설 101호 | 일반 | AI Radar |
+| FSR-DEMO-01 | 돌봄기기 1 | A시설 101호 | 일반 | 사용감지(FSR) |
+| garmin-example-account-01 | (폴러 가동 후 자동 등록) | - | 일반 | Garmin 워치 |
 
 > **기기 정보는 `/devices` 화면에서 수정한다.** 값은 `device_info.json` 에 저장되며,
 > 코드(`analyzer.py` 의 `_DEFAULT_DEVICE_INFO`)는 파일이 아예 없을 때 쓰는 초기값일 뿐이다.
@@ -111,7 +107,7 @@ EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) · Garmin 워�
 | 그룹(시설) URL | `/v/{토큰}` | 관리자가 묶어준 기기들만 |
 | 개인 URL | `/d/{토큰}` | 그 기기 하나만 |
 
-- 관리자 ID 는 `operator` (환경변수 `EMFIT_ADMIN_USER` 로 변경 가능), 비밀번호는 젯슨의
+- 관리자 ID는 환경변수 `EMFIT_ADMIN_USER`로 설정하며 기본값은 `admin`, 비밀번호는 운영 서버의
   `admin_password.txt` 파일에 있다. 파일이 없으면 서버가 켜질 때 무작위로 만들어 로그에 한 번 출력한다.
   비밀번호를 바꾸려면 그 파일을 직접 편집한다.
 - **서버를 재시작하면 로그인 세션이 모두 풀린다** (세션 서명키를 부팅할 때마다 새로 만들기 때문). 다시 로그인하면 된다.
@@ -136,8 +132,8 @@ EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) · Garmin 워�
 
 ```
 ┌─────────────────────────┐
-│ 사용자-D님 가정       🛌  │ ← 위치 / 상태 아이콘
-│ 사용자-D                  │ ← 사용자 이름
+│ A시설 101호         🛌  │ ← 위치 / 상태 아이콘
+│ 사용자 A                 │ ← 사용자 이름
 │                         │
 │  ❤️ HR │ 🫁 RR │ 🏃 ACT │ ← 최근 측정값
 │   68   │  12   │   5    │
@@ -145,7 +141,7 @@ EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) · Garmin 워�
 │    🛌 재실               │ ← 판정된 상태
 │   측정: 08:13 (1시간 전) │ ← 마지막 측정 시각
 │   통신: 연결됨 (방금)    │ ← 장비 연결 상태
-│   EMFIT-DEMO-04                │ ← 기기 SN
+│   EMFIT-DEMO-01         │ ← 기기 SN
 └─────────────────────────┘
 ```
 
@@ -223,7 +219,7 @@ AI Radar 카드는 `🏃 ACT` 자리에 `🧭 자세`(누움/앉음/걸터앉음
 ### 2.7 신규 디자인 미리보기 (`/dashboard2`)
 
 새 UI 를 시험하는 별도 주소다. 상태 판정·데이터 로직은 기존과 같고 화면만 다르며,
-**McKare 전용 구역이 여기에만 있다.** A시설 등 실사용은 기존 `/dashboard`·`/view` 를 계속 쓴다.
+**McKare 전용 구역이 여기에만 있다.** 운영 환경은 기존 `/dashboard`·`/view` 를 계속 쓴다.
 
 ---
 
@@ -240,9 +236,9 @@ AI Radar 카드는 `🏃 ACT` 자리에 `🧭 자세`(누움/앉음/걸터앉음
 ### 3.2 결과물
 
 ```
-2026-04-01_to_2026-04-12_사용자-D님 가정_사용자-D.zip
-├─ 2026-04-01_사용자-D님 가정_사용자-D_리포트.csv
-├─ 2026-04-02_사용자-D님 가정_사용자-D_리포트.csv
+2026-04-01_to_2026-04-12_A시설_사용자A.zip
+├─ 2026-04-01_A시설_사용자A_리포트.csv
+├─ 2026-04-02_A시설_사용자A_리포트.csv
 └─ ...
 ```
 
@@ -295,7 +291,7 @@ AI Radar 는 자세·낙상·감지인원·Radar모델(bed/fall) 컬럼이, McKa
 | 설정 | 설명 |
 |---|---|
 | 기본 Webhook | 채널 배정이 없는 기기의 알림이 가는 곳 |
-| 시설(채널)별 Webhook | `A시설` 처럼 채널을 등록하고 기기를 배정 |
+| 시설(채널)별 Webhook | `A시설`처럼 채널을 등록하고 기기를 배정 |
 | 끊김 기준 시간 | 기본 **30분**. 보고 주기가 긴 기기는 기기별로 따로 늘릴 수 있다 |
 | 테스트 전송 / 기준 재설정 | 화면 버튼으로 즉시 확인 |
 
@@ -316,7 +312,7 @@ AI Radar 는 자세·낙상·감지인원·Radar모델(bed/fall) 컬럼이, McKa
 > 멀쩡한 기기가 끊김으로 잡힌다(병동 실증에서 확인). 반대로 `connected` 만 믿으면 수신 경로가 죽어
 > `true` 로 멈춘 기기는 영영 알림이 안 간다 — 그래서 6시간 안전장치를 함께 둔다.
 
-알림 메시지 예: `🔴 (EMFIT QS) A시설 1 - 돌봄자 (A시설 1) 연결이 끊겼습니다`
+알림 메시지 예: `🔴 (EMFIT QS) 사용자 A (A시설 101호) 연결이 끊겼습니다`
 
 ### 배터리 부족 알림
 
@@ -324,7 +320,7 @@ AI Radar 는 자세·낙상·감지인원·Radar모델(bed/fall) 컬럼이, McKa
 끊김 기준 바로 아래에 있고, 기본값은 **20%** 다.
 
 ```
-🪫 배터리 부족 — (돌봄기기 사용 감지) 돌봄기기 2 (A시설 1)
+🪫 배터리 부족 — (돌봄기기 사용 감지) 돌봄기기 2 (A시설)
 남은 배터리: 17% (기준 20%)
 → 배터리 교체가 필요합니다
 ```
@@ -341,8 +337,8 @@ AI Radar 는 자세·낙상·감지인원·Radar모델(bed/fall) 컬럼이, McKa
 🔋 배터리 잔량 (교체 기준: 20% 이하)
 전체 4대 · 🪫 교체 필요 2대
 
-🔴 돌봄기기 3(A시설 2) - 4%  ·  3일 전 기준
-🪫 돌봄기기 2(A시설 1) - 17%
+🔴 돌봄기기 3(B시설) - 4%  ·  3일 전 기준
+🪫 돌봄기기 2(A시설) - 17%
 🔋 돌봄기기 4 - 31%
 🟢 돌봄기기 1(우리집) - 62%
 ```
@@ -352,7 +348,7 @@ AI Radar 는 자세·낙상·감지인원·Radar모델(bed/fall) 컬럼이, McKa
 > 믿으면 안 된다.
 
 **Garmin 토큰이 만료되면 다른 메시지로 온다**:
-`🔧 토큰 갱신 필요 — (Garmin 워치) A시설1 사용자-A님` + `Garmin 재로그인이 필요합니다`.
+`🔧 토큰 갱신 필요 — (Garmin 워치) A시설 사용자 A` + `Garmin 재로그인이 필요합니다`.
 전원·네트워크 문제가 아니라 **관리자가 재로그인해야만 풀리는** 경우라 제목부터 구분한다.
 
 ### 5.2 디스코드 봇 슬래시 명령어
@@ -362,7 +358,7 @@ AI Radar 는 자세·낙상·감지인원·Radar모델(bed/fall) 컬럼이, McKa
 | `/현황` | 전체 요약 + 끊긴 기기 목록 |
 | `/상세보기` | 전체 기기 목록과 상태 |
 | `/배터리` | 사용감지 센서 배터리 잔량 — **잔량이 적은 것부터** 정렬 |
-| `/A시설` 처럼 **시설 이름** | 그 시설에 배정된 기기만 |
+| `/a시설`처럼 **시설 이름** | 그 시설에 배정된 기기만 |
 
 표시 형식: `🟢 김돌봄(우리집, EMFIT QS) - 방금`
 
@@ -427,7 +423,7 @@ tail -f ~/emfit_server/mckare_data.jsonl     # McKare
 tail -f ~/emfit_server/fsr_data.jsonl        # 사용감지
 tail -f ~/emfit_server/garmin_data.jsonl     # Garmin 워치
 
-tail -f ~/emfit_server/emfit_data.jsonl | grep --line-buffered EMFIT-DEMO-04   # 특정 기기만
+tail -f ~/emfit_server/emfit_data.jsonl | grep --line-buffered EMFIT-DEMO-01   # 특정 기기만
 du -h ~/emfit_server/*.jsonl                                            # 파일 크기
 ```
 
@@ -515,7 +511,7 @@ WantedBy=timers.target
 
 ### 6.7 코드 수정 → 배포 워크플로우
 
-**원본 위치 (윈도우)**: `C:\path\to\monitoring_server`
+**원본 위치**: `<LOCAL_REPOSITORY_PATH>`
 
 핵심 안전장치: **파일을 덮어써도 재시작 전까지는 기존 앱이 그대로 돈다.**
 "복사 → (앱 멈추지 않고) 검사 → 통과할 때만 재시작" 순서를 지킨다.
@@ -554,10 +550,10 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/dashboard   # 200
 
 1. `sudo systemctl status emfit` → active 인가? 아니면 `sudo journalctl -u emfit -n 30 --no-pager`
 2. "점검 중" 화면이면 워밍업 중이다 — 몇 분 기다린다
-3. 내부 IP 로 테스트: `http://JETSON_HOST:8080/dashboard`
+3. 내부 호스트로 테스트: `http://JETSON_HOST:8080/dashboard`
    - 뜨면 네트워크/공유기 문제 / 안 뜨면 서비스 문제
-4. DDNS 확인: `nslookup monitoring.example.com`
-5. 공유기 포트포워딩: 외부 80 → JETSON_HOST:8080 (TCP)
+4. 공개 도메인 확인: `nslookup monitoring.example.com`
+5. 라우터/리버스 프록시가 공개 포트에서 `JETSON_HOST:8080`으로 전달하는지 확인
 
 ### 7.2 로그인이 안 됨 / 갑자기 로그아웃됨
 
@@ -631,7 +627,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/dashboard   # 200
 | AI Radar | 같음. MAC 이 바뀌면 새 기기로 뜨므로 옛 기기는 `/devices`·`assignments.json` 에서 정리 |
 | 사용감지(FSR) | 처음 데이터가 오면 자동 등록(`돌봄기기 XXXX`) → `/devices` 에서 이름·설치장소 수정. 무한 증가를 막는 자동 등록 상한 20대 |
 | McKare | `POST /mckare` 로 데이터가 오면 등록됨. 전용 대시보드 구역은 `/dashboard2` 에만 있다 |
-| **Garmin 워치** | 계정 토큰 폴더를 젯슨의 `~/.garmin_example-account-<번호>` 에 올리면, 다음 수집 주기에 `Garmin example-account-05` 로 자동 등록된다 → `/devices` 에서 이름·위치 지정 |
+| **Garmin 워치** | 계정 토큰 폴더를 젯슨의 `~/.garmin_<계정>` 에 올리면, 다음 수집 주기에 `Garmin <계정>`으로 자동 등록된다 → `/devices`에서 이름·위치 지정 |
 
 `/devices` 에서 삭제는 안 된다. 쓰지 않는 기본 등록을 지우려면 `assignments.json` 에서 해당 줄을 지우고 재시작한다.
 
@@ -649,7 +645,7 @@ for f in emfit radar mckare fsr garmin; do
 done
 cp ~/emfit_server/{device_info.json,assignments.json} ~/backup/
 # Garmin 토큰 — oauth1 은 재발급이 불가능한 유일한 자산이라 따로 챙긴다
-cp -r ~/.garmin_example-account-* ~/backup/garmin_tokens_$(date +%Y%m%d)/
+cp -r ~/.garmin_* ~/backup/garmin_tokens_$(date +%Y%m%d)/
 ```
 또는 외부 NAS/클라우드로 rsync·scp 주기 전송을 cron 에 설정한다.
 
@@ -672,8 +668,8 @@ sudo systemctl daemon-reload
 - **다운타임 감지가 없다.** 서버가 죽으면 알림이 없다 — UptimeRobot 등 외부 모니터링 필요.
   (기기 끊김은 디스코드로 알림이 가지만, 서버 자체가 죽으면 그 알림도 멈춘다.)
 - **로그 로테이션이 없다.** 파일이 계속 커지고, 재시작 시 워밍업 시간도 그만큼 늘어난다.
-- **EMFIT-DEMO-04(사용자-D, 뇌성마비)** 는 Summary 의 REM/깊은수면 값이 대부분 0 이다. Emfit 알고리즘이 뇌성마비
-  대상자의 수면 단계 분류에 실패하는 것으로 추정 — **총수면 값만 신뢰 가능**하다.
+- 일부 대상자는 Summary의 REM/깊은수면 값이 대부분 0일 수 있다. Emfit 알고리즘이 특정 신체 조건에서
+  수면 단계 분류에 실패하는 것으로 추정 — 해당 사례에서는 **총수면 값만 신뢰 가능**하다.
 - **McKare 는 기존 대시보드(`/dashboard`)에 전용 구역이 없다.** 등록하면 SN 모양(12자리 MAC) 때문에
   AI Radar 구역에 섞여 보인다. 전용 구역은 `/dashboard2` 에 있다.
 - **Garmin 은 실시간이 아니다.** 워치 → 폰 → 클라우드 → 서버 폴링(30~60분) 구조라 수 시간 지연이
@@ -690,7 +686,6 @@ sudo systemctl daemon-reload
 
 ## 10. 연락처 / 추가 정보
 
-- 코드 원본: `C:\path\to\monitoring_server\` (윈도우) · GitHub `gr4n4/emfit_server`
-- 운영 서버: Jetson Orin Nano `operator@jetson-host` : `/opt/monitoring_server/`
-- DDNS: `monitoring.example.com` (TP-Link 공유기에 등록)
-- 공인 IP: `PUBLIC_IP` (유동, DDNS 가 자동 갱신)
+- 코드 원본: 현재 Git 저장소 · GitHub `gr4n4/emfit_server`
+- 운영 서버: `operator@jetson-host` : `/opt/monitoring_server/` (예시; 실제 값은 비공개 운영 문서에서 관리)
+- 공개 주소: `EMFIT_EXTERNAL_BASE` 환경변수로 설정

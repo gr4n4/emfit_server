@@ -21,21 +21,11 @@ import threading as _threading
 _DEVICE_INFO_FILE = "device_info.json"
 _DEVICE_INFO_LOCK = _threading.Lock()
 
-_DEFAULT_DEVICE_INFO = {
-    "EMFIT-DEMO-01": {"name": "돌봄A", "location": "-", "group": "일반"},
-    "EMFIT-DEMO-02": {"name": "돌봄B", "location": "테스트 공간", "group": "일반"},
-    "EMFIT-DEMO-03": {"name": "사용자-C", "location": "A시설", "group": "일반"},
-    "EMFIT-DEMO-04": {"name": "사용자-D", "location": "사용자-D님 가정", "group": "뇌성마비"},
-    "EMFIT-DEMO-05": {"name": "사용자E", "location": "301호", "group": "일반"},
-    # AI Radar(라닉스 RMR602A). 실물 기기가 두 번 바뀌었다:
-    #   A1B2C3D4E5F6 → A1B2C3D4E5F7 → A1B2C3D4E5F8 (2026-08-06 현재 이 한 대만 보유)
-    # 옛 두 대는 아래 _RETIRED_SNS 로 정리한다.
-    "A1B2C3D4E5F8": {"name": "AI Radar", "location": "-", "group": "일반"},
-}
+# 실제 대상자·시설·기기 식별자는 공개 소스에 두지 않는다.
+# 운영 정보는 gitignore 대상인 device_info.json에서 관리한다.
+_DEFAULT_DEVICE_INFO = {}
 
-_RADAR_DEVICE_DEFAULTS = {
-    "A1B2C3D4E5F8": _DEFAULT_DEVICE_INFO["A1B2C3D4E5F8"],
-}
+_RADAR_DEVICE_DEFAULTS = {}
 
 # ESP32 압력 사용감지 센서(돌봄기기에 부착) — 알려진 기기는 여기에 적어두면
 # 데이터가 없어도 대시보드에 자리를 잡는다. name/location 은 /devices 에서 편집 가능.
@@ -57,17 +47,7 @@ _FSR_DEVICE_DEFAULTS = {}
 # 값이 None 이면 강제 제거 — 이름·위치를 바꿨더라도 지운다.
 #   ⚠️ 강제는 "사용자가 이 기기를 명시적으로 없애라고 한 경우"에만 쓴다.
 #      측정 데이터가 있는 기기를 강제로 빼면 과거 기록이 Unknown(SN) 으로 표시된다.
-_RETIRED_SNS = {
-    # 2026-08-03 AI Radar 교체 — 제조사 사용 권장 중단.
-    # 2026-08-06 강제 제거로 전환: 위치를 '테스트 공간'로 바꿔둔 탓에 안 지워지고 있었다.
-    # 수신 데이터가 없는 기기라 잃을 기록도 없다.
-    "A1B2C3D4E5F6": None,
-    # 2026-08-06 AI Radar 재교체 — 설치 시 다른 실물이 와서 MAC 변경. 보유 기기는 A1B2C3D4E5F8 한 대뿐.
-    "A1B2C3D4E5F7": None,
-    # 2026-08-06 사용감지 테스트 잔재 정리 — 실제 운영에 쓰지 않는 자리.
-    "B1C2D3E4F5A6": None,
-    "CONNECTIVITY-TEST": None,
-}
+_RETIRED_SNS = {}
 
 # 기기 종류(kind) — 대시보드가 어느 섹션에 넣을지 판단하는 값.
 # ⚠️ 종류를 SN 모양으로 추측하면 안 된다. ESP32 의 MAC 도 12자리 16진수라
@@ -714,7 +694,7 @@ def _ensure_garmin_device(sn, account=None):
 
     FSR 과 같은 이유 — 이게 없으면 데이터는 쌓이는데 화면에는 안 보인다.
     계정을 추가할 때 서버 코드를 고치지 않아도 되게 하는 장치이고,
-    이름(예: 'A시설1 사용자-A님')은 /devices 화면에서 붙이면 된다."""
+    이름(예: 'A시설 사용자1')은 /devices 화면에서 붙이면 된다."""
     if sn in DEVICE_INFO:
         return
     if sn in _RETIRED_SNS:
@@ -859,7 +839,7 @@ def _store_garmin_record(storage, g):
     #
     # ⚠️ 근거가 하나도 없으면 None 으로 둔다. 예전에는 '지금'으로 채웠는데,
     #    그러면 **데이터가 0건인 계정이 '🟢 동기화 정상 · 방금'으로 보인다**
-    #    (2026-09-14 실제 배포에서 0003·0006 이 그렇게 떴다).
+    #    (실제 배포에서 복수 계정이 그렇게 표시된 사례가 있다).
     #    모르는 것은 모른다고 표시해야 한다 — 화면은 '동기화 기록 없음'으로 나가고,
     #    디스코드는 connected=None 을 '판단 근거 없음'으로 보고 알림을 만들지 않는다.
     candidates = [c for c in (g.get("last_sync_ts"),

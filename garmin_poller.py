@@ -6,13 +6,13 @@
 
 실행 (한 번 돌고 끝남 — 주기 실행은 systemd timer 로):
     python3 garmin_poller.py --all-accounts
-    python3 garmin_poller.py --account example-account-04 --days 2 --dry-run
+    python3 garmin_poller.py --account example-account-01 --days 2 --dry-run
 
 설치:
     pip install "garminconnect==0.2.38" "garth>=0.5.17,<0.6.0"
 
 토큰:
-    기본 위치는 홈 폴더의 ~/.garmin_example-account-* (젯슨: /home/operator/...).
+    기본 위치는 홈 폴더의 ~/.garmin_<account>.
     각 폴더에 oauth1_token.json, oauth2_token.json 이 있어야 한다. chmod 600 권장.
 
 ⚠️ 알아둘 것 세 가지
@@ -48,7 +48,7 @@ if hasattr(sys.stdout, "reconfigure"):
 from garminconnect import Garmin  # noqa: E402
 
 TOKEN_DIR_PREFIX = ".garmin_"
-TOKEN_GLOB = ".garmin_example-account-*"
+TOKEN_GLOB = ".garmin_*"
 REQUIRED_TOKEN_FILES = ("oauth1_token.json", "oauth2_token.json")
 
 STATE_FILE = Path(__file__).resolve().parent / "garmin_poll_state.json"
@@ -105,8 +105,6 @@ def token_dir_for(token_root: Path, account: str) -> Path:
         return p.resolve()
     name = account
     if not name.startswith(TOKEN_DIR_PREFIX):
-        if not name.startswith("operator"):
-            name = f"operator{name}"
         name = f"{TOKEN_DIR_PREFIX}{name}"
     return (token_root / name).resolve()
 
@@ -322,7 +320,7 @@ def poll_account(token_dir: Path, dates: list[str], server: str,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Garmin 워치 수집기")
-    ap.add_argument("--account", help="계정 (예: example-account-04 / 0004 / 토큰폴더 경로)")
+    ap.add_argument("--account", help="계정 (예: example-account-01 / 토큰폴더 경로)")
     ap.add_argument("--all-accounts", action="store_true")
     ap.add_argument("--token-root", type=Path, default=Path(os.path.expanduser("~")),
                     help="토큰 폴더 위치 (기본: 홈 디렉터리)")

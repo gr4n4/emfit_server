@@ -19,14 +19,14 @@
                      └───────────────────────────────┘
 ```
 - **대시보드/로그인** → `https://monitoring.example.com` (Caddy, 비번 보호)
-- **Emfit 수신** → `http://monitoring.example.com/` (80, 지금 그대로 — 무변경)
+- **Emfit 수신** → `http://monitoring.example.com/` (80, 기존 센서 설정과 맞춤)
 - **AI Radar 수신** → HTTP·HTTPS 둘 다 가능 (기기가 되는 쪽 선택)
 
 ## 우리 환경 값
 | 항목 | 값 |
 |---|---|
 | 공유기 | TP-Link Archer BE550 |
-| 젯슨 내부 IP | `JETSON_HOST` |
+| 젯슨 내부 호스트 | `JETSON_HOST` |
 | 도메인 | `monitoring.example.com` |
 | 앱 | systemd 서비스 `emfit`, 포트 8080 |
 

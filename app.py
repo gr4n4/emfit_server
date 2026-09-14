@@ -17,7 +17,7 @@ from nrcarec_alert import send_alert, should_send
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.21.0"
+VERSION = "3.21.1"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -48,11 +48,12 @@ ADMIN_COOKIE = "emfit_admin"  # device 토큰 쿠키 이름 (변수 이름은 �
 SESSION_COOKIE = "emfit_session"  # 관리자 로그인 세션 쿠키
 VIEW_COOKIE = "emfit_view"  # 그룹(view) 토큰 쿠키
 # 관리자 ID — 비번은 ADMIN_PW_FILE에서 읽음. ID 변경 원하면 환경변수로.
-ADMIN_USERNAME = os.environ.get("EMFIT_ADMIN_USER", "operator")
+ADMIN_USERNAME = os.environ.get("EMFIT_ADMIN_USER", "admin")
 # 세션 쿠키 서명용 비밀키 — 서버 부팅 시 1회 생성. 재시작하면 모두 로그아웃됨.
 _SESSION_SECRET = secrets.token_bytes(32)
-# 외부 접속 URL (DDNS). 내부 base는 사용자가 들어온 host에서 자동 추출.
-EXTERNAL_BASE = os.environ.get("EMFIT_EXTERNAL_BASE", "http://monitoring.example.com")
+# 외부 접속 URL. 운영 주소는 저장소에 넣지 않고 환경변수로 주입한다.
+# 내부 base는 사용자가 들어온 host에서 자동 추출한다.
+EXTERNAL_BASE = os.environ.get("EMFIT_EXTERNAL_BASE", "http://localhost:8080")
 _tokens_lock = threading.Lock()
 _view_tokens_lock = threading.Lock()
 _feedback_lock = threading.Lock()
@@ -176,7 +177,7 @@ def _save_tokens(tokens):
 
 
 def _load_view_tokens():
-    """view_tokens.json 로드. 형식: {"<token>": {"name": "A시설", "sns": ["EMFIT-DEMO-01", ...]}}."""
+    """view_tokens.json 로드. 형식: {"<token>": {"name": "A시설", "sns": ["DEVICE-01", ...]}}."""
     if not os.path.exists(VIEW_TOKENS_FILE):
         return {}
     try:
@@ -1064,7 +1065,7 @@ FSR_BATT_LOW, FSR_BATT_WARN = 15, 30   # 카드 색 경고 기준(주의 표시�
 def _is_fsr_device(sn, state=None, ds=None):
     """사용감지 센서 판별. ⚠️ _is_radar_device 보다 먼저 확인해야 한다.
 
-    ESP32 의 MAC(예: ECE334450058)도 12자리 16진수라 레이더와 생김새가 같다.
+    ESP32 의 MAC(예: A1B2C3D4E5F6)도 12자리 16진수라 레이더와 생김새가 같다.
     그래서 SN 모양이 아니라 등록 정보의 kind 를 먼저 본다 —
     이래야 데이터가 아직 안 들어온 기기도 올바른 섹션에 뜬다."""
     if (analyzer.DEVICE_INFO.get(sn) or {}).get("kind") == analyzer.KIND_FSR:
@@ -1590,7 +1591,7 @@ def _build_cards_payload(token="", sn_filter=None, view_token=""):
 # ══════════════════════════════════════════════════════════════════════════
 #  대시보드 V2 (신규 디자인) — 기존 /dashboard·/view 는 그대로 두고 별도 주소로.
 #  기존 상태 판정·데이터 로직은 재사용하고, 화면(HTML/CSS)만 새로 그린다.
-#  A시설는 기존 /view 를 계속 쓰므로 영향 없음.
+#  기존 운영 그룹은 /view 를 계속 쓰므로 영향 없음.
 # ══════════════════════════════════════════════════════════════════════════
 
 # 자세 라벨 → (SVG 심볼 id, 위험도 색 변수)
@@ -5163,7 +5164,7 @@ def internal_discord_status(request: Request):
         "disconnected": sum(1 for d in devices if d["connected"] is False),
         "unknown": sum(1 for d in devices if d["connected"] is None),
         "devices": devices,
-        # 봇이 시설별(/A시설 등) 슬래시 명령어를 동적으로 등록할 때 씀.
+        # 봇이 시설별(/a시설 등) 슬래시 명령어를 동적으로 등록할 때 씀.
         "channels": sorted((cfg.get("channels") or {}).keys()),
     })
 

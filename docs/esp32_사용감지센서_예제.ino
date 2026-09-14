@@ -16,7 +16,7 @@
 // ═══ 설정 ═══════════════════════════════════════════════════════
 // 같은 WiFi 면 내부 주소가 안정적. 다른 망이면 아래 주석 쪽을 쓰세요.
 const char* SERVER_URL = "http://JETSON_HOST:8080/jy01";
-// const char* SERVER_URL = "http://monitoring.example.com/jy01";
+// const char* SERVER_URL = "https://monitoring.example.com/jy01";
 
 const int   FSR_PIN      = 34;    // ⚠️ ADC1 만 가능 — GPIO 32·33·34·35·36·39
 const int   BATT_PIN     = 35;    // 배터리 분압 핀 (측정 회로 없으면 -1)

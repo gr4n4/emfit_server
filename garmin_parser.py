@@ -8,8 +8,8 @@
 
 폴러가 보내는 형태 (Garmin 원본 필드명을 그대로 싣고, 필요한 것만 골라 담는다):
   {"data_source": "garmin",
-   "account": "example-account-04",
-   "sn": "garmin-example-account-04",
+   "account": "example-account-01",
+   "sn": "garmin-example-account-01",
    "date": "2026-09-13",
    "server_received_at": "2026-09-14 15:00:00",
    "last_sync_gmt": "2026-09-13T15:00:00.0",     ← user_summary.wellnessEndTimeGmt
@@ -31,8 +31,8 @@
   · '연결됨'을 알려주는 필드가 없다. 마지막 동기화 시각(last_sync_gmt)의 경과로 판정한다.
     워치는 폰을 거쳐 올라오므로 수십 분~수 시간 지연이 정상이다.
   · 걸음(totalSteps)과 밀기(totalPushes)는 상호 배타다 — 휠체어 사용자는 걸음이 아예
-    안 잡히고 밀기로 집계된다 (2026-09-14 실측: 0004 는 pushes 19/steps None,
-    0005 는 steps 7040/pushes 키 없음).
+    안 잡히고 밀기로 집계될 수 있다 (익명화된 실측 예: 계정 A는 pushes만,
+    계정 B는 steps만 제공).
 """
 
 import re
@@ -111,7 +111,7 @@ def _date_end_epoch(date_str, now_ts=None):
 
 # ── 일별 요약 매핑 ────────────────────────────────────────────────────
 # (한국어 컬럼, Garmin 필드, 변환). 값이 없으면 컬럼 자체를 만들지 않는다 —
-# 계정·기기마다 제공 지표가 다르다 (예: averageSpo2 는 0004 만 있고 0005 엔 없다).
+# 계정·기기마다 제공 지표가 다르다 (예: 일부 계정에는 averageSpo2가 없을 수 있다).
 _SUMMARY_MAP = (
     ("안정시심박",      "restingHeartRate",              _integer),
     ("최저심박",        "minHeartRate",                  _integer),

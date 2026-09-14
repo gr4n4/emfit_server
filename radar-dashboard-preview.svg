@@ -12,7 +12,7 @@
   </style>
   <rect width="1280" height="670" fill="#f0f2f5"/>
   <text x="40" y="54" class="title">AI Radar 대시보드 더미데이터 테스트</text>
-  <text x="40" y="84" class="note">실제 기기 MAC: A1B2C3D4E5F6 · 아래 카드는 표시 상태를 미리 확인하기 위한 가짜 데이터입니다.</text>
+  <text x="40" y="84" class="note">예시 기기 MAC: A1B2C3D4E5F6 · 아래 카드는 표시 상태를 미리 확인하기 위한 가짜 데이터입니다.</text>
 
   <g transform="translate(40 120)">
     <rect width="370" height="230" rx="15" fill="#f3f0ff" stroke="#7e57c2" stroke-width="2"/>

@@ -115,7 +115,7 @@
 
 **(d) `POST /` (입구)**
 - **변경 없음.** 이미 JSON이면 그대로 받아 저장 중.
-- 단, 레이더 설정에서 전송 주소를 우리 서버(`http://monitoring.example.com` 등)로 지정해야 함.
+- 단, 레이더 설정에서 전송 주소를 운영 서버(`https://monitoring.example.com` 등)로 지정해야 함.
   (RANIX 문서 HTTP API의 `ssid/pw`는 레이더의 AP/네트워크 설정용)
 
 ### 3-3. 기기 등록 (`/devices`)
