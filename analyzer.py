@@ -856,16 +856,24 @@ def _store_garmin_record(storage, g):
 
     # '마지막 동기화 시각'이 이 기기의 통신 시각이다. 폴링한 시각이 아니다 —
     # 폴링 시각을 쓰면 워치가 꺼져 있어도 매번 '방금 통신함'으로 보인다.
+    #
+    # ⚠️ 근거가 하나도 없으면 None 으로 둔다. 예전에는 '지금'으로 채웠는데,
+    #    그러면 **데이터가 0건인 계정이 '🟢 동기화 정상 · 방금'으로 보인다**
+    #    (2026-09-14 실제 배포에서 0003·0006 이 그렇게 떴다).
+    #    모르는 것은 모른다고 표시해야 한다 — 화면은 '동기화 기록 없음'으로 나가고,
+    #    디스코드는 connected=None 을 '판단 근거 없음'으로 보고 알림을 만들지 않는다.
     candidates = [c for c in (g.get("last_sync_ts"),
                               (g["hr"][-1][0] if g.get("hr") else None),
                               prev.get("last_seen_ts")) if c]
-    last_seen = max(candidates) if candidates else now_ts
+    last_seen = max(candidates) if candidates else None
 
     auth_error = g.get("auth_error")
     if auth_error:
         # 인증 실패는 '워치를 안 찼다'와 완전히 다른 문제다. 사람이 개입해야 하는
         # 유일한 경우라 따로 표시해서 화면·알림이 구분할 수 있게 한다.
         connected = False
+    elif last_seen is None:
+        connected = None
     else:
         connected = (now_ts - last_seen) <= GARMIN_SYNC_STALE_SEC
 
@@ -875,8 +883,8 @@ def _store_garmin_record(storage, g):
     _device_status[sn] = {
         "connected": connected,
         "status_code": None,
-        "last_seen_ts": int(last_seen),
-        "status_since_ts": int(last_seen),
+        "last_seen_ts": int(last_seen) if last_seen is not None else None,
+        "status_since_ts": int(last_seen) if last_seen is not None else None,
         "server_received_at": g.get("server_received_at"),
         "source": "garmin",
         "account": g.get("account"),

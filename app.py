@@ -1165,7 +1165,9 @@ def _render_inactive_card(sn, info, ds, now, link_suffix=""):
         if isinstance(last_seen_ts, (int, float)):
             last_text = f"마지막 통신: {_format_ago(max(0, int(now.timestamp() - last_seen_ts)))}"
         else:
-            last_text = "통신 끊김"
+            # 상태 기록은 있는데 시각을 모르는 경우 — '끊김'이라고 단정하면 안 된다.
+            # (Garmin 처럼 조회는 됐지만 올라온 데이터가 없는 계정이 여기 해당한다)
+            last_text = "통신 이력 없음"
     return f"""
     <a href="/device/{sn}{link_suffix}" style="display:block; text-decoration:none; color:inherit;">
     <div style="background:#fafafa; padding:12px 14px; border-radius:10px; border:1px solid #e0e0e0; transition:transform 0.1s;" onmouseover="this.style.transform='translateY(-2px)'" onmouseout="this.style.transform='translateY(0)'">
