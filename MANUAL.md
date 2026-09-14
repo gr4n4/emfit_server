@@ -430,7 +430,43 @@ du -h ~/emfit_server/*.jsonl                                            # 파일
 └─ venv/                   # 파이썬 가상환경
 ```
 
-systemd 서비스 정의: `/etc/systemd/system/emfit.service`, `/etc/systemd/system/emfit-discord-bot.service`
+systemd 정의: `/etc/systemd/system/` 아래
+`emfit.service` · `emfit-discord-bot.service` · `emfit-garmin-poller.service` · `emfit-garmin-poller.timer`
+
+**Garmin 수집기 유닛** (젯슨 재설치 시 그대로 다시 만들면 된다):
+
+```ini
+# /etc/systemd/system/emfit-garmin-poller.service
+[Unit]
+Description=Garmin 워치 수집기 (emfit 대시보드)
+After=network-online.target emfit.service
+
+[Service]
+Type=oneshot
+User=operator
+WorkingDirectory=/opt/monitoring_server
+ExecStart=/opt/monitoring_server/venv/bin/python3 garmin_poller.py --all-accounts --days 3 --save-tokens
+```
+```ini
+# /etc/systemd/system/emfit-garmin-poller.timer
+[Unit]
+Description=Garmin 수집 30분마다
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+| 선택 | 이유 |
+|---|---|
+| `--days 3` | 워치 동기화가 하루 넘게 밀리는 일이 잦아서, 오늘·어제만 보면 놓친다 |
+| `--save-tokens` | 없으면 30분마다 매번 재인증해 차단 위험. **단 `oauth1_token.json` 까지 덮어쓰므로 토큰 백업이 전제다** |
+| `Persistent=true` | 정전으로 꺼져 있던 동안 건너뛴 실행을 부팅 후 한 번 따라잡는다 |
+| `venv/bin/python3` 전체 경로 | 젯슨에 conda(`base`)가 깔려 있어 `python3` 만 쓰면 다른 파이썬이 잡힌다 |
 
 ### 6.6 기기 등록 정보 vs 배정 이력
 
