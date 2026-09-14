@@ -33,6 +33,7 @@ gw_commands.json
 *_리포트.csv
 *_Radar-BED.csv
 *_Radar-FALL.csv
+*_Garmin.csv
 
 # 로그
 logs/

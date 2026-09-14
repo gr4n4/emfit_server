@@ -449,14 +449,25 @@ def _send_discord_message(webhook_url, content):
         return False
 
 
-def _discord_threshold_minutes(cfg, sn):
+# Garmin 은 폴러가 30~60분마다 돌므로 전역 기본값(30분)으로 확인 대기를 잡으면
+# 폴링 한 번만 밀려도 끊김/복구가 번갈아 뜬다. 종류 기본값을 따로 둔다.
+GARMIN_DISCORD_CONFIRM_MIN = 120
+
+
+def _discord_threshold_minutes(cfg, sn, kind=None):
     """기기별 임계값(device_overrides)이 있으면 그걸, 없으면 전역 기본값을 쓴다.
     보고 주기가 원래 긴 기기(예: 30분 간격 게이트웨이)를 전역 기준(30분)에 맞춰
-    끊김/복구로 계속 플랩하는 걸 막기 위함 — 그 기기만 여유를 더 줄 수 있게."""
+    끊김/복구로 계속 플랩하는 걸 막기 위함 — 그 기기만 여유를 더 줄 수 있게.
+
+    Garmin 은 그 '보고 주기가 원래 긴 기기'에 해당해서 종류 기본값을 둔다
+    (관리자가 기기마다 손으로 1440 을 넣어야만 오탐이 안 나는 상태를 피하려는 것).
+    device_overrides 가 있으면 그쪽이 항상 우선이다."""
     overrides = cfg.get("device_overrides") or {}
     val = overrides.get(sn)
     if isinstance(val, (int, float)) and val > 0:
         return int(val)
+    if kind == "garmin":
+        return GARMIN_DISCORD_CONFIRM_MIN
     return max(1, int(cfg.get("threshold_minutes") or 30))
 
 
@@ -498,8 +509,8 @@ def _discord_device_snapshot(cfg):
         location = str(info.get("location") or "").strip()
         if location == "-":
             location = ""
-        threshold_minutes = _discord_threshold_minutes(cfg, sn)
         kind = _v2_kind(sn, None, ds)
+        threshold_minutes = _discord_threshold_minutes(cfg, sn, kind)
 
         if isinstance(last_seen, (int, float)):
             age_sec = now_ts - last_seen
@@ -509,7 +520,22 @@ def _discord_device_snapshot(cfg):
 
         raw_connected = ds.get("connected") if isinstance(ds, dict) else None
         raw_fault = bool(ds.get("fault")) if isinstance(ds, dict) else False
-        if raw_connected is not None:
+        reason = ""
+        if kind == "garmin":
+            # ⚠️ Garmin 의 connected 는 '수집한 그 순간' 계산된 값이다. 다른 기기처럼
+            # 스스로 보내주는 게 아니라 폴러가 넣어주는 값이라, **폴러가 죽으면 마지막
+            # connected=True 가 그대로 굳어 영영 알림이 안 간다.**
+            # 그래서 여기서는 저장된 판정을 믿지 않고 마지막 동기화 시각으로 다시 잰다.
+            # (시각은 시간이 갈수록 저절로 낡으므로 이 경로는 조용히 죽지 않는다)
+            if ds is not None and ds.get("auth_error"):
+                connected, reason = False, "토큰 갱신 필요"
+            elif age_sec is None:
+                connected = None
+            else:
+                connected = age_sec <= analyzer.GARMIN_SYNC_STALE_SEC
+                if not connected:
+                    reason = "워치 착용·폰 동기화 확인"
+        elif raw_connected is not None:
             # Discord alerts are based only on device-reported state, not elapsed
             # communication time. A quiet device can mean absence or idle use.
             connected = bool(raw_connected)
@@ -521,7 +547,7 @@ def _discord_device_snapshot(cfg):
         out.append({
             "sn": sn, "name": name, "location": location,
             "connected": connected, "age_sec": age_sec, "last_seen_text": last_seen_text,
-            "threshold_minutes": threshold_minutes,
+            "threshold_minutes": threshold_minutes, "reason": reason,
             "kind": kind, "kind_label": _DISCORD_KIND_LABELS.get(kind, kind),
             "channel": (cfg.get("device_channels") or {}).get(sn) or None,
         })
@@ -579,10 +605,17 @@ def _discord_check_once():
         if pending_since is None:
             _discord_pending[sn] = now_ts
         elif now_ts - pending_since >= confirm_sec:
-            if _send_discord_message(
-                webhook_url,
-                f"🔴 **연결 끊김** — {label}\n마지막 통신: {d['last_seen_text']}",
-            ):
+            # 토큰 만료처럼 '사람이 손대야만 풀리는' 경우는 제목부터 다르게 보낸다.
+            # 전원·네트워크를 확인하라는 안내를 받고 워치를 들여다봐야 소용이 없다.
+            reason = d.get("reason") or ""
+            if reason == "토큰 갱신 필요":
+                text = (f"🔧 **토큰 갱신 필요** — {label}\n"
+                        f"Garmin 재로그인이 필요합니다 (수집이 멈춘 상태).")
+            else:
+                text = f"🔴 **연결 끊김** — {label}\n마지막 통신: {d['last_seen_text']}"
+                if reason:
+                    text += f"\n→ {reason}"
+            if _send_discord_message(webhook_url, text):
                 _discord_alerted[sn] = True
                 _save_discord_alerted()
                 _discord_pending.pop(sn, None)
@@ -3874,7 +3907,9 @@ def _resolve_report_target(device, assignment):
 # EMFIT QS 와 AI Radar 는 측정하는 게 달라서 CSV 를 따로 뽑는다.
 # 레이더는 한 대가 BED(자세7종+생체) 와 FALL(자세3종+인원) 두 형식을 같이 보내는데,
 # 이것도 성격이 달라 파일을 나눈다. 분석할 때 섞여 있으면 오히려 다루기 어렵다.
+# Garmin 워치도 같은 이유로 '_Garmin' 꼬리표를 붙여 따로 뽑는다.
 RADAR_CSV_KINDS = [("bed", "Radar-BED"), ("fall", "Radar-FALL")]
+GARMIN_ROW_TYPES = {"Garmin", "Garmin일별"}
 
 
 def _report_frames(date_str, sn, aid, kind=None):
@@ -3889,6 +3924,14 @@ def _report_frames(date_str, sn, aid, kind=None):
         return []
     if df is None or df.empty:
         return []
+
+    # 워치 데이터만 들어 있으면 '_Garmin' 으로 따로 뽑는다. 측정 항목이 Emfit 과
+    # 전혀 달라(안정시심박·걸음/밀기·수면단계) 한 파일에 섞으면 빈칸이 대부분이 된다.
+    if "유형" in df.columns:
+        types = set(df["유형"].dropna().unique())
+        if types and types <= GARMIN_ROW_TYPES:
+            return [("Garmin", df.dropna(axis=1, how="all"))]
+
     if "Radar모델" not in df.columns:
         return [("리포트", df)]
 
