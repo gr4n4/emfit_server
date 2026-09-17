@@ -19,7 +19,7 @@
 
 ## 1. 이관받은 자산 — 무엇을 쓰고 무엇을 버리는가
 
-`garmin` 폴더는 `cyberjunky/python-garminconnect` v0.2.38 포크(`hanbl0502-lab/garminconnect-0.2.38`)에
+`garmin` 폴더는 `cyberjunky/python-garminconnect` v0.2.38 을 내부에서 포크한 저장소에
 자체 스크립트를 얹은 것이다. 커밋 4개(2026-03-10 ~ 03-31)가 그 작업분.
 
 | 파일 | 역할 | 연동 시 |

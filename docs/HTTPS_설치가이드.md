@@ -46,7 +46,7 @@ systemctl is-active emfit
 curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/dashboard   # 401 또는 200 이면 정상
 
 # 3) 도메인이 우리 공유기(현재 외부 IP)를 가리키는지
-curl -s ifconfig.me ; echo    # 이 IP 와 tplinkdns 가 같은 곳을 가리키면 인증서 발급 가능
+curl -s ifconfig.me ; echo    # 이 IP 와 DDNS 주소가 같은 곳을 가리키면 인증서 발급 가능
 ```
 
 ---
