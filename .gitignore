@@ -33,6 +33,7 @@ feedback.jsonl
 assignments.json
 preferences.json
 device_info.json
+retired_devices.json
 gw_commands.json
 
 # 일별 리포트 출력물 (재생성 가능)

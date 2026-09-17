@@ -114,7 +114,8 @@ sudo systemctl restart emfit && sleep 5 && systemctl is-active emfit
 ### 5-1. 커밋 금지
 [.gitignore](.gitignore) 에 적힌 것은 **환자 건강 데이터이거나 비밀 정보**다 — `*_data.jsonl`,
 `*_리포트.csv`, `device_tokens.json`, `view_tokens.json`, `admin_password.txt`, `mckare_apikey.txt`,
-`discord_config.json`, `discord_bot_token.txt`, `*firebase-adminsdk*.json`, `mckare_images/`, `logs/`.
+`discord_config.json`, `discord_bot_token.txt`, `*firebase-adminsdk*.json`, `mckare_images/`, `logs/`,
+`retired_devices.json`.
 새 비밀·데이터 파일을 만들면 같은 커밋에서 `.gitignore` 에 먼저 추가한다.
 운영 호스트·IP·계정·대상자·시설·실기기 식별자도 공개 문서나 소스 예시에 직접 적지 않고,
 환경변수·gitignore 대상 설정 파일 또는 명확한 예시 플레이스홀더를 사용한다.
@@ -144,8 +145,13 @@ CHANGELOG 는 "무엇을 고쳤는지"와 함께 **왜 그렇게 판단했는지
 - 조용한 것만으로 경고하지 않는다 (하루 종일 안 쓰는 기기가 정상일 수 있다).
 
 ### 5-5. 사람이 손댄 데이터는 코드가 지우지 않는다
-퇴역 기기 정리(`_RETIRED_SNS`, [analyzer.py:59](analyzer.py#L59))는 **기본 등록 상태 그대로일 때만** 제거한다.
+퇴역 기기 정리(`_RETIRED_SNS`)는 **기본 등록 상태 그대로일 때만** 제거한다.
 이름·위치를 고쳤거나 배정 이력이 갈라졌다면 사람이 의미를 부여한 기록이므로 남기고, 사용자가 직접 정리하게 한다.
+
+⚠️ `_RETIRED_SNS` 는 기록이 아니라 **자동 등록을 막는 가드**다 (`_ensure_fsr_device` /
+`_ensure_garmin_device`). 비우면 로그에 옛 데이터가 남은 기기가 재파싱마다 되살아난다.
+SN 을 공개 저장소에 남기지 않으려고 `retired_devices.json`(gitignore 대상)에서 읽으므로,
+**이 파일은 서버 이전·재설치 때 반드시 함께 옮긴다.**
 
 ### 5-6. 주석은 한국어로, "왜"를 남긴다
 기존 코드의 주석 밀도·어조를 따른다. 무엇을 하는지보다 **왜 그 선택인지, 무엇을 피하려는지**를 적는다

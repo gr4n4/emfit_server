@@ -44,10 +44,33 @@ _FSR_DEVICE_DEFAULTS = {}
 #    이름·위치를 고쳤거나 배정 이력이 갈라졌다면 그건 사람이 의미를 부여한 기록이고,
 #    코드가 임의로 지울 대상이 아니다. 그 경우엔 화면에 남고 사용자가 직접 정리하면 된다.
 # 값 = 시드 당시 이름. 그 이름·기본 위치 그대로일 때만 지운다(사람이 손댄 건 보존).
-# 값이 None 이면 강제 제거 — 이름·위치를 바꿨더라도 지운다.
+# 값이 null 이면 강제 제거 — 이름·위치를 바꿨더라도 지운다.
 #   ⚠️ 강제는 "사용자가 이 기기를 명시적으로 없애라고 한 경우"에만 쓴다.
 #      측정 데이터가 있는 기기를 강제로 빼면 과거 기록이 Unknown(SN) 으로 표시된다.
-_RETIRED_SNS = {}
+#
+# 목록은 코드가 아니라 파일에서 읽는다 — 실기기 SN 이라 공개 저장소에 남기지 않기 위함
+# (device_info.json·assignments.json 과 같은 취급: gitignore 대상 운영 파일).
+#   retired_devices.json 예시:  {"OLD-SN-0001": "옛 이름", "TEST-BOARD": null}
+#
+# ⚠️ 이 목록이 비면 _ensure_fsr_device / _ensure_garmin_device 의 재등록 방지가 풀린다.
+#    로그 파일에 옛 데이터가 남아 있으면 재파싱 때마다 그 기기가 되살아나므로,
+#    한 번 정리한 기기가 있는 서버에서는 이 파일을 반드시 유지해야 한다.
+_RETIRED_SNS_FILE = "retired_devices.json"
+
+
+def _load_retired_sns():
+    if not os.path.exists(_RETIRED_SNS_FILE):
+        return {}   # 정리할 게 없는 새 설치 — 빈 목록이 맞다
+    try:
+        with open(_RETIRED_SNS_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[analyzer] {_RETIRED_SNS_FILE} 로드 실패 — 퇴역 기기 정리를 건너뜁니다: {e}", flush=True)
+        return {}
+
+
+_RETIRED_SNS = _load_retired_sns()
 
 # 기기 종류(kind) — 대시보드가 어느 섹션에 넣을지 판단하는 값.
 # ⚠️ 종류를 SN 모양으로 추측하면 안 된다. ESP32 의 MAC 도 12자리 16진수라
@@ -421,7 +444,7 @@ for _sn, _seeded_name in _RETIRED_SNS.items():
         print(f"[analyzer] 퇴역 기기 정리: {_sn} ({_seeded_name}) — 기본 등록 상태라 목록에서 제거", flush=True)
     else:
         print(f"[analyzer] 퇴역 기기 {_sn} 은 수정 이력이 있어 그대로 둔다 "
-              f"— 지우려면 _RETIRED_SNS 값을 None 으로", flush=True)
+              f"— 지우려면 {_RETIRED_SNS_FILE} 에서 그 SN 의 값을 null 로", flush=True)
 
 _assigned_sns = {a.get("sn") for a in ASSIGNMENTS}
 for _sn, _info, _kind in ([(s, i, None) for s, i in _RADAR_DEVICE_DEFAULTS.items()]

@@ -3,7 +3,7 @@
 EMFIT QS · AI Radar · McKare · 돌봄기기 사용감지(FSR) · Garmin 워치 다섯 종류 데이터를
 수집·관제하고 리포트·알림을 제공하는 서버의 운영 및 사용 문서.
 
-> 기준 버전 **v3.21.1** (2026-09-14). 기술 변경 내역은 [CHANGELOG.md](CHANGELOG.md),
+> 기준 버전 **v3.21.2** (2026-09-17). 기술 변경 내역은 [CHANGELOG.md](CHANGELOG.md),
 > 개발 여정 요약은 [VERSION_HISTORY.md](VERSION_HISTORY.md), 코드 작업 규칙은 [CLAUDE.md](CLAUDE.md) 참고.
 
 ---
@@ -447,6 +447,7 @@ du -h ~/emfit_server/*.jsonl                                            # 파일
 ├─ *_data.jsonl            # 기기별 수집 로그 (append-only)
 ├─ mckare_images/          # McKare 열화상 이미지 (+ mckare_image_log.jsonl 목록)
 ├─ device_info.json        # 현재 기기 등록 정보
+├─ retired_devices.json    # 퇴역 기기 SN — 재등록 방지 (없으면 가드 없음)
 ├─ assignments.json        # 기기 배정 이력
 ├─ discord_config.json     # 디스코드 Webhook·기준·채널 배정
 ├─ discord_alert_state.json# 끊김 알림을 이미 보낸 기기
@@ -629,7 +630,20 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/dashboard   # 200
 | McKare | `POST /mckare` 로 데이터가 오면 등록됨. 전용 대시보드 구역은 `/dashboard2` 에만 있다 |
 | **Garmin 워치** | 계정 토큰 폴더를 젯슨의 `~/.garmin_<계정>` 에 올리면, 다음 수집 주기에 `Garmin <계정>`으로 자동 등록된다 → `/devices`에서 이름·위치 지정 |
 
-`/devices` 에서 삭제는 안 된다. 쓰지 않는 기본 등록을 지우려면 `assignments.json` 에서 해당 줄을 지우고 재시작한다.
+`/devices` 에서 삭제는 안 된다. 카드에서만 감추려면 👁 아이콘(숨김)을 쓰고, 목록에서 아예 빼려면
+`assignments.json` 에서 해당 줄을 지운 뒤 **`retired_devices.json` 에 그 SN 을 추가**하고 재시작한다.
+
+```json
+// retired_devices.json — 값이 null 이면 강제 제거, 문자열이면 '시드 당시 이름 그대로일 때만' 제거
+{ "OLD-SN-0001": null, "TEST-BOARD": null }
+```
+
+> ⚠️ **이 파일을 빼먹으면 정리가 무효가 된다.** 사용감지·Garmin 은 로그에 옛 데이터가 남아 있으면
+> 재파싱 때마다 자동 등록이 다시 돌아서 죽은 카드가 되살아난다. 커밋 금지 대상이므로
+> 서버를 옮기거나 재설치할 때 백업에 꼭 포함한다.
+
+> 새로 설치하는 서버는 등록된 기기가 하나도 없는 상태로 시작한다. 사용감지·Garmin 은 데이터가
+> 오면 자동 등록되지만, **EMFIT·AI Radar 는 자동 등록 경로가 없어** `/devices` 에서 직접 등록해야 한다.
 
 ### 8.3 사용자 URL 발급
 
