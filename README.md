@@ -116,6 +116,6 @@ export EMFIT_ADMIN_USER="admin"
 
 ## 버전
 
-현재 **v3.21.0** · [SemVer](https://semver.org/lang/ko/) — MAJOR: 기존 사용 방식이 깨지는 변경 /
+현재 **v3.21.2** · [SemVer](https://semver.org/lang/ko/) — MAJOR: 기존 사용 방식이 깨지는 변경 /
 MINOR: 기능 추가 / PATCH: 버그·자잘한 수정. 코드를 고치면 `app.py` 의 `VERSION` 과
 `CHANGELOG.md` 를 **같이** 올린다.
