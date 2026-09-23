@@ -22,6 +22,11 @@ FastAPI 기반 통합 모니터링 서버다.
 | ESP32 압력 사용감지 (돌봄기기 부착) | `POST /jy01` | `fsr_data.jsonl` | [fsr_parser.py](fsr_parser.py) |
 | Garmin 워치 | 로컬 수집기가 `POST /garmin` | `garmin_data.jsonl` | [garmin_parser.py](garmin_parser.py) |
 
+그 밖에 **사무실 환경측정기**(자체 제작 ESP32 — 미세먼지·VOC·CO2)가 `POST /env` → `env_data.jsonl` 로 들어온다.
+돌봄 대상자 기기가 아니므로 **`DATA_FILES` 에 넣지 않고** analyzer 도 타지 않는다 — 기기 카드·배정 이력·
+리포트·끊김 알림과 완전히 분리돼 있고, 전용 화면 `/env-monitor` 에서만 읽는다. 위 5종과 같은 취급을 하면
+없는 대상자가 생긴다.
+
 **다루는 데이터는 환자 건강정보다.** 로그·리포트·토큰 파일을 커밋하거나 외부로 내보내지 않는다(§5-1).
 
 ---
@@ -66,7 +71,7 @@ sudo systemctl restart emfit && sleep 5 && systemctl is-active emfit
 
 ## 3. 코드 지도
 
-### [app.py](app.py) — 6,293줄 단일 파일 (FastAPI 앱 + 대시보드 HTML 인라인)
+### [app.py](app.py) — 7434줄 단일 파일 (FastAPI 앱 + 대시보드 HTML 인라인)
 | 라인 | 내용 |
 |---|---|
 | 1~120 | 인코딩 설정, `VERSION`, 파일 경로 상수, 쿠키·인증 상수 |
@@ -81,6 +86,7 @@ sudo systemctl restart emfit && sleep 5 && systemctl is-active emfit
 | 5230~5600 | **센서 수신 경로** — `/`(EMFIT), `/radar`, `/mckare`, 이미지, `/jy01`(FSR) |
 | 5600~6030 | FSR 게이트웨이 명령 큐(`gw_commands.json`), `/fsr-tune` 실시간 조정 화면 |
 | 6031~6300 | FSR 노드 원격 조정(`/fsr-nodes`) — ⚠️ 6031~6071 은 **과거 패치 안내 주석 잔재**이지 실행 코드가 아니다 |
+| 6763~끝 | **사무실 환경측정기** — `POST /env` 수신, 대시보드 구역(`_render_env_section`), 상세 화면 `/env-monitor`. 다른 기기와 코드·데이터가 겹치지 않는 독립 블록 |
 
 ### [analyzer.py](analyzer.py) — 1,245줄, 파싱·캐시·리포트
 - `ingest_realtime_record()` ([analyzer.py:535](analyzer.py#L535)) — 수신 즉시 현재 상태 캐시 갱신.

@@ -17,7 +17,7 @@ from nrcarec_alert import send_alert, should_send
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.21.2"
+VERSION = "3.22.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -724,13 +724,15 @@ threading.Thread(target=_discord_monitor_loop, daemon=True).start()
 @app.middleware("http")
 async def _maintenance_gate(request: Request, call_next):
     """워밍업이 안 끝났으면 점검 페이지(503)로 응답한다.
-    단, Emfit(POST /)·AI Radar(POST /radar)·McKare(POST /mckare)·FSR(POST /jy01)의
-    데이터 수신은 점검 중에도 받아 데이터 유실을 막는다."""
+    단, Emfit(POST /)·AI Radar(POST /radar)·McKare(POST /mckare)·FSR(POST /jy01)·
+    사무실 환경측정기(POST /env)의 데이터 수신은 점검 중에도 받아 데이터 유실을 막는다."""
     if not _SERVER_READY:
         # McKare 표준 경로는 여러 개라 아래 목록과 합쳐서 판단한다.
         # /garmin 도 포함 — 폴러가 워밍업 중에 보낸 데이터를 버리면 그 주기는 통째로
         # 유실된다 (다음 폴링까지 30~60분을 기다려야 한다).
-        receive_paths = ({"/", "/radar", "/jy01", "/garmin"}
+        # /env 도 포함 — 보드는 60초마다 한 번 쏘고 실패해도 다시 보내지 않는다.
+        # 워밍업이 몇 분이면 그만큼 오늘 그래프에 구멍이 난다.
+        receive_paths = ({"/", "/radar", "/jy01", "/garmin", "/env"}
                          | set(_MCKARE_PATHS) | set(_MCKARE_IMAGE_PATHS))
         if not (request.method == "POST" and request.url.path in receive_paths):
             return HTMLResponse(_maintenance_page_html(), status_code=503,
@@ -2162,6 +2164,9 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                 <div id="fsr-section">
                     {p['fsr_section']}
                 </div>
+                <div id="env-section">
+                    {_render_env_section()}
+                </div>
                 <div id="garmin-section">
                     {p['garmin_section']}
                 </div>
@@ -2175,6 +2180,7 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                     <a href="/help" style="display:inline-block; padding:10px 20px; background:#27ae60; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">📘 사용 가이드</a>
                     <a href="/fsr-nodes" style="display:inline-block; padding:10px 20px; background:#d35400; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🛏️ FSR 노드 설정</a>
                     <a href="/fsr-tune" style="display:inline-block; padding:10px 20px; background:#c0392b; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🎚️ FSR 실시간 튜닝</a>
+                    <a href="/env-monitor" style="display:inline-block; padding:10px 20px; background:#00897b; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🌡️ 사무실 환경모니터링</a>
                     <a href="/dashboard/raw" style="display:inline-block; padding:10px 20px; background:#7f8c8d; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🔎 원본 데이터</a>
                     <a href="/logout" style="display:inline-block; padding:10px 20px; background:#b0bec5; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🚪 로그아웃</a>
                 </p>
@@ -2195,6 +2201,10 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                         document.getElementById('emfit-section').innerHTML = d.emfit_section;
                         document.getElementById('radar-section').innerHTML = d.radar_section;
                         document.getElementById('fsr-section').innerHTML = d.fsr_section;
+                        try {{
+                            const e = await fetch('/api/env/section');
+                            if (e.ok) document.getElementById('env-section').innerHTML = await e.text();
+                        }} catch (err) {{}}
                         document.getElementById('garmin-section').innerHTML = d.garmin_section;
                         document.getElementById('header-summary').innerHTML = d.summary;
                         document.getElementById('clock').textContent = d.now;
@@ -6748,6 +6758,730 @@ async function load(){
 }
 load(); setInterval(load, 5000);
 </script></body></html>"""
+
+
+
+# ============================================================================
+#  사무실 환경모니터링 — 개인 제작 환경측정기(Env_v01) 수신·표시
+#
+#  보드: FireBeetle 2 ESP32-UE + PMS7003(미세먼지) · SGP40(VOC) · RX-9(CO2)
+#  보드가 60초마다 아래 JSON 을 POST /env 로 보낸다. 다른 기기들과 섞이지
+#  않도록 파일·화면을 따로 둔다 (돌봄기기 쪽 코드는 건드리지 않음).
+#
+#    {"deviceId":"env-F6803C","event":"env","seq":12,"ts":1790000000,
+#     "uptime":720,"every":60,"pm1":6,"pm25":9,"pm10":13,"n03":605,
+#     "voc":92,"co2":812,"rssi":-35,"fw":"v0.0.22"}
+#
+#  화면(/env-monitor)은 보드 LCD 보다 넓게 쓴다 — 미세먼지 3종(PM1.0·2.5·10)을
+#  모두 보여주고, 오늘 추이·7일 요약·시간별 표를 함께 둔다.
+#
+#  [색 규칙]
+#   · 등급 4색(파랑 좋음 / 초록 보통 / 주황 나쁨 / 빨강 매우나쁨)은 '상태' 색이다.
+#     보드 LCD 와 같은 값을 쓰고, 반드시 글자(좋음·보통…)와 같이 쓴다 — 색만으로
+#     뜻을 전하지 않는다. 주황과 빨강은 색맹 조건에서 구분이 약하기 때문.
+#   · 미세먼지 3종은 크기만 다른 같은 값이라 '한 색조의 밝기 3단계'로 그린다
+#     (PM10 밝음 → PM1.0 어두움). 범례와 직접 이름표를 같이 단다.
+#   · 등급 경계값은 펌웨어 MET[] 과 같은 값 — 한쪽을 고치면 양쪽 다 고쳐야 한다.
+# ============================================================================
+
+ENV_LOG_FILE = "env_data.jsonl"
+ENV_STALE_SEC = 300          # 이 시간 넘게 소식 없으면 '끊김'
+ENV_KEEP_LINES = 20000       # 화면 그릴 때 파일 끝에서 이만큼만 읽는다 (약 14일치)
+ENV_SLOTS = 288              # 하루를 5분 칸으로
+
+#            key     이름       단위     좋음  보통   나쁨   최소눈금
+ENV_METRICS = [
+    ("pm1",  "PM1.0", "㎍/㎥", None, None, None,   35),   # 공식 등급 기준 없음
+    ("pm25", "PM2.5", "㎍/㎥",   15,   35,   75,   35),
+    ("pm10", "PM10",  "㎍/㎥",   30,   80,  150,   80),
+    ("voc",  "VOC",   "index",   80,  150,  250,  200),
+    ("co2",  "CO2",   "ppm",    700,  999, 2000, 1200),
+]
+ENV_GRADED = ["pm25", "pm10", "voc", "co2"]
+
+ENV_GRADE_NAME  = ["좋음", "보통", "나쁨", "매우나쁨"]
+ENV_GRADE_ICON  = ["●", "●", "▲", "■"]           # 색과 별개로 모양도 다르게
+ENV_GRADE_COLOR = ["#1E90FF", "#2ECC71", "#FF9800", "#FF3B30"]
+ENV_GRADE_DIM   = ["#0A3259", "#104728", "#593500", "#591511"]
+ENV_GRADE_TINT  = ["#D6E9FF", "#D7F5E4", "#FFE8C7", "#FFD9D6"]   # 흰 바탕용 옅은 등급 색
+ENV_DUST_COLOR  = {"pm10": "#7DD3FC", "pm25": "#38A8E0", "pm1": "#1E6FB8"}   # 밝기 3단계
+ENV_ACCENT      = {"voc": "#38A8E0", "co2": "#7DD3FC"}
+
+ENV_BG, ENV_CARD, ENV_LINE = "#0b0d10", "#161a20", "#242a33"
+ENV_GRID, ENV_DIM, ENV_TXT = "#39414d", "#8a93a0", "#f2f5f8"
+
+
+def _env_grade(t1, t2, t3, v):
+    """값 → 등급 0~3. 값이 없거나 기준이 없으면 -1 (펌웨어 gradeOf 와 같은 규칙)"""
+    if v is None or t1 is None:
+        return -1
+    if v <= t1:
+        return 0
+    if v <= t2:
+        return 1
+    if v <= t3:
+        return 2
+    return 3
+
+
+def _env_met(key):
+    for m in ENV_METRICS:
+        if m[0] == key:
+            return m
+    return None
+
+
+def _env_num(rec, key):
+    v = rec.get(key)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f < 0 else f
+
+
+def _env_dt(rec):
+    """기록 시각(KST). 보드가 보낸 ts 를 먼저 쓰고, 없으면 서버가 받은 시각"""
+    ts = rec.get("ts")
+    if isinstance(ts, (int, float)) and ts > 1600000000:
+        return datetime.fromtimestamp(ts, KST)
+    return _parse_kst_dt(rec.get("server_received_at"))
+
+
+def _env_read(days=7):
+    """최근 days 일치 기록을 [(시각, 기록)] 으로. 파일 끝쪽만 읽는다"""
+    if not os.path.exists(ENV_LOG_FILE):
+        return []
+    try:
+        with open(ENV_LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-ENV_KEEP_LINES:]
+    except Exception:
+        return []
+    cutoff = datetime.now(KST) - timedelta(days=days)
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        dt = _env_dt(rec)
+        if dt is None or dt < cutoff:
+            continue
+        out.append((dt, rec))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _env_today_series(rows, key):
+    """오늘 0시부터 5분에 한 칸(288칸) 평균. 값이 없는 칸은 None"""
+    today = datetime.now(KST).date()
+    acc = [[] for _ in range(ENV_SLOTS)]
+    for dt, rec in rows:
+        if dt.date() != today:
+            continue
+        v = _env_num(rec, key)
+        if v is None:
+            continue
+        acc[min(ENV_SLOTS - 1, (dt.hour * 3600 + dt.minute * 60 + dt.second) // 300)].append(v)
+    return [round(sum(a) / len(a), 1) if a else None for a in acc]
+
+
+def _env_span(rows, key):
+    """[(시각, 기록)] 묶음 → (최저, 평균, 최고)
+
+    보드는 v0.0.23 부터 한 번 보낼 때 **그 60초 동안의 최저·최고**(`<키>_min`/`_max`)를
+    평균과 같이 보낸다. 그 값을 쓰면 7일 수염이 보드 화면과 같아진다 — 평균만 쓰면
+    20초쯤 튄 값이 60초 평균에 묻혀서 수염이 실제보다 짧게 나온다.
+    예전 펌웨어가 보낸 기록에는 그 항목이 없으므로 평균으로 대신한다."""
+    tot, n, mn, mx = 0.0, 0, None, None
+    for _dt, rec in rows:
+        v = _env_num(rec, key)
+        if v is None:
+            continue
+        lo = _env_num(rec, key + "_min")
+        hi = _env_num(rec, key + "_max")
+        lo = v if lo is None else lo
+        hi = v if hi is None else hi
+        tot += v
+        n += 1
+        mn = lo if mn is None else min(mn, lo)
+        mx = hi if mx is None else max(mx, hi)
+    return (mn, tot / n, mx) if n else (None, None, None)
+
+
+def _env_daily(rows, key, days=7):
+    """최근 days 일의 (날짜, 최저, 평균, 최고). 값 없는 날은 None 셋"""
+    today = datetime.now(KST).date()
+    buckets = {}
+    for r in rows:
+        buckets.setdefault(r[0].date(), []).append(r)
+    out = []
+    for i in range(days - 1, -1, -1):
+        d = today - timedelta(days=i)
+        mn, av, mx = _env_span(buckets.get(d, []), key)
+        out.append((d, mn, av, mx))
+    return out
+
+
+def _env_trend(ser, span=6):
+    """최근 30분 평균 vs 그 앞 30분 평균 → 1 오름 / -1 내림 / 0 그대로 / None 모름"""
+    vals = [(i, v) for i, v in enumerate(ser) if v is not None]
+    if len(vals) < span + 2:
+        return None
+    recent = [v for _i, v in vals[-span:]]
+    before = [v for _i, v in vals[-2 * span:-span]]
+    if not before:
+        return None
+    a, b = sum(recent) / len(recent), sum(before) / len(before)
+    if b == 0:
+        return 0
+    diff = (a - b) / abs(b)
+    return 1 if diff > 0.08 else (-1 if diff < -0.08 else 0)
+
+
+def _env_stat_line(rows, key):
+    """오늘 최저·평균·최고 — 5분 평균이 아니라 보드가 보낸 최저·최고 기준"""
+    mn, av, mx = _env_span(rows, key)
+    if av is None:
+        return "오늘 기록 없음"
+    return f"오늘 최저 {mn:g} · 평균 {av:.0f} · 최고 {mx:g}"
+
+
+# ---------------------------------------------------------------- 받기
+@app.post("/env")
+async def receive_env_data(request: Request):
+    """환경측정기가 60초마다 보내는 곳. 보드가 재전송할 수 있게 실패는 5xx 로 알린다"""
+    try:
+        data = await request.json()
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"invalid JSON: {e}"}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({"status": "error", "message": "JSON object required"}, status_code=400)
+
+    record = dict(data)
+    record["server_received_at"] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    record["data_source"] = "env"
+    try:
+        with open(ENV_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"log write failed: {e}"}, status_code=500)
+    return {"status": "success", "source": "env", "device": str(data.get("deviceId", ""))}
+
+
+# ---------------------------------------------------------------- 그림 조각
+def _env_segments(ser):
+    """값이 이어지는 구간만 [(칸번호, 값)] 묶음으로 — 끊긴 데는 선을 잇지 않는다"""
+    segs, cur = [], []
+    for i, v in enumerate(ser):
+        if v is None:
+            if len(cur) > 1:
+                segs.append(cur)
+            cur = []
+        else:
+            cur.append((i, v))
+    if len(cur) > 1:
+        segs.append(cur)
+    return segs
+
+
+def _env_area_svg(charts, top, cid, height=210, bands=None):
+    """오늘 0~24시 면 그래프. charts = [(이름, 색, 값목록)] — 앞엣것이 뒤에 깔린다.
+    bands: [(경계값, 등급)] 를 주면 등급 구간을 옅게 깔고 오른쪽에 이름을 적는다."""
+    W, H = 960, height
+    L, R, T, B = 8, 64, 14, 26          # 오른쪽은 등급 이름표 자리
+    pw, ph = W - L - R, H - T - B
+
+    def x(i):
+        return L + i * pw / (ENV_SLOTS - 1)
+
+    def y(v):
+        return T + ph - min(max(v, 0.0), top) * ph / top
+
+    p = []
+    # 등급 구간 — 배경에 아주 옅게. 색만으로 뜻을 전하지 않으려고 이름을 같이 적는다
+    if bands:
+        lo = 0.0
+        for edge, g in bands:
+            hi = min(float(edge), top)
+            if hi > lo:
+                p.append(f'<rect x="{L}" y="{y(hi):.1f}" width="{pw}" height="{y(lo) - y(hi):.1f}" '
+                         f'fill="{ENV_GRADE_DIM[g]}" opacity="0.5"/>')
+                if y(lo) - y(hi) > 13:
+                    p.append(f'<text x="{W - R + 6}" y="{(y(hi) + y(lo)) / 2 + 3.5:.1f}" fill="{ENV_DIM}" '
+                             f'font-size="10">{ENV_GRADE_NAME[g]}</text>')
+            lo = hi
+        if lo < top:
+            p.append(f'<rect x="{L}" y="{T}" width="{pw}" height="{y(lo) - T:.1f}" '
+                     f'fill="{ENV_GRADE_DIM[3]}" opacity="0.5"/>')
+            p.append(f'<text x="{W - R + 6}" y="{(T + y(lo)) / 2 + 3.5:.1f}" fill="{ENV_DIM}" '
+                     f'font-size="10">{ENV_GRADE_NAME[3]}</text>')
+
+    # 가로 눈금 (값)
+    for frac in (0.25, 0.5, 0.75, 1.0):
+        v = top * frac
+        p.append(f'<line x1="{L}" y1="{y(v):.1f}" x2="{W - R}" y2="{y(v):.1f}" stroke="{ENV_GRID}" '
+                 f'stroke-width="1" opacity="0.5"/>')
+        p.append(f'<text x="{L + 2}" y="{y(v) - 4:.1f}" fill="{ENV_DIM}" font-size="10">{v:.0f}</text>')
+
+    # 세로 눈금 (시각)
+    for hh in range(0, 25, 3):
+        xx = x(hh * 12)
+        p.append(f'<line x1="{xx:.1f}" y1="{T}" x2="{xx:.1f}" y2="{T + ph}" stroke="{ENV_GRID}" '
+                 f'stroke-width="1" opacity="0.35"/>')
+        p.append(f'<text x="{xx:.1f}" y="{H - 8}" fill="{ENV_DIM}" font-size="11" '
+                 f'text-anchor="middle">{hh}</text>')
+
+    defs = []
+    for idx, (name, color, ser) in enumerate(charts):
+        gid = f"g{cid}{idx}"
+        defs.append(f'<linearGradient id="{gid}" x1="0" y1="0" x2="0" y2="1">'
+                    f'<stop offset="0%" stop-color="{color}" stop-opacity="0.55"/>'
+                    f'<stop offset="100%" stop-color="{color}" stop-opacity="0.06"/></linearGradient>')
+        for seg in _env_segments(ser):
+            pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in seg)
+            p.append(f'<polygon points="{x(seg[0][0]):.1f},{y(0):.1f} {pts} {x(seg[-1][0]):.1f},{y(0):.1f}" '
+                     f'fill="url(#{gid})"/>')
+            p.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2" '
+                     f'stroke-linejoin="round" stroke-linecap="round"/>')
+        # 직접 이름표 — 마지막 값 옆에 (색만으로 구분하지 않게)
+        last = [(i, v) for i, v in enumerate(ser) if v is not None]
+        if last and len(charts) > 1:
+            i, v = last[-1]
+            p.append(f'<text x="{min(x(i) + 6, W - R - 2):.1f}" y="{y(v) - 5:.1f}" fill="{color}" '
+                     f'font-size="11" font-weight="bold">{name}</text>')
+
+    now = datetime.now(KST)
+    xn = x((now.hour * 60 + now.minute) // 5)
+    p.append(f'<line x1="{xn:.1f}" y1="{T}" x2="{xn:.1f}" y2="{T + ph}" stroke="{ENV_TXT}" '
+             f'stroke-width="1" opacity="0.35" stroke-dasharray="3 3"/>')
+    p.append(f'<line x1="{L}" y1="{T + ph}" x2="{W - R}" y2="{T + ph}" stroke="{ENV_GRID}" stroke-width="1"/>')
+    return (f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;display:block;overflow:visible" '
+            f'data-cid="{cid}" data-l="{L}" data-pw="{pw}">'
+            f'<defs>{"".join(defs)}</defs>{"".join(p)}'
+            f'<line class="cross" x1="0" y1="{T}" x2="0" y2="{T + ph}" stroke="{ENV_TXT}" '
+            f'stroke-width="1" opacity="0" pointer-events="none"/>'
+            f'<rect class="hit" x="{L}" y="{T}" width="{pw}" height="{ph}" fill="transparent"/></svg>')
+
+
+def _env_scale_svg(key, now_v, mn, avg, mx, numbers=False, light=False):
+    """등급 눈금 막대 — 보드 LCD 의 drawScale 과 같은 모양.
+
+      ▼                                  지금 값 (등급 색)
+      [좋음|보통  |나쁨    |매우나쁨   ]  등급 구간 (옅은 색)
+        ━━━━━━┿━━━━                      오늘 오간 범위, ┿ 는 평균
+        15    35        75               등급 경계값 (numbers 일 때)
+
+    눈금 끝은 '나쁨' 구간 폭만큼 '매우나쁨' 을 더 보여준 곳이다 (LCD 와 같은 계산).
+    그보다 큰 값은 끝에 붙는다 — 축을 값에 맞춰 늘이면 눈금이 매번 달라져 못 읽는다."""
+    _k, _n, _u, t1, t2, t3, _b = _env_met(key)
+    if t1 is None:
+        return ""                                   # PM1.0 은 등급 기준이 없다
+    W, BH = 300, 9
+    top = 7                                         # ▼ 자리
+    H = top + BH + 7 + (11 if numbers else 0)
+    smax = float(t3 + (t3 - t2))
+
+    def px(v):
+        return round(min(max(v, 0.0), smax) * (W - 1) / smax, 1)
+
+    band = ENV_GRADE_TINT if light else ENV_GRADE_DIM
+    ink  = "#5b6472" if light else ENV_DIM
+    edge = [0, t1, t2, t3, smax]
+    p = []
+    for i in range(4):
+        a, b = px(edge[i]), px(edge[i + 1])
+        p.append(f'<rect x="{a}" y="{top}" width="{max(b - a, 1)}" height="{BH}" fill="{band[i]}"/>')
+    if mn is not None and mx is not None:            # 오늘 오간 범위
+        a, b = px(mn), px(mx)
+        p.append(f'<rect x="{a}" y="{top + BH + 2}" width="{max(b - a, 2)}" height="2" fill="{ink}"/>')
+        if avg is not None:
+            p.append(f'<rect x="{px(avg)}" y="{top + BH}" width="1.4" height="6" fill="{ink}"/>')
+    if now_v is not None:                            # 지금 값
+        x = px(now_v)
+        c = ENV_GRADE_COLOR[_env_grade(t1, t2, t3, now_v)]
+        p.append(f'<rect x="{max(x - 0.8, 0)}" y="{top}" width="1.6" height="{BH}" fill="{c}"/>')
+        p.append(f'<polygon points="{x - 4},0 {x + 4},0 {x},5" fill="{c}"/>')
+    if numbers:
+        for t in (t1, t2, t3):
+            p.append(f'<text x="{px(t)}" y="{H - 1}" fill="{ink}" font-size="9" '
+                     f'text-anchor="middle">{t}</text>')
+    return (f'<svg viewBox="0 0 {W} {H}" preserveAspectRatio="none" '
+            f'style="width:100%;height:{H}px;display:block;overflow:visible">{"".join(p)}</svg>')
+
+
+def _env_spark_svg(ser, color, h=30, stretch=False):
+    """카드 안 작은 그래프 — 눈금 없이 모양만.
+    가로는 오늘 0~24시 고정이라 왼쪽부터 차오른다 (언제 일이 있었는지 위치로 보이게).
+    세로는 그 항목의 오늘 최저~최고에 맞춘다 — 작은 그림이라 절대값보다 모양이 중요하다.
+    stretch=True 면 카드 폭에 맞춰 늘린다. 선 굵기는 non-scaling-stroke 로 일정하게 둔다."""
+    W = ENV_SLOTS
+    size = ("width:100%%;height:%dpx" % h) if stretch else ("width:132px;height:%dpx" % h)
+    par = ' preserveAspectRatio="none"' if stretch else ''
+    head = '<svg viewBox="0 0 %d %d"%s style="%s;display:block">' % (W, h, par, size)
+    vals = [v for v in ser if v is not None]
+    if not vals:
+        return head + "</svg>"
+    lo, hi = min(vals), max(vals)
+    rng = (hi - lo) or 1.0
+
+    def y(v):
+        return round(h - 2 - (v - lo) * (h - 5) / rng, 1)
+
+    p = []
+    for seg in _env_segments(ser):
+        pts = " ".join("%.1f,%.1f" % (i, y(v)) for i, v in seg)
+        p.append('<polyline points="%s" fill="none" stroke="%s" stroke-width="1.8" '
+                 'stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>'
+                 % (pts, color))
+    last = [(i, v) for i, v in enumerate(ser) if v is not None]
+    if last:                                   # 지금 값 — 점 하나
+        i, v = last[-1]
+        p.append('<circle cx="%.1f" cy="%.1f" r="1.6" fill="%s" vector-effect="non-scaling-stroke"/>'
+                 % (i, y(v), color))
+    return head + "".join(p) + "</svg>"
+
+
+def _env_week_svg(rows, key, days=7):
+    """7일 막대 + 뼈다귀. 막대 = 그날 평균, 위아래 수염 = 그날 최저~최고"""
+    _k, _n, _u, t1, t2, t3, bar_min = _env_met(key)
+    data = _env_daily(rows, key, days)
+    vals = [d[3] for d in data if d[3] is not None]
+    top = max([float(bar_min)] + vals) if vals else float(bar_min)
+    W, H, T, B = 300, 132, 10, 26
+    ph = H - T - B
+    slot = W / days
+
+    def y(v):
+        return T + ph - min(max(v, 0.0), top) * ph / top
+
+    p = []
+    for t in (t1, t2, t3):
+        if t is not None and t < top:
+            p.append(f'<line x1="0" y1="{y(t):.1f}" x2="{W}" y2="{y(t):.1f}" stroke="{ENV_GRID}" '
+                     f'stroke-width="1" stroke-dasharray="3 3"/>')
+    p.append(f'<line x1="0" y1="{T + ph}" x2="{W}" y2="{T + ph}" stroke="{ENV_GRID}" stroke-width="1"/>')
+    for i, (d, mn, av, mx) in enumerate(data):
+        cx = slot * i + slot / 2
+        last = (i == len(data) - 1)
+        p.append(f'<text x="{cx:.1f}" y="{H - 10}" fill="{ENV_TXT if last else ENV_DIM}" font-size="11" '
+                 f'text-anchor="middle">{d.day}</text>')
+        if av is None:
+            p.append(f'<line x1="{cx - 5:.1f}" y1="{T + ph - 1}" x2="{cx + 5:.1f}" y2="{T + ph - 1}" '
+                     f'stroke="{ENV_GRID}" stroke-width="2"/>')
+            continue
+        ya, ymn, ymx = y(av), y(mn), y(mx)
+        g = _env_grade(t1, t2, t3, av)
+        c = ENV_GRADE_COLOR[g] if g >= 0 else ENV_DUST_COLOR["pm1"]
+        p.append(f'<rect x="{cx - 11:.1f}" y="{ya:.1f}" width="22" height="{max(T + ph - ya, 1):.1f}" '
+                 f'rx="4" fill="{c}"/>')
+        p.append(f'<line x1="{cx:.1f}" y1="{ymx:.1f}" x2="{cx:.1f}" y2="{ymn:.1f}" stroke="{ENV_BG}" '
+                 f'stroke-width="4"/>')
+        p.append(f'<line x1="{cx:.1f}" y1="{ymx:.1f}" x2="{cx:.1f}" y2="{ymn:.1f}" stroke="{ENV_TXT}" '
+                 f'stroke-width="1.6"/>')
+        for yy in (ymx, ymn):
+            p.append(f'<line x1="{cx - 6:.1f}" y1="{yy:.1f}" x2="{cx + 6:.1f}" y2="{yy:.1f}" '
+                     f'stroke="{ENV_TXT}" stroke-width="1.6"/>')
+        p.append(f'<title>{d.strftime("%m/%d")} 최저 {mn:g} · 평균 {av:.0f} · 최고 {mx:g}</title>')
+    return f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:auto;display:block">{"".join(p)}</svg>'
+
+
+def _env_grade_chip(g, small=False):
+    if g < 0:
+        return (f'<span style="color:{ENV_DIM}; font-size:{"0.75em" if small else "0.85em"};">'
+                f'기준 없음</span>')
+    c = ENV_GRADE_COLOR[g]
+    pad = "1px 7px" if small else "2px 10px"
+    return (f'<span style="display:inline-block; padding:{pad}; border-radius:999px; '
+            f'background:{ENV_GRADE_DIM[g]}; color:{c}; font-weight:bold; '
+            f'font-size:{"0.72em" if small else "0.82em"}; white-space:nowrap;">'
+            f'{ENV_GRADE_ICON[g]} {ENV_GRADE_NAME[g]}</span>')
+
+
+# ---------------------------------------------------------------- 대시보드 구역
+def _render_env_section():
+    rows = _env_read(days=1)
+    now = datetime.now(KST)
+    if not rows:
+        body = ('<p style="grid-column:1/-1; text-align:center; color:#90a4ae; padding:28px 10px; margin:0;">'
+                '아직 받은 데이터가 없습니다. 보드 시리얼에 <code>url ' + EXTERNAL_BASE + '/env</code> 를 넣어주세요.</p>')
+        head_right = "대기 중"
+    else:
+        dt, rec = rows[-1]
+        ago = int((now - dt).total_seconds())
+        live = ago <= ENV_STALE_SEC
+        head_right = ("🟢 " + _format_ago(ago)) if live else ("🔴 끊김 · " + _format_ago(ago))
+        series = {k: _env_today_series(rows, k) for k, *_r in ENV_METRICS}
+        today_rows = [r for r in rows if r[0].date() == now.date()]
+        tiles = []
+        for key, name, unit, t1, t2, t3, _bm in ENV_METRICS:
+            v = _env_num(rec, key)
+            g = _env_grade(t1, t2, t3, v)
+            c = ENV_GRADE_COLOR[g] if g >= 0 else ENV_DUST_COLOR.get(key, "#90a4ae")
+            tiles.append(f"""
+                <div style="background:#fafbfc; border-left:6px solid {c}; border-radius:10px; padding:10px 12px;">
+                    <div style="color:#78909c; font-size:0.78em;">{name} <span style="color:#b0bec5;">{unit}</span></div>
+                    <div style="font-size:1.7em; font-weight:bold; color:{c}; line-height:1.2;">{"--" if v is None else f"{v:g}"}</div>
+                    <div>{_env_grade_chip(g, small=True)}</div>
+                    <div style="margin-top:7px;">{_env_scale_svg(key, v, *_env_span(today_rows, key), light=True)}</div>
+                    <div style="margin-top:4px;">{_env_spark_svg(series[key], c, h=26, stretch=True)}</div>
+                    <div style="color:#b0bec5; font-size:0.68em; margin-top:1px;">오늘 0시 ~ 지금</div>
+                </div>""")
+        body = f"""
+            <a href="/env-monitor" style="grid-column:1/-1; text-decoration:none; color:inherit;">
+                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); gap:10px;">
+                    {''.join(tiles)}
+                </div>
+                <div style="margin-top:10px; color:#90a4ae; font-size:0.82em;">
+                    {html.escape(str(rec.get('deviceId', '')))} · 펌웨어 {html.escape(str(rec.get('fw', '')))}
+                    · 신호 {html.escape(str(rec.get('rssi', '')))}dBm · 눌러서 상세 보기 →
+                </div>
+            </a>"""
+    return f"""
+        <section style="margin-top:26px; padding:20px; background:#ffffff; border-radius:16px; border-top:5px solid #00897b; box-shadow:0 2px 8px rgba(0,0,0,0.05);">
+            <div style="display:flex; justify-content:space-between; align-items:flex-end; flex-wrap:wrap; gap:8px; margin-bottom:15px;">
+                <div>
+                    <h2 style="margin:0; color:#263238; font-size:1.35em;">🌡️ 사무실 환경모니터링</h2>
+                    <div style="margin-top:5px; color:#78909c; font-size:0.85em;">미세먼지(PM1.0·2.5·10) · VOC · CO2 — 60초마다 갱신</div>
+                </div>
+                <div style="color:#90a4ae; font-size:0.85em;">{head_right}</div>
+            </div>
+            <div style="display:grid; grid-template-columns:1fr; gap:15px;">{body}</div>
+        </section>
+    """
+
+
+@app.get("/api/env/section", response_class=HTMLResponse)
+def api_env_section(request: Request, _: str = Depends(require_admin)):
+    return _render_env_section()
+
+
+ENV_PAGE_JS = """
+<script>
+(function () {
+  const store = window.__ENV_CHARTS__ || {};
+  document.querySelectorAll('svg[data-cid]').forEach(svg => {
+    const cid = svg.dataset.cid, info = store[cid];
+    if (!info) return;
+    const L = +svg.dataset.l, PW = +svg.dataset.pw;
+    const cross = svg.querySelector('.cross'), hit = svg.querySelector('.hit');
+    const tip = document.getElementById('tip');
+    function at(evt) {
+      const r = svg.getBoundingClientRect();
+      const vb = svg.viewBox.baseVal;
+      const vx = (evt.clientX - r.left) * vb.width / r.width;
+      let i = Math.round((vx - L) / PW * (info.n - 1));
+      i = Math.max(0, Math.min(info.n - 1, i));
+      cross.setAttribute('x1', L + i * PW / (info.n - 1));
+      cross.setAttribute('x2', L + i * PW / (info.n - 1));
+      cross.setAttribute('opacity', '0.5');
+      const hh = String(Math.floor(i / 12)).padStart(2, '0');
+      const mm = String((i % 12) * 5).padStart(2, '0');
+      let rowsHtml = '';
+      info.series.forEach(s => {
+        const v = s.data[i];
+        rowsHtml += '<div style="display:flex;gap:8px;align-items:center;justify-content:space-between">'
+          + '<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'
+          + s.color + ';margin-right:6px"></span>' + s.name + '</span><b>'
+          + (v === null ? '--' : v) + ' ' + info.unit + '</b></div>';
+      });
+      tip.innerHTML = '<div style="color:#8a93a0;margin-bottom:4px">' + hh + ':' + mm + '</div>' + rowsHtml;
+      tip.style.display = 'block';
+      tip.style.left = Math.min(window.innerWidth - 170, evt.clientX + 14) + 'px';
+      tip.style.top = (evt.clientY + 14) + 'px';
+    }
+    hit.addEventListener('mousemove', at);
+    hit.addEventListener('mouseleave', () => {
+      cross.setAttribute('opacity', '0');
+      document.getElementById('tip').style.display = 'none';
+    });
+  });
+})();
+</script>
+"""
+
+
+# ---------------------------------------------------------------- 상세 화면
+@app.get("/env-monitor", response_class=HTMLResponse)
+def view_env_monitor(request: Request, _: str = Depends(require_admin)):
+    rows = _env_read(days=7)
+    now = datetime.now(KST)
+
+    if not rows:
+        return f"""<!doctype html><html><head><meta charset="utf-8"><title>사무실 환경모니터링</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:40px;background:{ENV_BG};color:{ENV_TXT};font-family:'Malgun Gothic',sans-serif;text-align:center">
+<h1 style="font-size:1.4em">🌡️ 사무실 환경모니터링</h1>
+<p style="color:{ENV_DIM}">아직 받은 데이터가 없습니다.<br><br>보드 시리얼 모니터에 아래 한 줄을 넣어주세요.</p>
+<p><code style="background:{ENV_CARD};padding:10px 14px;border-radius:8px;display:inline-block">url {EXTERNAL_BASE}/env</code></p>
+<p><a href="/dashboard" style="color:#64b5f6">← 관제 화면으로</a></p></body></html>"""
+
+    dt, rec = rows[-1]
+    ago = int((now - dt).total_seconds())
+    series = {k: _env_today_series(rows, k) for k, *_ in ENV_METRICS}
+    today_rows = [r for r in rows if r[0].date() == now.date()]
+
+    # ---- 전체 상태 (등급이 있는 항목 중 가장 나쁜 것) ----
+    worst, worst_name, worst_txt = -1, "", ""
+    for key in ENV_GRADED:
+        _k, name, unit, t1, t2, t3, _b = _env_met(key)
+        v = _env_num(rec, key)
+        g = _env_grade(t1, t2, t3, v)
+        if g > worst:
+            worst, worst_name, worst_txt = g, name, ("--" if v is None else f"{v:g}{unit}")
+    wc = ENV_GRADE_COLOR[worst] if worst >= 0 else ENV_DIM
+    wdim = ENV_GRADE_DIM[worst] if worst >= 0 else ENV_CARD
+
+    # ---- 값 카드 5장 ----
+    tiles = []
+    for key, name, unit, t1, t2, t3, _bm in ENV_METRICS:
+        v = _env_num(rec, key)
+        g = _env_grade(t1, t2, t3, v)
+        c = ENV_GRADE_COLOR[g] if g >= 0 else ENV_DUST_COLOR.get(key, ENV_DIM)
+        smn, sav, smx = _env_span(today_rows, key)
+        tr = _env_trend(series[key])
+        arrow = {1: "▲ 오르는 중", -1: "▼ 내리는 중", 0: "— 그대로"}.get(tr, "")
+        tiles.append(f"""
+        <div style="background:{ENV_CARD}; border:1px solid {ENV_LINE}; border-radius:14px; padding:16px 18px;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="color:{ENV_TXT}; font-weight:bold;">{name}
+              <span style="color:{ENV_DIM}; font-weight:normal; font-size:0.8em;">{unit}</span></span>
+            {_env_grade_chip(g, small=True)}
+          </div>
+          <div style="font-size:2.8em; font-weight:bold; color:{c}; line-height:1.1; margin:4px 0 0;">
+            {"--" if v is None else f"{v:g}"}</div>
+          <div style="color:{ENV_DIM}; font-size:0.78em; min-height:15px;">{arrow}</div>
+          <div style="margin-top:8px;">{_env_scale_svg(key, v, smn, sav, smx, numbers=True)}</div>
+          <div style="margin-top:8px;">{_env_spark_svg(series[key], c, stretch=True)}</div>
+          <div style="color:{ENV_DIM}; font-size:0.72em; margin-top:2px;">{_env_stat_line(today_rows, key)}</div>
+        </div>""")
+
+    # ---- 오늘 그래프 3개 ----
+    charts_js = {}
+
+    dust = [("PM10", ENV_DUST_COLOR["pm10"], series["pm10"]),
+            ("PM2.5", ENV_DUST_COLOR["pm25"], series["pm25"]),
+            ("PM1.0", ENV_DUST_COLOR["pm1"], series["pm1"])]
+    dust_vals = [v for _n, _c, s in dust for v in s if v is not None]
+    dust_top = max([50.0] + dust_vals)
+    dust_svg = _env_area_svg(dust, dust_top, "dust", 230)
+    charts_js["dust"] = {"n": ENV_SLOTS, "unit": "㎍/㎥",
+                         "series": [{"name": n, "color": c, "data": s} for n, c, s in dust]}
+
+    small = []
+    for key in ("voc", "co2"):
+        _k, name, unit, t1, t2, t3, bm = _env_met(key)
+        vals = [v for v in series[key] if v is not None]
+        top = max([float(bm)] + vals)
+        svg = _env_area_svg([(name, ENV_ACCENT[key], series[key])], top, key, 210,
+                            bands=[(t1, 0), (t2, 1), (t3, 2)])
+        charts_js[key] = {"n": ENV_SLOTS, "unit": unit,
+                          "series": [{"name": name, "color": ENV_ACCENT[key], "data": series[key]}]}
+        small.append(f"""
+        <div style="background:{ENV_CARD}; border:1px solid {ENV_LINE}; border-radius:14px; padding:16px 18px;">
+          <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px;">
+            <h3 style="margin:0; font-size:1em; color:{ENV_TXT};">{name} <span style="color:{ENV_DIM};
+              font-weight:normal; font-size:0.8em;">오늘 0~24시 · {unit}</span></h3>
+            <span style="color:{ENV_DIM}; font-size:0.78em;">{_env_stat_line(today_rows, key)}</span>
+          </div>
+          {svg}
+        </div>""")
+
+    # ---- 7일 ----
+    week = "".join(f"""
+        <div style="background:{ENV_CARD}; border:1px solid {ENV_LINE}; border-radius:14px; padding:14px 16px;">
+          <div style="color:{ENV_TXT}; font-weight:bold; font-size:0.92em; margin-bottom:6px;">{name}
+            <span style="color:{ENV_DIM}; font-weight:normal; font-size:0.85em;">{unit}</span></div>
+          {_env_week_svg(rows, key)}
+        </div>""" for key, name, unit, *_r in ENV_METRICS)
+
+    legend = " ".join(
+        f'<span style="display:inline-flex; align-items:center; gap:5px; color:{ENV_DIM}; font-size:0.8em;">'
+        f'<span style="color:{ENV_GRADE_COLOR[i]};">{ENV_GRADE_ICON[i]}</span>{ENV_GRADE_NAME[i]}</span>'
+        for i in range(4))
+    dust_legend = " ".join(
+        f'<span style="display:inline-flex; align-items:center; gap:5px; color:{ENV_DIM}; font-size:0.82em;">'
+        f'<span style="width:12px; height:3px; border-radius:2px; background:{ENV_DUST_COLOR[k]};'
+        f' display:inline-block;"></span>{n}</span>'
+        for k, n in (("pm10", "PM10"), ("pm25", "PM2.5"), ("pm1", "PM1.0")))
+
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>사무실 환경모니터링</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+ body {{ margin:0; padding:22px; background:{ENV_BG}; color:{ENV_TXT};
+        font-family:'Malgun Gothic', sans-serif; }}
+ a {{ color:#64b5f6; }}
+ h2 {{ font-size:1.05em; margin:30px 0 12px; color:{ENV_TXT}; }}
+ table {{ border-collapse:collapse; width:100%; font-size:0.85em; }}
+ tr:nth-child(even) {{ background:rgba(255,255,255,0.025); }}
+ #tip {{ position:fixed; display:none; z-index:9; background:#0f1318; border:1px solid {ENV_LINE};
+         border-radius:8px; padding:8px 10px; font-size:0.8em; pointer-events:none;
+         box-shadow:0 6px 20px rgba(0,0,0,0.5); min-width:130px; }}
+ @media (max-width:600px) {{ body {{ padding:12px; }} }}
+</style></head><body>
+<div id="tip"></div>
+<div style="max-width:1240px; margin:auto;">
+
+  <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+    <h1 style="margin:0; font-size:1.45em;">🌡️ 사무실 환경모니터링</h1>
+    <div style="color:{ENV_DIM}; font-size:0.85em;">
+      {dt.strftime('%m/%d %H:%M:%S')} · {_format_ago(ago)}{'' if ago <= ENV_STALE_SEC else ' · 끊김'}
+      · {html.escape(str(rec.get('deviceId','')))} · 펌웨어 {html.escape(str(rec.get('fw','')))}
+      · 신호 {html.escape(str(rec.get('rssi','')))}dBm
+      · 0.1L 당 입자 {html.escape(str(rec.get('n03','--')))}개
+    </div>
+  </div>
+
+  <div style="margin-top:14px; padding:18px 22px; border-radius:16px; background:{wdim};
+              border:1px solid {wc}33; display:flex; align-items:center; gap:18px; flex-wrap:wrap;">
+    <div style="font-size:2.2em; color:{wc};">{ENV_GRADE_ICON[worst] if worst >= 0 else '·'}</div>
+    <div>
+      <div style="color:{ENV_DIM}; font-size:0.8em;">지금 사무실 공기</div>
+      <div style="font-size:1.9em; font-weight:bold; color:{wc}; line-height:1.2;">
+        {ENV_GRADE_NAME[worst] if worst >= 0 else '값 없음'}</div>
+      <div style="color:{ENV_DIM}; font-size:0.82em;">가장 나쁜 항목 · {worst_name} {worst_txt}</div>
+    </div>
+    <div style="margin-left:auto; display:flex; gap:14px; flex-wrap:wrap;">{legend}</div>
+  </div>
+
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:14px; margin-top:16px;">
+    {''.join(tiles)}
+  </div>
+
+  <h2>오늘 미세먼지 <span style="color:{ENV_DIM}; font-weight:normal; font-size:0.82em;">
+      0~24시 · 입자가 큰 것부터 쌓아 그렸습니다 (PM10 ⊃ PM2.5 ⊃ PM1.0)</span></h2>
+  <div style="background:{ENV_CARD}; border:1px solid {ENV_LINE}; border-radius:14px; padding:16px 18px;">
+    <div style="display:flex; gap:16px; margin-bottom:8px;">{dust_legend}</div>
+    {dust_svg}
+  </div>
+
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(420px, 1fr)); gap:14px; margin-top:14px;">
+    {''.join(small)}
+  </div>
+
+  <h2>최근 7일 <span style="color:{ENV_DIM}; font-weight:normal; font-size:0.82em;">
+      막대 = 그날 평균, 위아래 수염 = 그날 최저~최고</span></h2>
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:14px;">
+    {week}
+  </div>
+
+  <p style="text-align:center; margin-top:28px;">
+    <a href="/dashboard" style="display:inline-block; padding:10px 22px; background:#2b333d; color:#fff;
+       text-decoration:none; border-radius:8px; font-weight:bold;">← 관제 화면으로</a>
+  </p>
+  <p style="text-align:center; color:#5c6068; font-size:0.75em;">
+    30초마다 자동 갱신 · 보드는 60초마다 보냅니다 · 그래프 위에 마우스를 올리면 그 시각 값이 나옵니다</p>
+</div>
+<script>window.__ENV_CHARTS__ = {json.dumps(charts_js, ensure_ascii=False)};</script>
+{ENV_PAGE_JS}
+<script>setTimeout(() => location.reload(), 30000);</script>
+</body></html>"""
 
 
 if __name__ == "__main__":
