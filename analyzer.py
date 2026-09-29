@@ -1177,6 +1177,10 @@ def warmup(jsonl_path):
         print(f"[analyzer] 워밍업 실패: {e}", flush=True)
 
 
+# CSV 맨 위로 올릴 '하루 요약' 행의 유형. 기기마다 이름이 달라 한곳에 모아둔다.
+_REPORT_TOP_TYPES = ("Summary", "Garmin일별")
+
+
 def get_report_df(jsonl_path, date_str, device_sn, assignment_id=None):
     storage = _load_storage(jsonl_path)
     records = storage.get((device_sn, date_str), [])
@@ -1196,8 +1200,14 @@ def get_report_df(jsonl_path, date_str, device_sn, assignment_id=None):
 
     df = df.sort_values(by="시간(KST)")
 
-    # Summary(수면종료요약) 행을 맨 위로 올린다. 그날의 수면점수/총수면 등을 한눈에 보기 위함.
-    summary_mask = df["유형"] == "Summary"
+    # 하루 요약 행을 맨 위로 올린다. 그날의 수면점수/총수면 등을 한눈에 보기 위함.
+    #
+    # ⚠️ Garmin일별도 같이 올린다. 이 행은 하루 딱 1건인데 23:59:59 로 찍혀서
+    #    시각순 정렬에서는 심박 시계열 수백 줄 **맨 아래**에 묻힌다. 안정시심박·
+    #    걸음수·수면점수 같은 19개 컬럼이 오직 이 한 줄에만 있어서, 위로 올리지
+    #    않으면 위쪽 행만 보고 "값이 아예 안 들어온다"고 오해하게 된다
+    #    (2026-09-29 실제로 그렇게 보고됨).
+    summary_mask = df["유형"].isin(_REPORT_TOP_TYPES)
     if summary_mask.any():
         df = pd.concat([df[summary_mask], df[~summary_mask]], ignore_index=True)
 
