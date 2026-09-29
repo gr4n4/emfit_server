@@ -17,7 +17,7 @@ from nrcarec_alert import send_alert, should_send
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.25.0"
+VERSION = "3.26.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -2148,6 +2148,7 @@ def _v2_page(p):
       <div class="v2nl">모니터링</div>
       <a class="v2ni on"><svg><use href="#i-grid"/></svg>통합 현황</a>
       <a class="v2ni" href="/view"><svg><use href="#i-place"/></svg>장소별 보기</a>
+      <a class="v2ni" href="/day"><svg><use href="#i-clock"/></svg>하루 일과표</a>
       <div class="v2nl">관리</div>
       <a class="v2ni" href="/devices"><svg><use href="#i-cog"/></svg>장비 관리</a>
       <a class="v2ni" href="/admin/discord"><svg><use href="#i-cog"/></svg>디스코드 알림</a>
@@ -2240,6 +2241,7 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                     <a href="/fsr-nodes" style="display:inline-block; padding:10px 20px; background:#d35400; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🛏️ FSR 노드 설정</a>
                     <a href="/fsr-tune" style="display:inline-block; padding:10px 20px; background:#c0392b; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🎚️ FSR 실시간 튜닝</a>
                     <a href="/env-monitor" style="display:inline-block; padding:10px 20px; background:#00897b; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🌡️ 사무실 환경모니터링</a>
+                    <a href="/day" style="display:inline-block; padding:10px 20px; background:#c2543f; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🗓️ 하루 일과표</a>
                     <a href="/dashboard/raw" style="display:inline-block; padding:10px 20px; background:#7f8c8d; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🔎 원본 데이터</a>
                     <a href="/logout" style="display:inline-block; padding:10px 20px; background:#b0bec5; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🚪 로그아웃</a>
                 </p>
@@ -2606,6 +2608,134 @@ def _band_totals(bands):
         secs[b["label"]] = secs.get(b["label"], 0) + (b["end"] - b["start"])
         cnt[b["label"]] = cnt.get(b["label"], 0) + 1
     return secs, cnt
+
+
+def _fsr_day_intervals(sn, aid, date_str, now_ts=None, tz=KST):
+    """그 날짜의 사용 구간 목록과 하루 경계를 함께 돌려준다.
+
+    날짜별 합계와 시간대별 분포가 같은 계산을 두 번 하지 않도록 공통 입구로 뺐다.
+    반환: (구간목록, 하루시작 epoch, 하루끝 epoch). 데이터가 없으면 ([], None, None)."""
+    if now_ts is None:
+        now_ts = datetime.now().timestamp()
+    try:
+        df = analyzer.get_report_df(DATA_FILES, date_str, sn, assignment_id=aid)
+    except Exception:
+        return [], None, None
+    if df is None or df.empty or "사용중" not in df.columns:
+        return [], None, None
+    try:
+        day0 = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz)
+    except Exception:
+        return [], None, None
+
+    day_start = day0.timestamp()
+    day_end = day_start + 24 * 3600
+    events = []
+    for _, row in df.iterrows():
+        if row.get("유형") != "FSR":
+            continue
+        t = row.get("시간(KST)")
+        if not isinstance(t, str) or len(t) < 8:
+            continue
+        try:
+            ep = datetime.strptime(f"{date_str} {t}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz).timestamp()
+        except Exception:
+            continue
+        iu = row.get("사용중")
+        used = row.get("사용시간(ms)")
+        events.append({
+            "epoch": ep,
+            "in_use": bool(iu) if isinstance(iu, (bool, int, float)) and pd.notna(iu) else None,
+            "used_sec": float(used) / 1000 if isinstance(used, (int, float)) and pd.notna(used) else None,
+        })
+    events.sort(key=lambda e: e["epoch"])
+    return _fsr_intervals(events, day_start, day_end, now_ts), day_start, day_end
+
+
+# 야간으로 보는 시간대 — 이 사이의 이승은 돌봄자의 잠을 끊는다.
+FSR_NIGHT_FROM, FSR_NIGHT_TO = 22, 6
+
+
+def _is_night_hour(hour):
+    return hour >= FSR_NIGHT_FROM or hour < FSR_NIGHT_TO
+
+
+def _fsr_period_stats(sn, aid, dates, tz=KST, aid_for=None):
+    """날짜별·시간대별 이승 통계를 한 번에 낸다.
+
+    횟수와 사용시간을 함께 내는 이유: 같은 6회라도 '짧게 여러 번'과 '길게 몇 번'은
+    돌봄 부담이 다르다. 화면에서 둘을 바꿔 볼 수 있어야 한다.
+
+    ⚠️ 구간이 시간 경계를 넘을 때 —
+       **횟수는 시작한 시간대에 1회**로 세고(한 번의 이승을 두 번으로 세지 않게),
+       **시간은 시간대별로 쪼개어** 나눈다(그 시간에 실제로 쓰인 만큼만 잡히게).
+
+    aid_for(날짜) 를 주면 날짜마다 배정을 다시 판정한다. False 를 돌려주면 그 날은
+    이 가구 통계에서 빼고 '기록 없음'으로 남긴다 — 기기를 다른 집으로 옮긴 날의
+    사용량이 새 집 통계에 섞이면 안 된다(device_info vs assignments 분리와 같은 이유).
+
+    반환: {"daily": [{date, count, seconds}, ...] 오래된→최신,
+           "hourly": [{hour, count, seconds}, ...] 0~23,
+           "total_count", "total_seconds", "night_count", "night_seconds"}
+    """
+    now_ts = datetime.now().timestamp()
+    daily = []
+    hourly = [{"hour": h, "count": 0, "seconds": 0} for h in range(24)]
+    total_count = total_seconds = night_count = night_seconds = 0
+
+    for d in dates:
+        day_aid = aid_for(d) if aid_for else aid
+        if day_aid is False:
+            daily.append({"date": d, "count": 0, "seconds": 0, "no_data": True})
+            continue
+        intervals, day_start, _day_end = _fsr_day_intervals(sn, day_aid, d, now_ts, tz)
+        if day_start is None:
+            # 그 날 로그가 아예 없다 — '0회'가 아니라 '모름'이다(기기가 꺼져 있었을 수도 있다).
+            # 빼버리면 막대그래프 x축이 조용히 짧아져 "요즘 이승이 줄었다"는 착시를 만든다.
+            daily.append({"date": d, "count": 0, "seconds": 0, "no_data": True})
+            continue
+        day_count = 0
+        day_seconds = 0
+        for iv in intervals:
+            length = iv["end"] - iv["start"]
+            if length <= 0:
+                continue
+            day_count += 1
+            day_seconds += length
+
+            start_hour = int((iv["start"] - day_start) // 3600)
+            if 0 <= start_hour <= 23:
+                hourly[start_hour]["count"] += 1
+                if _is_night_hour(start_hour):
+                    night_count += 1
+
+            # 시간대별 사용시간 — 경계를 넘는 구간은 쪼개서 나눠 담는다
+            cur = iv["start"]
+            while cur < iv["end"]:
+                h = int((cur - day_start) // 3600)
+                if h < 0:
+                    cur = day_start
+                    continue
+                if h > 23:
+                    break
+                hour_end = day_start + (h + 1) * 3600
+                seg = min(iv["end"], hour_end) - cur
+                if seg > 0:
+                    hourly[h]["seconds"] += int(seg)
+                    if _is_night_hour(h):
+                        night_seconds += int(seg)
+                cur = hour_end
+
+        daily.append({"date": d, "count": day_count, "seconds": int(day_seconds), "no_data": False})
+        total_count += day_count
+        total_seconds += int(day_seconds)
+
+    daily.reverse()          # 오래된 → 최신 (그래프 x축 순서)
+    return {
+        "daily": daily, "hourly": hourly,
+        "total_count": total_count, "total_seconds": total_seconds,
+        "night_count": night_count, "night_seconds": night_seconds,
+    }
 
 
 def _fsr_daily_totals(sn, aid, dates, tz=KST):
@@ -7556,6 +7686,439 @@ def view_env_monitor(request: Request, _: str = Depends(require_admin)):
 <script>window.__ENV_CHARTS__ = {json.dumps(charts_js, ensure_ascii=False)};</script>
 {ENV_PAGE_JS}
 <script>setTimeout(() => location.reload(), 30000);</script>
+</body></html>"""
+
+
+# ============================================================================
+#  하루 일과표 — 한 가구의 하루를 시간축 하나에 겹쳐 본다
+#
+#  기존 화면은 기기 하나를 깊게 본다. 이 화면은 반대로 **한 가구에 속한 사람과
+#  기기를 같은 시간축에 나란히** 놓는다. 이승기기 사용은 한 사람의 상태가 아니라
+#  두 사람 사이에서 일어난 일이라, 사람 카드에 넣으면 절반만 맞기 때문이다.
+#
+#  가구는 새 개념을 만들지 않고 **등록 정보의 위치(location)로 묶는다.**
+#  기기 대수도 배정 이력도 그대로고, 묶는 일은 이 화면에서만 한다.
+# ============================================================================
+
+# 레인 블록 색. 순서가 그대로 범례 순서가 된다(누움→앉음→배회 처럼 읽히게).
+DAY_LANE_COLORS = {
+    # Garmin 수면 단계
+    "깊은수면": "#2a5f8f", "얕은수면": "#7ba7ce", "REM": "#a882c4", "각성": "#d9a441",
+    # EMFIT 침대 재실
+    "재실": "#9fb6cc",
+    # 라닉스 레이더 자세 — 자세마다 색을 달리 준다. 한 색으로 칠하면 5개 구간이
+    # 한 덩어리로 보여 "몇 시에 일어나 돌아다녔나"를 읽을 수 없다.
+    # 수면 단계 색과 겹치지 않는 색으로 고른다 — 범례에 같은 색이 두 이름으로 나오면
+    # 어느 레인 얘기인지 알 수 없다. 누움→앉음→배회→낙상 순으로 점점 뜨거워지게.
+    "누움": "#5b8fb0", "뒤척임": "#8fc0c9", "걸터앉음": "#86b3a2",
+    "앉음": "#6fa08b", "배회": "#cf7e59", "낙상": "#c2543f",
+}
+DAY_LANE_FALLBACK = "#9fb6cc"      # 펌웨어가 새 상태를 보내도 칸은 보이게
+
+# '사람이 그 자리에 없다'는 뜻의 라벨 — 칠하지 않고 빈칸으로 둔다.
+# 칠해버리면 침대에 누워 있던 시간과 나가 있던 시간이 구분되지 않는다.
+DAY_HIDDEN_LABELS = {"이탈", "자리비움", "감지 대기"}
+
+# 3시간 간격 눈금. f-string 밖에서 만들어 중괄호 이스케이프를 피한다(_V2_STYLE 과 같은 이유).
+_DAY_GRIDLINES = "".join(
+    f'<div class="gridline" style="left:{h / 24 * 100:.4f}%"></div>' for h in range(3, 24, 3))
+
+_DAY_STYLE = """
+*{box-sizing:border-box}
+body{margin:0; background:#eef1f5; color:#12181f; line-height:1.6;
+     font-family:'Malgun Gothic','Apple SD Gothic Neo',-apple-system,sans-serif;}
+.wrap{max-width:1180px; margin:0 auto; padding:26px 18px 60px;}
+h1{font-size:23px; margin:0; font-weight:700; letter-spacing:-.02em;}
+h2{font-size:17px; margin:0; font-weight:600;}
+.head{display:flex; align-items:center; gap:12px; margin-bottom:16px;}
+.sp{flex:1}
+.bar{display:flex; gap:7px; flex-wrap:wrap; align-items:center; margin-bottom:12px;}
+.chip{font-size:12.5px; border:1px solid #dbe1ea; background:#fff; color:#4a5568;
+      border-radius:999px; padding:5px 13px; text-decoration:none; display:inline-block;}
+.chip.on{background:#e4eef5; color:#1f5f8b; border-color:transparent; font-weight:600;}
+.chip:hover{border-color:#1f5f8b}
+.hint{font-size:11.5px; color:#78849a;}
+.card{background:#fff; border:1px solid #dbe1ea; border-radius:12px; padding:18px; margin-bottom:16px;
+      box-shadow:0 1px 2px rgba(18,24,31,.05);}
+
+.stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-bottom:22px;}
+.stat{border:1px solid #dbe1ea; border-radius:9px; padding:11px 13px; background:#f6f8fb;}
+.stat.hl{border-color:#c2543f; background:#fff;}
+.stat.hl .v{color:#c2543f}
+.stat .k{font-size:11px; color:#78849a; margin-bottom:3px;}
+.stat .v{font-size:22px; font-weight:700; line-height:1.15; font-variant-numeric:tabular-nums;}
+.stat .v span{font-size:11px; font-weight:400; color:#78849a; margin-left:3px;}
+.stat .d{font-size:10.5px; color:#78849a; margin-top:3px;}
+
+.tl-head{display:flex; font-size:10px; color:#78849a; margin-left:100px; margin-bottom:4px;
+         font-variant-numeric:tabular-nums;}
+.tl-head span{flex:1}
+.lane-row{display:flex; align-items:stretch; margin-bottom:7px;}
+.lane-row.lift{margin-top:14px; margin-bottom:18px;}
+.lane-name{width:100px; flex:none; font-size:12px; padding-right:10px; padding-top:4px; line-height:1.3;}
+.lane-name b{display:block; font-size:12.5px; font-weight:600;}
+.lane-name b.lift-t{color:#c2543f}
+.lane-name span{font-size:10.5px; color:#78849a;}
+.lane{position:relative; flex:1; height:30px; background:#e8edf3; border:1px solid #dbe1ea;
+      border-radius:5px; overflow:hidden;}
+.blk{position:absolute; top:0; bottom:0;}
+.gridline{position:absolute; top:0; bottom:0; width:1px; background:#dbe1ea; opacity:.7;}
+.empty{position:absolute; inset:0; display:grid; place-items:center; font-size:10.5px; color:#a3adbd;}
+.marklane{position:relative; flex:1; height:30px;}
+.mark{position:absolute; top:0; bottom:0; width:3px; background:#c2543f; border-radius:2px;}
+.mark.night{box-shadow:0 0 0 3px rgba(194,84,63,.18)}
+.marklab{position:absolute; top:-2px; font-size:9.5px; color:#c2543f; font-weight:600;
+         transform:translateX(-50%); white-space:nowrap; font-variant-numeric:tabular-nums;}
+.marklab.alt{top:15px}
+.marklab.r{transform:translateX(-100%)}
+.marklab.l{transform:none}
+.legend{display:flex; gap:14px; flex-wrap:wrap; margin-left:100px; font-size:11px; color:#78849a;}
+.legend span{display:flex; align-items:center; gap:5px;}
+.legend i{width:10px; height:10px; border-radius:2px; display:inline-block;}
+
+.chart-head{display:flex; align-items:center; gap:12px; margin-bottom:16px; flex-wrap:wrap;}
+.toggle{display:flex; border:1px solid #dbe1ea; border-radius:8px; overflow:hidden;}
+.tg{border:0; background:#fff; color:#4a5568; font-size:12.5px; padding:6px 16px; cursor:pointer;
+    font-family:inherit; font-weight:500;}
+.tg.on{background:#1f5f8b; color:#fff; font-weight:600;}
+.charts{display:grid; grid-template-columns:1fr 1fr; gap:22px;}
+.chart h5{margin:0 0 2px; font-size:13px; font-weight:600;}
+.chart .sub{font-size:11px; color:#78849a; margin-bottom:12px;}
+.bars{display:flex; align-items:flex-end; gap:2px; height:92px; border-bottom:1px solid #dbe1ea;}
+.bar{flex:1; background:#4d90c0; border-radius:2px 2px 0 0; position:relative; min-height:2px;}
+.bar.night{background:#c2543f}
+.bar.zero{background:#dbe1ea}
+/* 기록 없음 — 0회와 눈으로 구분돼야 한다. 기기가 꺼져 있던 날일 수 있다. */
+.bar.nodata{background:repeating-linear-gradient(45deg,#e8edf3 0 3px,#d3dae4 3px 6px)}
+.bar b{position:absolute; top:-14px; left:50%; transform:translateX(-50%); font-size:9px;
+       font-weight:600; color:#4a5568; white-space:nowrap; font-variant-numeric:tabular-nums;}
+.xaxis{display:flex; gap:2px; margin-top:5px; font-size:9px; color:#78849a;}
+.xaxis span{flex:1; text-align:center;}
+@media (max-width:760px){
+  .charts{grid-template-columns:1fr}
+  .tl-head,.legend{margin-left:0}
+  .lane-row{flex-direction:column}
+  .lane-name{width:auto; padding:0 0 3px;}
+}
+"""
+
+
+def _households():
+    """{위치: [SN, ...]} — 숨긴 기기는 뺀다. 위치가 없는 기기는 묶을 수 없으므로 제외."""
+    out = {}
+    for sn, info in analyzer.DEVICE_INFO.items():
+        if info.get("hidden"):
+            continue
+        loc = str(info.get("location") or "").strip()
+        if not loc or loc == "-":
+            continue
+        out.setdefault(loc, []).append(sn)
+    return dict(sorted(out.items()))
+
+
+def _day_device_bands(sn, date_str, tz=KST):
+    """그 날짜에 이 기기가 만든 상태 구간. 종류마다 뜻이 다르다.
+
+    emfit  → 재실 / 이탈 (움직임이 0이면 매트 위에 사람이 없다고 본다)
+    garmin → 수면 단계 (이미 구간으로 저장돼 있어 그대로 쓴다)
+    radar  → 자세
+    반환: (종류, [{label, start, end}, ...])
+    """
+    kind = _detail_kind(sn)
+    try:
+        df = analyzer.get_report_df(DATA_FILES, date_str, sn)
+    except Exception:
+        return kind, []
+    if df is None or df.empty:
+        return kind, []
+
+    def epoch_of(t):
+        try:
+            return datetime.strptime(f"{date_str} {t}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz).timestamp()
+        except Exception:
+            return None
+
+    if kind == "garmin":
+        # 수면 단계는 구간 그대로 저장돼 있다 — 시작 시각 + 지속(분).
+        bands = []
+        for _, row in df.iterrows():
+            if row.get("유형") != "Garmin수면단계":
+                continue
+            start = epoch_of(row.get("시간(KST)"))
+            mins = row.get("지속(분)")
+            if start is None or not isinstance(mins, (int, float)) or pd.isna(mins):
+                continue
+            bands.append({"label": str(row.get("수면단계") or "수면"),
+                          "start": int(start), "end": int(start + mins * 60)})
+        return kind, bands
+
+    samples = []
+    for _, row in df.iterrows():
+        t = row.get("시간(KST)")
+        if not isinstance(t, str) or len(t) < 8:
+            continue
+        ep = epoch_of(t)
+        if ep is None:
+            continue
+        if kind == "emfit":
+            act = row.get("활동량(ACT)")
+            if not isinstance(act, (int, float)) or pd.isna(act):
+                continue
+            samples.append((ep, "재실" if act >= 1 else "이탈"))
+        elif kind == "radar":
+            pos = row.get("자세")
+            if pos:
+                samples.append((ep, str(pos)))
+    if not samples:
+        return kind, []
+    day_end = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz).timestamp() + 24 * 3600
+    return kind, _sampled_bands(samples, _BAND_GAP_SEC.get(kind, 300),
+                                min(day_end, datetime.now().timestamp()))
+
+
+def _fmt_dur(seconds):
+    """초 → '1시간 24분' / '24분' / '40초'."""
+    s = int(seconds or 0)
+    if s <= 0:
+        return "0분"
+    if s < 60:
+        return f"{s}초"
+    h, m = divmod(s // 60, 60)
+    return f"{h}시간 {m}분" if h else f"{m}분"
+
+
+@app.get("/day", response_class=HTMLResponse)
+def view_day(request: Request, loc: str = Query(None), date: str = Query(None),
+             _: str = Depends(require_admin)):
+    """가구 하루 일과표."""
+    houses = _households()
+    if not houses:
+        return HTMLResponse("<p style='font-family:sans-serif;padding:40px'>"
+                            "묶을 가구가 없습니다. 기기 관리에서 위치를 지정해주세요.</p>")
+
+    loc = loc if loc in houses else next(iter(houses))
+    today = datetime.now(KST).date()
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d").date() if date else today
+    except ValueError:
+        day = today
+    date_str = day.isoformat()
+    day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=KST).timestamp()
+
+    # ── 레인 만들기 ──────────────────────────────────────────────
+    lanes, lift_sn = [], None
+    for sn in houses[loc]:
+        info = analyzer.DEVICE_INFO.get(sn) or {}
+        kind = _detail_kind(sn)
+        if kind == "fsr":
+            lift_sn = sn                      # 이승기기는 별도 레인으로 뺀다
+            continue
+        _k, bands = _day_device_bands(sn, date_str)
+        lanes.append({
+            "sn": sn, "name": str(info.get("name") or sn), "kind": kind,
+            "kind_label": {"emfit": "침대", "garmin": "워치",
+                           "radar": "레이더", "mckare": "레이더"}.get(kind, kind),
+            "bands": [b for b in bands if b["label"] not in DAY_HIDDEN_LABELS],
+        })
+    lanes.sort(key=lambda l: (l["kind"] != "emfit", l["name"]))
+
+    # ── 이승 통계 ────────────────────────────────────────────────
+    lifts, stats = [], None
+    if lift_sn:
+        def lift_aid_for(d):
+            """그 날 이 기기를 쓰던 배정 id. 다른 가구에 있던 날이면 False."""
+            try:
+                at = datetime.strptime(d, "%Y-%m-%d").replace(hour=12, tzinfo=KST)
+                a = analyzer.resolve_assignment(lift_sn, at)
+            except Exception:
+                return None
+            if str(a.get("location") or "").strip() != loc:
+                return False
+            return a.get("id")
+
+        aid_today = lift_aid_for(date_str)
+        if aid_today is not False:
+            intervals, ds, _de = _fsr_day_intervals(lift_sn, aid_today, date_str)
+            if ds is not None:
+                for iv in intervals:
+                    h = int((iv["start"] - ds) // 3600)
+                    lifts.append({"start": iv["start"], "end": iv["end"],
+                                  "night": _is_night_hour(h) if 0 <= h <= 23 else False})
+        recent = [(day - timedelta(days=i)).isoformat() for i in range(14)]
+        stats = _fsr_period_stats(lift_sn, None, recent, aid_for=lift_aid_for)
+
+    def pct(ts):
+        return max(0.0, min(100.0, (ts - day_start) / 864.0))      # 86400초 → 100%
+
+    # ── HTML ────────────────────────────────────────────────────
+    house_chips = "".join(
+        f'<a class="chip{" on" if h == loc else ""}" href="/day?loc={quote(h)}&date={date_str}">{html.escape(h)}</a>'
+        for h in houses)
+
+    _order = list(DAY_LANE_COLORS)
+    seen = sorted({b["label"] for ln in lanes for b in ln["bands"]},
+                  key=lambda lb: (_order.index(lb) if lb in _order else len(_order), lb))
+    legend_html = "".join(
+        f'<span><i style="background:{DAY_LANE_COLORS.get(lb, DAY_LANE_FALLBACK)}"></i>{html.escape(lb)}</span>'
+        for lb in seen)
+
+    lane_html = ""
+    for ln in lanes:
+        blocks = "".join(
+            f'<div class="blk" style="left:{pct(b["start"]):.3f}%;width:{max(pct(b["end"]) - pct(b["start"]), 0.2):.3f}%;'
+            f'background:{DAY_LANE_COLORS.get(b["label"], DAY_LANE_FALLBACK)}" title="{html.escape(b["label"])} '
+            f'{datetime.fromtimestamp(b["start"], KST):%H:%M}~{datetime.fromtimestamp(b["end"], KST):%H:%M}"></div>'
+            for b in ln["bands"])
+        lane_html += f"""
+        <div class="lane-row">
+          <div class="lane-name"><b>{html.escape(ln['name'])}</b><span>{ln['kind_label']}</span></div>
+          <div class="lane">{_DAY_GRIDLINES}{blocks or '<div class="empty">기록 없음</div>'}</div>
+        </div>"""
+
+    if lift_sn:
+        def _mark(i, lf):
+            x = pct(lf["start"])
+            # 라벨을 늘 가운데 맞추면 23시대 이승은 화면 밖으로 밀려 잘린다.
+            side = " r" if x > 92 else (" l" if x < 3 else "")
+            # 가까운 시각이 연달아 있으면 라벨이 겹친다 — 한 칸씩 위아래로 엇갈리게.
+            alt = " alt" if i % 2 else ""
+            return (f'<div class="mark{" night" if lf["night"] else ""}" style="left:{x:.3f}%" '
+                    f'title="{datetime.fromtimestamp(lf["start"], KST):%H:%M} · '
+                    f'{_fmt_dur(lf["end"] - lf["start"])}"></div>'
+                    f'<div class="marklab{alt}{side}" style="left:{x:.3f}%">'
+                    f'{datetime.fromtimestamp(lf["start"], KST):%H:%M}</div>')
+
+        marks = "".join(_mark(i, lf) for i, lf in enumerate(lifts))
+        today_sec = sum(lf["end"] - lf["start"] for lf in lifts)
+        lift_legend = '<span><i style="background:#c2543f"></i>이승</span>'
+        lift_row = f"""
+        <div class="lane-row lift">
+          <div class="lane-name"><b class="lift-t">이승기기</b><span>{len(lifts)}회 · {_fmt_dur(today_sec)}</span></div>
+          <div class="marklane">{marks or '<div class="empty">기록 없음</div>'}</div>
+        </div>"""
+    else:
+        lift_row = ('<p class="hint">이 가구에 등록된 이승기기(사용감지 센서)가 없습니다. '
+                    '기기 관리에서 위치를 이 가구로 맞추면 여기에 나옵니다.</p>')
+        lift_legend = ""
+        today_sec = 0
+
+    night_today = sum(1 for lf in lifts if lf["night"])
+    avg7, avg7_days = None, 0
+    if stats and stats["daily"]:
+        # 기록이 있는 날만 평균에 넣는다 — 기기가 꺼져 있던 날을 0회로 세면 평균이 가짜로 낮아진다.
+        last7 = [d for d in stats["daily"][-7:] if not d.get("no_data")]
+        avg7_days = len(last7)
+        if last7:
+            avg7 = sum(d["count"] for d in last7) / len(last7)
+
+    stat_html = f"""
+      <div class="stat hl"><div class="k">이승 횟수</div><div class="v">{len(lifts)}<span>회</span></div>
+        <div class="d">{f'7일 평균 {avg7:.1f}회 ({avg7_days}일)' if avg7 is not None else '비교할 이전 기록 없음'}</div></div>
+      <div class="stat"><div class="k">야간 이승 (22–06시)</div><div class="v">{night_today}<span>회</span></div>
+        <div class="d">돌봄자 수면이 끊기는 시각</div></div>
+      <div class="stat"><div class="k">오늘 총 사용시간</div><div class="v">{_fmt_dur(today_sec)}</div>
+        <div class="d">구간 {len(lifts)}개 합계</div></div>
+      <div class="stat"><div class="k">14일 누적</div>
+        <div class="v">{(stats or {}).get('total_count', 0)}<span>회</span></div>
+        <div class="d">{_fmt_dur((stats or {}).get('total_seconds', 0))}</div></div>"""
+
+    chart_data = json.dumps({
+        "hourly": (stats or {}).get("hourly", []),
+        "daily": (stats or {}).get("daily", []),
+    }, ensure_ascii=False)
+
+    prev_d = (day - timedelta(days=1)).isoformat()
+    next_d = (day + timedelta(days=1)).isoformat()
+
+    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<title>하루 일과표 · {html.escape(loc)}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{_DAY_STYLE}</style></head><body>
+<div class="wrap">
+  <div class="head">
+    <h1>하루 일과표</h1>
+    <span class="sp"></span>
+    <a class="chip" href="/dashboard">← 관제 화면</a>
+  </div>
+
+  <div class="bar">{house_chips}</div>
+  <div class="bar">
+    <a class="chip" href="/day?loc={quote(loc)}&date={prev_d}">◀ 어제</a>
+    <span class="chip on">{date_str}</span>
+    <a class="chip" href="/day?loc={quote(loc)}&date={next_d}">내일 ▶</a>
+    <span class="sp"></span>
+    <span class="hint">막대 위에 마우스를 올리면 그 시각 값이 나옵니다</span>
+  </div>
+
+  <div class="card">
+    <div class="stats">{stat_html}</div>
+
+    <div class="tl-head"><span>00</span><span>03</span><span>06</span><span>09</span>
+      <span>12</span><span>15</span><span>18</span><span>21</span></div>
+    {lane_html}
+    {lift_row}
+
+    <div class="legend">{legend_html}{lift_legend}</div>
+  </div>
+
+  <div class="card">
+    <div class="chart-head">
+      <h2>이승 통계</h2>
+      <div class="toggle">
+        <button class="tg on" data-metric="count">횟수</button>
+        <button class="tg" data-metric="seconds">시간</button>
+      </div>
+    </div>
+    <div class="charts">
+      <div class="chart">
+        <h5>시간대별</h5><div class="sub">최근 14일 합계 · 붉은 칸은 야간</div>
+        <div class="bars" id="barsHour"></div>
+        <div class="xaxis" id="axisHour"></div>
+      </div>
+      <div class="chart">
+        <h5>날짜별</h5><div class="sub">최근 14일</div>
+        <div class="bars" id="barsDay"></div>
+        <div class="xaxis" id="axisDay"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const DATA = {chart_data};
+const NIGHT = h => h >= 22 || h < 6;
+const fmt = (metric, v) => metric === 'count' ? (v ? v + '회' : '')
+      : (v ? (v >= 3600 ? (v/3600).toFixed(1) + '시간' : Math.round(v/60) + '분') : '');
+
+function draw(metric) {{
+  const hs = DATA.hourly || [], ds = DATA.daily || [];
+  const hMax = Math.max(1, ...hs.map(x => x[metric] || 0));
+  const dMax = Math.max(1, ...ds.map(x => x[metric] || 0));
+  document.getElementById('barsHour').innerHTML = hs.map(x => {{
+    const v = x[metric] || 0, h = v ? Math.max(4, v / hMax * 100) : 2;
+    return `<div class="bar ${{v ? (NIGHT(x.hour) ? 'night' : '') : 'zero'}}" style="height:${{h}}%"
+      title="${{String(x.hour).padStart(2,'0')}}시 · ${{x.count}}회 · ${{Math.round(x.seconds/60)}}분">
+      ${{v ? `<b>${{fmt(metric, v)}}</b>` : ''}}</div>`;
+  }}).join('');
+  document.getElementById('barsDay').innerHTML = ds.map(x => {{
+    const v = x[metric] || 0, h = v ? Math.max(4, v / dMax * 100) : 2;
+    const cls = x.no_data ? 'nodata' : (v ? '' : 'zero');
+    const tip = x.no_data ? `${{x.date}} · 기록 없음`
+          : `${{x.date}} · ${{x.count}}회 · ${{Math.round(x.seconds/60)}}분`;
+    return `<div class="bar ${{cls}}" style="height:${{h}}%" title="${{tip}}">
+      ${{v ? `<b>${{fmt(metric, v)}}</b>` : ''}}</div>`;
+  }}).join('');
+  document.getElementById('axisHour').innerHTML =
+    (DATA.hourly || []).map(x => `<span>${{x.hour % 3 === 0 ? x.hour : ''}}</span>`).join('');
+  document.getElementById('axisDay').innerHTML =
+    (DATA.daily || []).map((x, i) => `<span>${{i % 3 === 0 ? x.date.slice(8) : ''}}</span>`).join('');
+}}
+document.querySelectorAll('.tg').forEach(b => b.addEventListener('click', () => {{
+  document.querySelectorAll('.tg').forEach(x => x.classList.remove('on'));
+  b.classList.add('on');
+  draw(b.dataset.metric);
+}}));
+draw('count');
+</script>
 </body></html>"""
 
 
