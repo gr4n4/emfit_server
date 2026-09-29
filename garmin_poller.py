@@ -63,6 +63,10 @@ SLEEP_BETWEEN_ACCOUNTS = 0.5
 # 상태 파일에 날짜별 서명을 무한정 쌓지 않도록 정리하는 기준.
 STATE_KEEP_DAYS = 14
 
+# 서버가 아직 안 떴을 때(재시작 직후) 바로 포기하지 않고 기다려 본다.
+POST_RETRIES = 3
+POST_RETRY_DELAY = 10.0
+
 # user_summary 에서 가져갈 필드. 96개 중 쓰는 것만 골라 보낸다 —
 # 전부 보내면 로그가 몇 배로 커지고, 정작 파서는 아래 값만 쓴다.
 # (한국어 컬럼 매핑은 서버의 garmin_parser 가 한다. 여기서는 원본 이름 그대로 전달)
@@ -156,10 +160,11 @@ def save_state(state: dict) -> None:
 
 
 def prune_state(acct_state: dict, keep_dates: set) -> None:
-    sigs = acct_state.get("daily_sig") or {}
-    for d in list(sigs):
-        if d not in keep_dates:
-            del sigs[d]
+    for key in ("daily_sig", "hr_ts"):
+        block = acct_state.get(key) or {}
+        for d in list(block):
+            if d not in keep_dates:
+                del block[d]
 
 
 # ── 조회 ──────────────────────────────────────────────────────────────
@@ -334,15 +339,25 @@ def post_payload(server: str, payload: dict, dry_run: bool) -> bool:
         f"{server.rstrip('/')}/garmin", data=body, method="POST",
         headers={"Content-Type": "application/json"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as res:
-            return 200 <= res.status < 300
-    except urllib.error.HTTPError as e:
-        # 503 = 서버가 아직 로그 파싱(워밍업) 중. 수신 경로는 열려 있으므로 보통
-        # 여기까지 오지 않지만, 왔다면 다음 주기에 다시 보낸다 (상태를 갱신하지 않으므로).
-        print(f"    전송 실패 HTTP {e.code}: {str(e.reason)[:80]}", flush=True)
-    except Exception as e:  # noqa: BLE001
-        print(f"    전송 실패: {str(e)[:120]}", flush=True)
+    # 서버를 재시작한 직후에 폴러를 돌리면 uvicorn 이 아직 포트를 열기 전이라
+    # connection refused 가 난다. 몇 초만 기다리면 열리므로 그때는 다시 시도한다.
+    # HTTP 응답이 온 경우(4xx/5xx)는 서버가 살아 있다는 뜻이라 재시도하지 않는다.
+    for attempt in range(1, POST_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as res:
+                return 200 <= res.status < 300
+        except urllib.error.HTTPError as e:
+            # 503 = 서버가 아직 로그 파싱(워밍업) 중. 수신 경로는 열려 있으므로 보통
+            # 여기까지 오지 않지만, 왔다면 다음 주기에 다시 보낸다 (상태를 갱신하지 않으므로).
+            print(f"    전송 실패 HTTP {e.code}: {str(e.reason)[:80]}", flush=True)
+            return False
+        except Exception as e:  # noqa: BLE001
+            if attempt < POST_RETRIES:
+                print(f"    전송 실패({attempt}/{POST_RETRIES}), {POST_RETRY_DELAY:.0f}초 후 재시도: "
+                      f"{str(e)[:90]}", flush=True)
+                time.sleep(POST_RETRY_DELAY)
+                continue
+            print(f"    전송 실패: {str(e)[:120]}", flush=True)
     return False
 
 
@@ -376,20 +391,24 @@ def poll_account(token_dir: Path, dates: list[str], server: str,
         return False
 
     acct = state.setdefault(label, {})
-    last_hr_ts = float(acct.get("last_hr_ts") or 0)
     sigs = acct.setdefault("daily_sig", {})
+    # 심박 진행 표시는 **날짜별로** 둔다.
+    # 계정 하나로 관리하면(예전 방식) 앞 날짜 전송이 실패했는데 뒤 날짜가 성공했을 때
+    # 표시가 뒤 날짜까지 넘어가, 실패한 날의 심박이 '이미 보낸 것'이 되어 영영 안 간다.
+    # (2026-09-29 실제로 발생 — 서버 재시작 직후 첫 건이 connection refused)
+    hr_ts = acct.setdefault("hr_ts", {})
 
     sent = 0
     for i, date_str in enumerate(dates):
         fetched = fetch_date(api, label, date_str)
         payload, new_ts, new_sig = build_payload(
-            label, date_str, fetched, last_hr_ts, sigs.get(date_str)
+            label, date_str, fetched, float(hr_ts.get(date_str) or 0), sigs.get(date_str)
         )
         if payload is not None:
             if post_payload(server, payload, dry_run):
                 sent += 1
                 # 전송에 성공했을 때만 상태를 갱신한다 — 실패한 구간은 다음 주기에 다시 간다.
-                last_hr_ts = new_ts
+                hr_ts[date_str] = new_ts
                 if new_sig is not None:
                     sigs[date_str] = new_sig
         else:
@@ -398,7 +417,7 @@ def poll_account(token_dir: Path, dates: list[str], server: str,
         if i < len(dates) - 1:
             time.sleep(SLEEP_BETWEEN_DATES)
 
-    acct["last_hr_ts"] = last_hr_ts
+    acct.pop("last_hr_ts", None)   # 예전 계정 단위 표시 — 날짜별(hr_ts)로 옮겼다
     acct["last_poll"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     prune_state(acct, set(dates) | set(list(sigs)[-STATE_KEEP_DAYS:]))
 
