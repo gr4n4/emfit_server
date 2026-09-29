@@ -140,6 +140,13 @@ _SLEEP_SERIES_MAP = (
     ("stress", "스트레스",          _integer),
 )
 
+# 수면 단계 코드 → 이름.
+# ⚠️ 추측이 아니라 확인된 값이다 — 구간 길이를 코드별로 합산해 dailySleepDTO 의
+#    deepSleepSeconds/lightSleepSeconds/remSleepSeconds/awakeSleepSeconds 와 대조했고
+#    두 계정 모두 초 단위까지 일치했다 (2026-09-29 실측).
+#    건강 데이터라 라벨을 잘못 붙이면 분석이 통째로 틀어지므로 반드시 근거를 두고 매핑한다.
+_SLEEP_LEVEL_LABELS = {0: "깊은수면", 1: "얕은수면", 2: "REM", 3: "각성"}
+
 # 수면 — Emfit '수면종료요약' 행과 컬럼 이름을 맞춘다 (위 docstring 참고).
 _SLEEP_MAP = (
     ("총수면(분)",     "sleepTimeSeconds",       _minutes),
@@ -172,6 +179,36 @@ def _build_sleep_rows(series):
             by_minute.setdefault(minute, {})[col] = val
 
     return sorted(by_minute.items())
+
+
+def _build_sleep_levels(levels):
+    """수면 단계 구간 → [(시작 epoch초, {수면단계, 지속(분), 종료시각}), ...].
+
+    구간을 분 단위로 펼치지 않고 **구간 그대로** 남긴다. 펼치면 야간 시계열 행과
+    시각이 겹쳐 병합 처리가 필요해지고, 그 과정에서 기존 행이 가려질 위험이 생긴다.
+    구간으로 두면 '18:48~19:53 이 깊은수면'을 그대로 읽을 수 있고, 분 단위가 필요하면
+    분석할 때 펼치면 된다."""
+    if not isinstance(levels, (list, tuple)):
+        return []
+
+    out = []
+    for item in levels:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        start, end = _epoch_seconds(item[0]), _epoch_seconds(item[1])
+        code = _integer(item[2])
+        if start is None or end is None or code is None or end <= start:
+            continue
+        # 모르는 코드가 와도 버리지 않는다 — 새 단계가 생겼을 때 데이터를 잃지 않게.
+        label = _SLEEP_LEVEL_LABELS.get(code, f"단계{code}")
+        end_kst = datetime.fromtimestamp(end, UTC).astimezone(KST)
+        out.append((start, {
+            "수면단계": label,
+            "지속(분)": round((end - start) / 60, 1),
+            "단계종료": end_kst.strftime("%H:%M:%S"),
+        }))
+    out.sort(key=lambda x: x[0])
+    return out
 
 
 def _build_daily(summary, sleep):
@@ -247,6 +284,7 @@ def parse_garmin_payload(row):
 
     daily = _build_daily(row.get("summary"), row.get("sleep"))
     sleep_rows = _build_sleep_rows(row.get("sleep_series"))
+    sleep_levels = _build_sleep_levels(row.get("sleep_levels"))
 
     return {
         "sn": sn,
@@ -256,6 +294,7 @@ def parse_garmin_payload(row):
         "last_sync_ts": _epoch_from_gmt(row.get("last_sync_gmt")),
         "hr": hr,
         "sleep_rows": sleep_rows,
+        "sleep_levels": sleep_levels,
         "daily": daily,
         "daily_ts": _date_end_epoch(date_str) if daily else None,
         "auth_error": auth_error,

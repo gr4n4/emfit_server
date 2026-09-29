@@ -17,7 +17,7 @@ from nrcarec_alert import send_alert, should_send
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.23.0"
+VERSION = "3.24.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -899,7 +899,7 @@ def _is_garmin_device(sn, state=None, ds=None):
     올바른 섹션에 뜨게 하기 위함이다 (FSR 과 같은 이유)."""
     if (analyzer.DEVICE_INFO.get(sn) or {}).get("kind") == analyzer.KIND_GARMIN:
         return True
-    if isinstance(state, dict) and state.get("유형") in ("Garmin", "Garmin수면", "Garmin일별"):
+    if isinstance(state, dict) and state.get("유형") in ("Garmin", "Garmin수면", "Garmin수면단계", "Garmin일별"):
         return True
     if isinstance(ds, dict) and ds.get("source") == "garmin":
         return True
@@ -4009,7 +4009,7 @@ def _resolve_report_target(device, assignment):
 # 이것도 성격이 달라 파일을 나눈다. 분석할 때 섞여 있으면 오히려 다루기 어렵다.
 # Garmin 워치도 같은 이유로 '_Garmin' 꼬리표를 붙여 따로 뽑는다.
 RADAR_CSV_KINDS = [("bed", "Radar-BED"), ("fall", "Radar-FALL")]
-GARMIN_ROW_TYPES = {"Garmin", "Garmin수면", "Garmin일별"}
+GARMIN_ROW_TYPES = {"Garmin", "Garmin수면", "Garmin수면단계", "Garmin일별"}
 
 
 def _report_frames(date_str, sn, aid, kind=None):

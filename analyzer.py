@@ -516,6 +516,9 @@ def add_to_storage(storage, sn, ts, dtype, extra):
         elif dtype == "Garmin":
             # 워치 심박 시계열(2분 간격). 호흡·산소포화도는 일별 값이라 여기 없다.
             default_fields = {"심박수(HR)": None, "상태설명": ""}
+        elif dtype == "Garmin수면단계":
+            # 구간 한 개 = 한 행. 생체값이 아니라 '언제부터 언제까지 무슨 단계였나'다.
+            default_fields = {"상태설명": ""}
         elif dtype == "Garmin수면":
             # 수면 중에만 나오는 시계열. 어떤 항목이 오는지는 기기·계정마다 달라서
             # (HRV 가 없는 모델도 있다) 고정 칸을 만들지 않고 온 컬럼만 채운다.
@@ -863,6 +866,25 @@ def _store_garmin_record(storage, g):
         extra = dict(cols)
         extra["상태설명"] = "Garmin 수면중"
         add_to_storage(storage, sn, ts, "Garmin수면", extra)
+
+    # ── 수면 단계 구간 ──────────────────────────────────────────
+    # 야간 시계열과 **다른 유형으로** 저장한다. 같은 분에 심박 행이 이미 있어도
+    # 서로 건드리지 않게 하려는 것 — 한 유형에 합치면 중복 방어("이미 있는 시각은
+    # 건너뛰기")에 걸려 단계가 영영 안 붙는다.
+    seen_level_by_date = {}
+    for ts, cols in g.get("sleep_levels") or []:
+        date_key, time_str = _kst_parts(ts)
+        seen = seen_level_by_date.get(date_key)
+        if seen is None:
+            seen = {r.get("시간(KST)") for r in storage.get((sn, date_key), [])
+                    if r.get("유형") == "Garmin수면단계"}
+            seen_level_by_date[date_key] = seen
+        if time_str in seen:
+            continue
+        seen.add(time_str)
+        extra = dict(cols)
+        extra["상태설명"] = f"Garmin {cols.get('수면단계', '수면')}"
+        add_to_storage(storage, sn, ts, "Garmin수면단계", extra)
 
     # ── 일별 요약 ───────────────────────────────────────────────
     # 부분 동기화된 값(예: 오전 6시까지의 걸음 13)이 나중에 완전한 값으로 바뀐다.

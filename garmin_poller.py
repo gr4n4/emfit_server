@@ -38,7 +38,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -100,6 +100,11 @@ SLEEP_SERIES_SPEC = (
 )
 # sleepMovement(하루 263포인트)는 넣지 않는다 — 가장 크면서 EMFIT 활동량과 척도가 달라
 # 곧바로 비교되지 않는다. 필요해지면 위 목록에 한 줄 추가하면 된다.
+
+# 수면 단계 구간(sleepLevels) — 위 시계열과 달리 '시점+값'이 아니라 **구간**이다.
+# 시각도 epoch 이 아니라 ISO 문자열('2026-09-13T09:48:41.0', GMT)로 온다.
+# 밤당 4~13건이라 양은 적다.
+SLEEP_LEVEL_FIELD = "sleepLevels"
 
 
 # ── 계정·상태 ─────────────────────────────────────────────────────────
@@ -190,6 +195,7 @@ def fetch_date(api, label: str, date_str: str) -> dict:
         "summary": pick(summary, SUMMARY_FIELDS),
         "sleep": pick(sleep_dto, SLEEP_FIELDS),
         "sleep_series": extract_sleep_series(sleep_raw),
+        "sleep_levels": extract_sleep_levels(sleep_raw),
         "hr_values": (hr_raw or {}).get("heartRateValues") if isinstance(hr_raw, dict) else None,
         "last_sync_gmt": (summary or {}).get("wellnessEndTimeGmt") if isinstance(summary, dict) else None,
     }
@@ -220,6 +226,41 @@ def extract_sleep_series(sleep_raw) -> dict:
     return out
 
 
+def _iso_gmt_ms(value):
+    """'2026-09-13T09:48:41.0' (GMT) → epoch ms. 실패하면 None."""
+    if not isinstance(value, str) or not value:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.0", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    return None
+
+
+def extract_sleep_levels(sleep_raw) -> list:
+    """수면 단계 구간 → [[시작 epoch_ms, 끝 epoch_ms, 단계코드], ...].
+
+    ISO 문자열을 epoch 으로 바꿔 다른 시계열과 같은 모양으로 맞춘다 — 파서가 시각
+    해석을 한 곳에서만 하게 하려는 것이다.
+    단계코드는 그대로 넘긴다. 뜻(깊은수면/얕은수면/REM/각성)은 서버의 파서가 붙인다."""
+    if not isinstance(sleep_raw, dict):
+        return []
+    out = []
+    for item in sleep_raw.get(SLEEP_LEVEL_FIELD) or []:
+        if not isinstance(item, dict):
+            continue
+        start = _iso_gmt_ms(item.get("startGMT"))
+        end = _iso_gmt_ms(item.get("endGMT"))
+        level = item.get("activityLevel")
+        if start is None or end is None or level is None:
+            continue
+        out.append([start, end, level])
+    out.sort(key=lambda x: x[0])
+    return out
+
+
 def build_payload(label: str, date_str: str, fetched: dict,
                   last_hr_ts: float, prev_sig: str | None) -> tuple[dict | None, float, str | None]:
     """서버로 보낼 payload 를 만든다. 보낼 게 없으면 (None, ...) 을 돌려준다.
@@ -244,11 +285,14 @@ def build_payload(label: str, date_str: str, fetched: dict,
     # 매 폴링마다 보내면 같은 줄이 하루 48개씩 쌓인다.
     summary, sleep = fetched.get("summary") or {}, fetched.get("sleep") or {}
     series = fetched.get("sleep_series") or {}
+    levels = fetched.get("sleep_levels") or []
     sig = None
-    if summary or sleep or series:
+    if summary or sleep or series or levels:
         # 야간 시계열은 통째로 넣지 않고 '몇 개까지 왔는지'만 넣는다 — 서명은 상태 파일에
         # 저장되므로, 6KB 짜리 배열을 그대로 넣으면 날짜·계정마다 그만큼 쌓인다.
         series_mark = {k: [len(v), v[-1][0]] for k, v in series.items()}
+        if levels:
+            series_mark["lv"] = [len(levels), levels[-1][1]]
         sig = json.dumps({"s": summary, "z": sleep, "n": series_mark},
                          sort_keys=True, ensure_ascii=False)
     send_daily = bool(sig) and sig != prev_sig
@@ -270,6 +314,8 @@ def build_payload(label: str, date_str: str, fetched: dict,
         payload["sleep"] = sleep
         if series:
             payload["sleep_series"] = series
+        if levels:
+            payload["sleep_levels"] = levels
     return payload, max_ts, (sig if send_daily else prev_sig)
 
 
