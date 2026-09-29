@@ -17,7 +17,7 @@ from nrcarec_alert import send_alert, should_send
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.24.1"
+VERSION = "3.25.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -297,6 +297,65 @@ def _get_token_from_request(request: Request):
     if t:
         return t
     return request.cookies.get(ADMIN_COOKIE)
+
+
+# ── 로그인 시도 제한 ─────────────────────────────────────────────────
+# 비밀번호를 무제한으로 넣어볼 수 있으면, 자물쇠(HTTPS)를 채워도 정문이 열려 있는 셈이다.
+# 상태는 메모리에만 둔다 — 재시작으로 풀려도 '몇 번 더 시도할 수 있다'가 전부고,
+# 정상 사용자를 막는 쪽으로는 새지 않는다 (알림 규칙과 같은 방향).
+LOGIN_MAX_FAILS = 5        # 이만큼 틀리면
+LOGIN_LOCK_SEC = 300       # 5분 잠근다
+LOGIN_WINDOW_SEC = 600     # 10분 안에 쌓인 실패만 센다 (어제 오타까지 셈하지 않게)
+_login_fails = {}          # {ip: {"n": 실패수, "first": 처음 실패 시각, "until": 잠금 해제 시각}}
+_login_fails_lock = threading.Lock()
+
+
+def _client_ip(request: Request):
+    """실제 접속자 IP.
+
+    ⚠️ Caddy(HTTPS)를 거쳐 오면 접속자가 127.0.0.1 로 보이고 진짜 IP 는
+    X-Forwarded-For 에 담겨 온다. 그대로 request.client 를 쓰면 **모든 사용자가
+    같은 IP 로 묶여**, 한 명이 비번을 틀리면 전원이 잠긴다.
+    반대로 80 포트로 직접 들어온 요청은 헤더를 마음대로 꾸밀 수 있으므로 믿으면 안 된다.
+    그래서 **로컬에서 온 요청일 때만** 헤더를 신뢰한다."""
+    host = request.client.host if request.client else ""
+    if host in ("127.0.0.1", "::1", "localhost"):
+        fwd = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        if fwd:
+            return fwd
+    return host or "unknown"
+
+
+def _login_locked_sec(ip):
+    """남은 잠금 시간(초). 잠겨 있지 않으면 0."""
+    with _login_fails_lock:
+        rec = _login_fails.get(ip)
+        if not rec:
+            return 0
+        left = rec.get("until", 0) - time.time()
+        return int(left) if left > 0 else 0
+
+
+def _login_note_fail(ip):
+    now = time.time()
+    with _login_fails_lock:
+        rec = _login_fails.get(ip)
+        if not rec or now - rec.get("first", 0) > LOGIN_WINDOW_SEC:
+            rec = {"n": 0, "first": now, "until": 0}
+        rec["n"] += 1
+        if rec["n"] >= LOGIN_MAX_FAILS:
+            rec = {"n": 0, "first": now, "until": now + LOGIN_LOCK_SEC}
+        _login_fails[ip] = rec
+        # 메모리에만 두는 값이라 무한정 쌓이면 안 된다. 지난 기록은 정리한다.
+        if len(_login_fails) > 500:
+            for k in [k for k, v in _login_fails.items()
+                      if v.get("until", 0) < now and now - v.get("first", 0) > LOGIN_WINDOW_SEC]:
+                _login_fails.pop(k, None)
+
+
+def _login_note_success(ip):
+    with _login_fails_lock:
+        _login_fails.pop(ip, None)
 
 
 def _get_view_token_from_request(request: Request):
@@ -5607,11 +5666,27 @@ async def login_submit(request: Request):
     username = (form.get("username") or "").strip()
     password = form.get("password") or ""
     next_url = _safe_next(form.get("next") or "/dashboard")
-    if not _check_basic_credentials(username, password):
+
+    ip = _client_ip(request)
+    locked = _login_locked_sec(ip)
+    if locked:
         return HTMLResponse(
-            _login_page_html(error="아이디 또는 비밀번호가 올바르지 않습니다.", next_url=next_url),
+            _login_page_html(
+                error=f"로그인 시도가 너무 많아 잠시 막혀 있습니다. {locked // 60 + 1}분 뒤에 다시 시도해주세요.",
+                next_url=next_url),
+            status_code=429,
+        )
+
+    if not _check_basic_credentials(username, password):
+        _login_note_fail(ip)
+        left = LOGIN_MAX_FAILS - (_login_fails.get(ip, {}).get("n") or 0)
+        hint = f" (남은 시도 {left}회)" if 0 < left < LOGIN_MAX_FAILS else ""
+        return HTMLResponse(
+            _login_page_html(error=f"아이디 또는 비밀번호가 올바르지 않습니다.{hint}", next_url=next_url),
             status_code=401,
         )
+
+    _login_note_success(ip)
     resp = RedirectResponse(next_url, status_code=303)
     resp.set_cookie(
         SESSION_COOKIE,
