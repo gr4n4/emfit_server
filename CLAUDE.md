@@ -71,7 +71,7 @@ sudo systemctl restart emfit && sleep 5 && systemctl is-active emfit
 
 ## 3. 코드 지도
 
-### [app.py](app.py) — 8100여 줄 단일 파일 (FastAPI 앱 + 대시보드 HTML 인라인)
+### [app.py](app.py) — 8600여 줄 단일 파일 (FastAPI 앱 + 대시보드 HTML 인라인)
 | 라인 | 내용 |
 |---|---|
 | 1~120 | 인코딩 설정, `VERSION`, 파일 경로 상수, 쿠키·인증 상수 |
@@ -87,6 +87,7 @@ sudo systemctl restart emfit && sleep 5 && systemctl is-active emfit
 | 5600~6030 | FSR 게이트웨이 명령 큐(`gw_commands.json`), `/fsr-tune` 실시간 조정 화면 |
 | 6031~6300 | FSR 노드 원격 조정(`/fsr-nodes`) — ⚠️ 6031~6071 은 **과거 패치 안내 주석 잔재**이지 실행 코드가 아니다 |
 | 6763~끝 | **사무실 환경측정기** — `POST /env` 수신, 대시보드 구역(`_render_env_section`), 상세 화면 `/env-monitor`. 다른 기기와 코드·데이터가 겹치지 않는 독립 블록 |
+| 8150~끝 | **사람·가구 관제** `/dashboard3` — 위치 단위 카드(`_build_dash3_payload`, `_d3_row`), 확인 필요 띠(`_d3_attention` — 끊김·배터리는 `_discord_device_snapshot` 재사용), 가구 트리 |
 | 7690~끝 | **하루 일과표** `/day` — 가구 단위 시간축(`_households`, `_day_device_bands`, `DAY_LANE_COLORS`) + 이승 통계. FSR 구간·통계 계산은 `_fsr_day_intervals`([app.py:2613](app.py#L2613))·`_fsr_period_stats` 에 있다 |
 
 ### [analyzer.py](analyzer.py) — 1,245줄, 파싱·캐시·리포트
@@ -94,6 +95,9 @@ sudo systemctl restart emfit && sleep 5 && systemctl is-active emfit
   대시보드를 열지 않아도 디스코드 알림이 최신 상태를 보게 하는 핵심.
 - `warmup()` / `get_latest_states()` / `get_report_df()` / `list_available_assignments()` — 재시작 파싱, 카드 상태, CSV.
 - `resolve_assignment(sn, dt)` — 측정 시각을 배정 이력과 대조해 "그때 그 기기를 쓰던 사람"을 붙인다.
+⚠️ 상태 판정은 `_conn_view`·`_bed_status`·`_fsr_status`·`_garmin_status` **네 함수에만** 둔다.
+화면을 새로 만들 때 복사하지 말고 이 함수를 부른다 — 복사하면 한쪽만 고쳐져 화면과 알림이 어긋난다(§5-3).
+
 - `GROUPS` — 대상자 그룹 목록. 여기에만 추가하면 폼 선택지·검증에 자동 반영된다.
 
 ### 그 외

@@ -17,7 +17,7 @@ from nrcarec_alert import send_alert, should_send
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.26.0"
+VERSION = "3.27.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -1674,6 +1674,56 @@ def _v2_tint(status_label):
     }.get(status_label, "st-live")
 
 
+def _conn_view(ds, now_ts):
+    """연결 상태와 화면에 쓸 문구. 카드마다 같은 문장이 나와야 해서 한곳에 모았다.
+
+    connected 가 None 인 것과 False 인 것은 다르다 — '아직 모른다'와 '끊겼다'를
+    같은 문구로 쓰면 등록만 해둔 기기가 고장난 것처럼 보인다.
+    반환: (connected(True|False|None), seen_ago 문구|None, conn_txt)"""
+    if ds is None:
+        connected = None
+    elif ds.get("connected"):
+        connected = True
+    else:
+        connected = False
+    seen_ago = None
+    if ds and isinstance(ds.get("last_seen_ts"), (int, float)):
+        seen_ago = _format_ago(max(0, int(now_ts - ds["last_seen_ts"])))
+    conn_ok = connected is True
+    conn_txt = ("연결됨" + (f" ({seen_ago})" if seen_ago else "")) if conn_ok \
+        else ("끊김" + (f" ({seen_ago})" if seen_ago else "")) if connected is False else "상태 없음"
+    return connected, seen_ago, conn_txt
+
+
+def _bed_status(state, connected, mins_ago, is_radar):
+    """침대(EMFIT·McKare)·레이더의 상태 라벨.
+
+    ⚠️ 카드 렌더러 안에 박아두면 화면을 하나 더 만들 때 복사하게 되고, 그러면
+    한쪽만 고쳐져 화면과 알림이 어긋난다(§5-3). 판정은 반드시 여기 하나만 둔다."""
+    if is_radar:
+        pos = state.get("자세(POS)")
+        if connected is False:
+            return "끊김"
+        if mins_ago > 10:
+            return "수신 지연"
+        if state.get("낙상") or pos == 4:
+            return "낙상"
+        if pos == 5:
+            return "자리비움"
+        if pos == -1:
+            return "감지 대기"
+        return "재실"
+    act = state.get("활동량(ACT)")
+    act_num = act if isinstance(act, (int, float)) else None
+    # 움직임이 0 이면 매트 위에 사람이 없다고 본다 (부재).
+    absent = act_num is not None and act_num < 1
+    if connected is False:
+        return "끊김"
+    if mins_ago > 10 or absent:
+        return "부재"
+    return "재실"
+
+
 def _render_fsr_card_v2(sn, info, state, ds, now, link_suffix=""):
     """신규 디자인 사용감지 카드 — 생체 셀 대신 사용 상태 + 배터리."""
     loc = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
@@ -1788,19 +1838,8 @@ def _render_card_v2(sn, info, state, ds, now, link_suffix=""):
     loc = html.escape(str(info['location'] if info['location'] and info['location'] != '-' else '미지정'))
     name = html.escape(str(info['name']))
 
-    # 연결 상태
-    if ds is None:
-        connected = None
-    elif ds.get("connected"):
-        connected = True
-    else:
-        connected = False
-    seen_ago = None
-    if ds and isinstance(ds.get("last_seen_ts"), (int, float)):
-        seen_ago = _format_ago(max(0, int(now.timestamp() - ds["last_seen_ts"])))
+    connected, seen_ago, conn_txt = _conn_view(ds, now.timestamp())
     conn_ok = connected is True
-    conn_txt = ("연결됨" + (f" ({seen_ago})" if seen_ago else "")) if conn_ok \
-        else ("끊김" + (f" ({seen_ago})" if seen_ago else "")) if connected is False else "상태 없음"
 
     # 측정 데이터 없음
     if state is None:
@@ -1826,30 +1865,9 @@ def _render_card_v2(sn, info, state, ds, now, link_suffix=""):
     act = state.get("활동량(ACT)")
     act_num = act if isinstance(act, (int, float)) else None
 
-    # 상태 판정 (기존 규칙 그대로)
-    if is_radar:
-        pos = state.get("자세(POS)")
-        posture = str(state.get("자세") or "-")
-        if connected is False:
-            status = "끊김"
-        elif mins_ago > 10:
-            status = "수신 지연"
-        elif state.get("낙상") or pos == 4:
-            status = "낙상"
-        elif pos == 5:
-            status = "자리비움"
-        elif pos == -1:
-            status = "감지 대기"
-        else:
-            status = "재실"
-    else:
-        absent = act_num is not None and act_num < 1
-        if connected is False:
-            status = "끊김"
-        elif mins_ago > 10 or absent:
-            status = "부재"
-        else:
-            status = "재실"
+    # 상태 판정 — 새 관제 화면과 같은 함수를 쓴다 (§5-3: 기준이 갈라지면 안 된다)
+    posture = str(state.get("자세") or "-") if is_radar else "-"
+    status = _bed_status(state, connected, mins_ago, is_radar)
 
     tint = _v2_tint(status)
     show_vitals = status == "재실"
@@ -2146,7 +2164,8 @@ def _v2_page(p):
       <div><b>돌봄로봇 사업단</b><span>통합 관제 시스템</span></div></div>
     <nav class="v2nav">
       <div class="v2nl">모니터링</div>
-      <a class="v2ni on"><svg><use href="#i-grid"/></svg>통합 현황</a>
+      <a class="v2ni on"><svg><use href="#i-grid"/></svg>통합 현황 (기기별)</a>
+      <a class="v2ni" href="/dashboard3"><svg><use href="#i-grid"/></svg>통합 현황 (사람·가구)</a>
       <a class="v2ni" href="/view"><svg><use href="#i-place"/></svg>장소별 보기</a>
       <a class="v2ni" href="/day"><svg><use href="#i-clock"/></svg>하루 일과표</a>
       <div class="v2nl">관리</div>
@@ -2241,6 +2260,7 @@ def view_dashboard(request: Request, _: str = Depends(require_admin)):
                     <a href="/fsr-nodes" style="display:inline-block; padding:10px 20px; background:#d35400; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🛏️ FSR 노드 설정</a>
                     <a href="/fsr-tune" style="display:inline-block; padding:10px 20px; background:#c0392b; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🎚️ FSR 실시간 튜닝</a>
                     <a href="/env-monitor" style="display:inline-block; padding:10px 20px; background:#00897b; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🌡️ 사무실 환경모니터링</a>
+                    <a href="/dashboard3" style="display:inline-block; padding:10px 20px; background:#3b5bdb; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🧑‍🦽 사람·가구 관제 (신규)</a>
                     <a href="/day" style="display:inline-block; padding:10px 20px; background:#c2543f; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🗓️ 하루 일과표</a>
                     <a href="/dashboard/raw" style="display:inline-block; padding:10px 20px; background:#7f8c8d; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🔎 원본 데이터</a>
                     <a href="/logout" style="display:inline-block; padding:10px 20px; background:#b0bec5; color:white; text-decoration:none; border-radius:8px; font-weight:bold; margin:4px;">🚪 로그아웃</a>
@@ -8120,6 +8140,489 @@ document.querySelectorAll('.tg').forEach(b => b.addEventListener('click', () => 
 draw('count');
 </script>
 </body></html>"""
+
+
+# ============================================================================
+#  통합 관제 A+C (`/dashboard3`) — 사람·가구 중심 카드 + 확인 필요 띠 + 시설 트리
+#
+#  기존 화면은 **기기 하나가 카드 하나**여서, 한 사람이 침대·워치·이승기기를
+#  같이 쓰면 그 사람이 세 구역에 흩어진다. 여기서는 **위치(가구·실) 하나가
+#  카드 하나**이고 기기는 그 안의 줄이 된다. 위치에 사람이 한 명뿐이면 제목이
+#  그 사람 이름이 되므로 사실상 사람 카드가 된다 — 광주서구처럼 돌봄자와
+#  돌봄받는자가 같이 사는 집만 한 카드에 두 줄로 들어간다.
+#
+#  ⚠️ `/dashboard`·`/dashboard2` 는 그대로 둔다. 판정 로직을 여기서 다시 쓰지
+#     않고 기존 함수(_bed_status·_fsr_status·_garmin_status·_discord_device_snapshot)를
+#     불러 쓰는 것이 이 화면의 전제다. 복사해두면 한쪽만 고쳐져 화면과 알림이
+#     어긋난다(§5-3).
+# ============================================================================
+
+DASH3_KIND_LABEL = {"emfit": "침대", "radar": "레이더", "mckare": "레이더",
+                    "fsr": "이승기기", "garmin": "워치"}
+DASH3_KIND_ICON = {"emfit": "i-bed", "radar": "i-radar", "mckare": "i-temp",
+                   "fsr": "i-act", "garmin": "i-pulse"}
+# 카드 정렬·제목 색을 정하는 심각도. 숫자가 크면 먼저 손봐야 한다.
+DASH3_TONE_RANK = {"crit": 3, "warn": 2, "idle": 1, "ok": 0, "none": 0}
+# 카드 오른쪽 배지 문구. '조용함'은 정상도 이상도 아니라는 뜻이다 — 안 쓰는 기기가
+# 정상일 수 있으므로 조용한 것만으로 경고하지 않는다(§5-4).
+D3_TONE_TEXT = {"crit": "확인 필요", "warn": "주의", "idle": "조용함", "ok": "정상"}
+# 위치를 안 채운 기기도 반드시 화면에 남겨야 한다 — 빠뜨리면 기기가 사라진 것처럼 보인다.
+DASH3_NO_LOC = "위치 미지정"
+
+_D3_STYLE = """
+.d3tree{margin:2px 0 6px}
+.d3tn{display:flex; align-items:center; gap:8px; padding:6px 10px; border-radius:7px;
+      font-size:12.5px; color:var(--ink-2); text-decoration:none; margin:1px 0;}
+.d3tn:hover{background:var(--surface-2)}
+.d3tn.on{background:var(--accent-soft); color:var(--accent); font-weight:600;}
+.d3tn .c{margin-left:auto; font-size:11px; color:var(--ink-3); font-variant-numeric:tabular-nums;}
+.d3tn.on .c{color:var(--accent)}
+.d3tn .dot{width:6px; height:6px; border-radius:50%; flex:none; background:var(--ok);}
+.d3tn .dot.crit{background:#c23a52}
+.d3tn .dot.warn{background:#e2b52f}
+
+.d3attn{background:var(--surface); border:1px solid var(--border); border-left:4px solid #c23a52;
+        border-radius:10px; padding:13px 16px; margin-bottom:16px;}
+.d3attn.calm{border-left-color:var(--ok)}
+.d3attn h3{margin:0 0 9px; font-size:13px; font-weight:700; color:#b3283f; letter-spacing:-.01em;}
+.d3attn.calm h3{color:var(--ok)}
+.d3attn ul{margin:0; padding:0; list-style:none; display:grid; gap:6px;}
+.d3attn li{display:flex; align-items:baseline; gap:9px; font-size:12.5px; flex-wrap:wrap;}
+.d3attn li .sev{font-size:10px; font-weight:700; padding:1px 7px; border-radius:999px;
+                background:#fdecef; color:#b3283f; flex:none;}
+.d3attn li .sev.warn{background:#fff7e0; color:#8a6100}
+.d3attn li b{color:var(--ink)}
+.d3attn li .who{color:var(--ink-2)}
+.d3attn li .why{color:var(--ink-3); font-size:11.5px;}
+.d3attn .ok{font-size:12.5px; color:var(--ink-2);}
+
+.d3grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); gap:14px;}
+.d3card{background:var(--surface); border:1px solid var(--border); border-radius:12px;
+        overflow:hidden; box-shadow:0 1px 2px rgba(27,36,52,.05);}
+.d3card.crit{border-color:#e9a3af}
+.d3card.warn{border-color:#ecd59a}
+.d3ch{display:flex; align-items:center; gap:10px; padding:12px 15px 11px;
+      border-bottom:1px solid var(--border); background:var(--surface-2);}
+.d3ch .st{width:9px; height:9px; border-radius:50%; flex:none; background:var(--ok);}
+.d3ch .st.crit{background:#c23a52}
+.d3ch .st.warn{background:#e2b52f}
+.d3ch .st.idle{background:var(--off)}
+.d3ch .st.none{background:var(--ink-3)}
+.d3ch .nm{font-size:14.5px; font-weight:700; letter-spacing:-.01em; line-height:1.25;}
+.d3ch .sub{font-size:11px; color:var(--ink-3); margin-top:1px;}
+.d3ch .rs{margin-left:auto; font-size:11px; font-weight:600; padding:3px 9px; border-radius:999px;
+          background:#eaf6f0; color:#12724f; flex:none; white-space:nowrap;}
+.d3ch .rs.crit{background:#fdecef; color:#b3283f}
+.d3ch .rs.warn{background:#fff7e0; color:#8a6100}
+.d3ch .rs.idle{background:var(--surface-2); color:var(--ink-2); border:1px solid var(--border);}
+
+.d3rows{display:grid}
+.d3row{display:flex; align-items:center; gap:10px; padding:10px 15px; border-top:1px solid var(--border);
+       text-decoration:none; color:inherit;}
+.d3rows .d3row:first-child{border-top:0}
+.d3row:hover{background:var(--surface-2)}
+.d3row.dim{opacity:.55}
+.d3row .ic{width:24px; height:24px; border-radius:6px; display:grid; place-items:center; flex:none;
+           background:var(--accent-soft); color:var(--accent);}
+.d3row .ic svg{width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8;}
+.d3row .who{min-width:0; flex:1 1 90px;}
+.d3row .who b{display:block; font-size:12.5px; font-weight:600; white-space:nowrap;
+              overflow:hidden; text-overflow:ellipsis;}
+.d3row .who span{font-size:10.5px; color:var(--ink-3); display:block;}
+.d3row .tag{font-size:10.5px; padding:2px 7px; border-radius:5px; flex:none;
+            background:var(--surface-2); color:var(--ink-2); border:1px solid var(--border);}
+.d3row .tag.crit{background:#fdecef; color:#b3283f; border-color:#f0bcc6;}
+.d3row .tag.warn{background:#fff7e0; color:#8a6100; border-color:#ecd59a;}
+.d3row .tag.ok{background:#eaf6f0; color:#12724f; border-color:#b8e0cc;}
+.d3row .cells{display:flex; gap:11px; margin-left:auto; flex:none;}
+.d3row .cell{text-align:right; min-width:34px;}
+.d3row .cell .v{font-size:14px; font-weight:700; line-height:1.1;
+                font-variant-numeric:tabular-nums; letter-spacing:-.02em;}
+.d3row .cell .u{font-size:9.5px; color:var(--ink-3); display:block;}
+.d3cf{padding:8px 15px 10px; font-size:10.5px; color:var(--ink-3); border-top:1px solid var(--border);
+      display:flex; gap:12px; flex-wrap:wrap;}
+.d3cf a{color:var(--accent); text-decoration:none; font-weight:600;}
+.d3note{font-size:11.5px; color:var(--ink-3); margin:0 0 14px;}
+.d3empty{background:var(--surface); border:1px dashed var(--border); border-radius:12px;
+         padding:28px; text-align:center; color:var(--ink-3); font-size:13px;}
+@media (max-width:640px){
+  .d3row .cells{margin-left:0; width:100%; justify-content:flex-start; order:9;}
+  .d3row{flex-wrap:wrap}
+}
+"""
+
+
+def _person_label(name, location):
+    """기기 이름에서 사람만 남긴다. '광주서구 1 - 돌봄자' → '돌봄자'.
+
+    ⚠️ 데이터 모델에 '사람' 필드가 없어서 이름 문자열에 의존한다. 규칙에 안 맞으면
+    이름을 그대로 쓴다 — 억지로 잘라내면 사람 이름 자체가 사라진다."""
+    n = str(name or "").strip()
+    loc = str(location or "").strip()
+    if loc and loc != "-" and n.startswith(loc):
+        rest = n[len(loc):].lstrip(" -·—~").strip()
+        if rest:
+            return rest
+    return n or "-"
+
+
+def _d3_row(sn, info, state, ds, now, batt_thr=20):
+    """카드 안의 기기 한 줄.
+
+    판정은 전부 기존 함수를 부른다 — 여기서 다시 구현하면 화면끼리 기준이 갈라진다.
+    batt_thr 는 디스코드 알림이 쓰는 배터리 기준을 그대로 받는다."""
+    now_ts = now.timestamp()
+    kind = _v2_kind(sn, state, ds)
+    connected, seen_ago, _conn_txt = _conn_view(ds, now_ts)
+    row = {"sn": sn, "kind": kind,
+           "kind_label": DASH3_KIND_LABEL.get(kind, kind),
+           "icon": DASH3_KIND_ICON.get(kind, "i-pulse"),
+           "person": _person_label(info.get("name"), info.get("location")),
+           "cells": [], "tone": "none", "label": "상태 없음", "note": "",
+           "asof": "", "batt": None, "seen": seen_ago,
+           "inactive": not _is_active(ds, now_ts)}
+
+    if kind == "garmin":
+        label, _i, _bg, _bd, _fg, reason = _garmin_status(ds, now_ts)
+        row["label"], row["note"] = label, reason
+        row["tone"] = {"동기화 정상": "ok", "동기화 지연": "warn",
+                       "미동기화": "crit", "토큰 갱신 필요": "crit"}.get(label, "none")
+        daily = (ds or {}).get("daily") if isinstance(ds, dict) else None
+        daily = daily if isinstance(daily, dict) else {}
+        resting = daily.get("안정시심박")
+        if isinstance(resting, (int, float)):
+            row["cells"].append((str(int(resting)), "안정HR"))
+        act_label, act_value = _garmin_activity_cell(daily)
+        if act_value != "-":
+            row["cells"].append((str(act_value), act_label.split(" ", 1)[-1]))
+        sleep_min = daily.get("총수면(분)")
+        if isinstance(sleep_min, (int, float)):
+            row["cells"].append((f"{sleep_min / 60:.1f}", "수면h"))
+        # 워치 값은 몇 시간 전이 정상이다. 언제 것인지 같이 안 적으면 고장으로 오인한다.
+        row["asof"] = f"동기화 {seen_ago}" if seen_ago else "동기화 기록 없음"
+        return row
+
+    if kind == "fsr":
+        if state is None:
+            row["label"] = "데이터 없음"
+        else:
+            label, _i, _bg, _bd, _fg, reason = _fsr_status(state, ds, now_ts)
+            row["label"], row["note"] = label, reason
+            row["tone"] = {"사용 중": "ok", "미사용": "idle",
+                           "센서 확인 필요": "crit"}.get(label, "none")
+            # 배터리는 알림 경로와 **같은 필드·같은 범위 검사**를 쓴다.
+            # ⚠️ 범위 밖(-1 등)은 '측정 불가'라는 뜻이지 방전이 아니다. 그대로 받으면
+            #    배터리 회로가 없는 보드가 매번 '배터리 부족'으로 잡힌다.
+            raw = ds.get("battery_pct") if isinstance(ds, dict) else None
+            if not (isinstance(raw, (int, float)) and 0 <= raw <= 100):
+                raw = state.get("배터리(%)")
+            if isinstance(raw, (int, float)) and 0 <= raw <= 100:
+                pct = int(raw)
+                row["batt"] = pct
+                row["cells"].append((str(pct), "배터리%"))
+                # 알림과 같은 기준으로 줄에도 표시한다 — 띠에만 있으면 카드만
+                # 훑는 사람은 배터리가 다 된 것을 놓친다.
+                if pct < batt_thr and row["tone"] != "crit":
+                    row["tone"] = "warn"
+                    row["note"] = row["note"] or f"배터리 {pct}% · 기준 {batt_thr}% 미만"
+        row["asof"] = f"마지막 신호 {seen_ago}" if seen_ago else "신호 없음"
+        return row
+
+    # EMFIT · McKare · 레이더
+    if state is None:
+        row["label"] = "데이터 없음"
+        row["tone"] = "crit" if connected is False else "none"
+        row["asof"] = f"마지막 통신 {seen_ago}" if seen_ago else "통신 이력 없음"
+        return row
+
+    is_radar = _is_radar_device(sn, state, ds)
+    try:
+        last_dt = _state_dt(state)
+        delta_sec = max(0, int((now - last_dt).total_seconds()))
+        mins_ago = delta_sec // 60
+        row["asof"] = f"측정 {_format_ago(delta_sec)}"
+        # 측정이 최근이면 '비활성'이라 부르지 않는다. _is_active 는 통신 상태(ds)만
+        # 보는데, 상태 레코드 없이 측정만 보내는 기기는 ds 가 비어 비활성으로 잡힌다.
+        # 방금 값이 있는 기기에 '7일 이상 소식 없음'을 붙이면 화면이 스스로 모순된다.
+        if delta_sec <= 7 * 24 * 3600:
+            row["inactive"] = False
+    except Exception:
+        mins_ago, row["asof"] = 10 ** 9, "측정 시각 불명"
+
+    status = _bed_status(state, connected, mins_ago, is_radar)
+    row["label"] = status
+    row["tone"] = {"낙상": "crit", "끊김": "crit", "수신 지연": "warn",
+                   "부재": "idle", "자리비움": "idle", "감지 대기": "idle",
+                   "재실": "ok"}.get(status, "none")
+
+    # 값은 '재실'일 때만 보여준다 — 부재 중 남아 있는 마지막 심박을 지금 값처럼
+    # 띄우면 침대에 없는 사람의 생체신호를 보고 있는 셈이 된다.
+    show = status == "재실"
+    if is_radar:
+        row["cells"].append((str(state.get("자세") or "-"), "자세"))
+    hr, rr = state.get("심박수(HR)"), state.get("호흡수(RR)")
+    row["cells"].append((f"{hr:.0f}" if show and isinstance(hr, (int, float)) else "–", "HR"))
+    row["cells"].append((f"{rr:.0f}" if show and isinstance(rr, (int, float)) else "–", "RR"))
+    if not is_radar:
+        act = state.get("활동량(ACT)")
+        row["cells"].append((f"{act:.0f}" if show and isinstance(act, (int, float)) else "–", "ACT"))
+    temp = state.get("체온")
+    if show and isinstance(temp, (int, float)):
+        row["cells"].append((f"{temp:.1f}", "체온℃"))
+    return row
+
+
+def _d3_attention(rows_by_sn, snap, thr):
+    """확인 필요 목록.
+
+    끊김·배터리 판정은 디스코드 알림과 **같은 스냅샷**(_discord_device_snapshot)을
+    쓴다. 화면과 알림이 다른 말을 하면 둘 다 못 믿게 된다(§5-3).
+    낙상·센서 이상은 스냅샷에 없는 실시간 상태라 카드 줄에서 가져온다."""
+    items = []
+    for d in snap:
+        sn = d["sn"]
+        r = rows_by_sn.get(sn)
+        who = " · ".join(x for x in (d.get("location") or "", (r or {}).get("person") or d["name"]) if x)
+        if d.get("connected") is False:
+            items.append({"tone": "crit", "sn": sn,
+                          "what": f"{d['kind_label']} 끊김",
+                          "who": who,
+                          "why": d.get("reason") or d.get("last_seen_text") or ""})
+        b = d.get("battery_pct")
+        if isinstance(b, int) and b < thr:
+            items.append({"tone": "warn", "sn": sn,
+                          "what": f"배터리 {b}%",
+                          "who": who,
+                          "why": f"기준 {thr}% 미만"})
+
+    # 낙상은 가장 급하다 — 목록 맨 위로 올린다.
+    for sn, r in rows_by_sn.items():
+        who = " · ".join(x for x in (r.get("where"), r.get("person")) if x and x != DASH3_NO_LOC)
+        if r["label"] == "낙상":
+            items.insert(0, {"tone": "crit", "sn": sn, "what": "낙상 감지",
+                             "who": who or sn, "why": "즉시 확인"})
+        elif r["label"] == "센서 확인 필요":
+            items.append({"tone": "crit", "sn": sn, "what": "사용감지 센서 이상",
+                          "who": who or sn, "why": r.get("note") or ""})
+    return items
+
+
+def _build_dash3_payload(loc_filter=None):
+    """A+C 화면 본문 + 사이드바 트리 + 요약."""
+    now = datetime.now(KST)
+    now_ts = now.timestamp()
+    latest = {}
+    if _has_data():
+        try:
+            latest = analyzer.get_latest_states(DATA_FILES)
+        except Exception:
+            latest = {}
+    statuses = analyzer.get_device_statuses()
+
+    # 끊김·배터리 기준은 디스코드 설정에서 한 번만 읽어 카드와 띠가 같은 값을 쓰게 한다.
+    try:
+        cfg = _load_discord_config()
+        snap = _discord_device_snapshot(cfg)
+        batt_thr = _discord_battery_threshold(cfg)
+    except Exception:
+        snap, batt_thr = [], 20
+
+    # 위치별로 묶는다. 위치가 없는 기기는 버리지 않고 '위치 미지정' 으로 모은다.
+    houses, rows_by_sn = {}, {}
+    connected_count = total = 0
+    for sn, info in analyzer.DEVICE_INFO.items():
+        if info.get("hidden"):
+            continue
+        total += 1
+        ds = statuses.get(sn)
+        if isinstance(ds, dict) and ds.get("connected"):
+            connected_count += 1
+        row = _d3_row(sn, info, latest.get(sn), ds, now, batt_thr)
+        loc = str(info.get("location") or "").strip()
+        loc = loc if loc and loc != "-" else DASH3_NO_LOC
+        row["where"] = loc
+        rows_by_sn[sn] = row
+        houses.setdefault(loc, []).append(row)
+
+    attention = _d3_attention(rows_by_sn, snap, batt_thr)
+
+    # 카드 하나 = 위치 하나. 심각한 곳이 위로 오게 정렬한다.
+    cards = []
+    for loc, rows in houses.items():
+        rows.sort(key=lambda r: (r["inactive"], -DASH3_TONE_RANK.get(r["tone"], 0),
+                                 r["kind_label"], r["person"]))
+        live = [r for r in rows if not r["inactive"]]
+        worst = max((DASH3_TONE_RANK.get(r["tone"], 0) for r in live), default=0)
+        # 전부 비활성인 가구를 '정상'이라고 쓰면 안 된다 — 아무 소식이 없는 것이지
+        # 괜찮다는 뜻이 아니다.
+        tone = "idle" if not live else {3: "crit", 2: "warn", 1: "idle", 0: "ok"}[worst]
+        people = []
+        for r in rows:
+            if r["person"] not in people:
+                people.append(r["person"])
+        # 사람이 한 명뿐인 위치는 제목을 사람 이름으로 — 그러면 사람 카드가 된다.
+        if len(people) == 1 and loc != DASH3_NO_LOC:
+            title, sub = people[0], loc
+        else:
+            title = loc
+            sub = f"{len(people)}명 · 기기 {len(rows)}대" if len(people) > 1 else f"기기 {len(rows)}대"
+        cards.append({"loc": loc, "title": title, "sub": sub, "tone": tone,
+                      "rank": worst if live else -1, "rows": rows})
+    cards.sort(key=lambda c: (-c["rank"], c["loc"] == DASH3_NO_LOC, c["loc"]))
+
+    tree = [{"loc": c["loc"], "n": len(c["rows"]), "tone": c["tone"]} for c in cards]
+    shown = [c for c in cards if loc_filter is None or c["loc"] == loc_filter]
+
+    # ── HTML ───────────────────────────────────────────────────
+    if attention:
+        lis = "".join(
+            f'<li><span class="sev{"" if a["tone"] == "crit" else " warn"}">'
+            f'{"확인" if a["tone"] == "crit" else "주의"}</span>'
+            f'<b>{html.escape(a["what"])}</b>'
+            f'<span class="who">{html.escape(a["who"])}</span>'
+            + (f'<span class="why">{html.escape(a["why"])}</span>' if a["why"] else "")
+            + "</li>"
+            for a in attention)
+        attn_html = f'<div class="d3attn"><h3>확인 필요 {len(attention)}건</h3><ul>{lis}</ul></div>'
+    else:
+        attn_html = ('<div class="d3attn calm"><h3>확인 필요 없음</h3>'
+                     '<div class="ok">끊김·배터리 부족·낙상으로 잡힌 기기가 없습니다. '
+                     '조용한 기기는 경고로 세지 않습니다.</div></div>')
+
+    cards_html = ""
+    for c in shown:
+        rows_html = ""
+        for r in c["rows"]:
+            cells = "".join(
+                f'<div class="cell"><div class="v">{html.escape(str(v))}</div>'
+                f'<div class="u">{html.escape(str(u))}</div></div>'
+                for v, u in r["cells"])
+            tag_tone = "crit" if r["tone"] == "crit" else ("warn" if r["tone"] == "warn"
+                                                           else ("ok" if r["tone"] == "ok" else ""))
+            # 비활성이라도 '언제까지는 왔었나'를 남긴다 — 한 번도 안 온 기기와
+            # 옛날에 오다 끊긴 기기는 손쓸 방법이 다르다.
+            if r["inactive"]:
+                sub = f'비활성 · 마지막 통신 {html.escape(r["seen"])}' if r.get("seen") \
+                    else "비활성 · 통신 이력 없음"
+            else:
+                sub = html.escape(r["asof"])
+                # 사유가 있으면 같이 적는다 — '무엇을 해야 하나'가 줄에서 바로 보이게.
+                if r.get("note"):
+                    sub += f' · {html.escape(r["note"])}'
+            rows_html += f"""
+            <a class="d3row{' dim' if r['inactive'] else ''}" href="/device/{r['sn']}">
+              <span class="ic"><svg><use href="#{r['icon']}"/></svg></span>
+              <span class="who"><b>{html.escape(r['person'])}</b><span>{r['kind_label']} · {sub}</span></span>
+              <span class="tag {tag_tone}">{html.escape(r['label'])}</span>
+              <span class="cells">{cells}</span>
+            </a>"""
+        day_link = (f'<a href="/day?loc={quote(c["loc"])}">하루 일과표 →</a>'
+                    if c["loc"] != DASH3_NO_LOC else
+                    '<span>기기 관리에서 위치를 채우면 가구로 묶입니다</span>')
+        rs = D3_TONE_TEXT.get(c["tone"], "")
+        cards_html += f"""
+        <div class="d3card {c['tone']}">
+          <div class="d3ch"><span class="st {c['tone']}"></span>
+            <div><div class="nm">{html.escape(c['title'])}</div><div class="sub">{html.escape(c['sub'])}</div></div>
+            <span class="rs {c['tone']}">{rs}</span></div>
+          <div class="d3rows">{rows_html}</div>
+          <div class="d3cf">{day_link}</div>
+        </div>"""
+    if not cards_html:
+        cards_html = '<div class="d3empty">표시할 기기가 없습니다.</div>'
+
+    tree_html = (f'<a class="d3tn{" on" if loc_filter is None else ""}" href="/dashboard3">'
+                 f'<span class="dot"></span>전체<span class="c">{total}</span></a>')
+    for t in tree:
+        on = " on" if loc_filter == t["loc"] else ""
+        dot = "crit" if t["tone"] == "crit" else ("warn" if t["tone"] == "warn" else "")
+        tree_html += (f'<a class="d3tn{on}" href="/dashboard3?loc={quote(t["loc"])}">'
+                      f'<span class="dot {dot}"></span>{html.escape(t["loc"])}'
+                      f'<span class="c">{t["n"]}</span></a>')
+
+    attn_n = len(attention)
+    summary = (f'<b style="color:var(--ok)">{connected_count}</b> / {total} 연결됨'
+               + (f' · <b style="color:#c23a52">확인 {attn_n}</b>' if attn_n else ""))
+    return {"attn": attn_html, "cards": cards_html, "tree": tree_html,
+            "summary": summary, "now": now.strftime('%Y-%m-%d %H:%M:%S'),
+            "title": loc_filter or "전체 현황"}
+
+
+def _d3_page(p):
+    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">
+<title>통합 관제 · 돌봄로봇 사업단</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{_V2_STYLE}{_D3_STYLE}</style></head><body>{_V2_DEFS}
+<div class="v2app">
+  <aside class="v2side">
+    <div class="v2brand"><div class="mk"><svg><use href="#i-radar"/></svg></div>
+      <div><b>돌봄로봇 사업단</b><span>통합 모니터링</span></div></div>
+    <nav class="v2nav">
+      <div class="v2nl">모니터링</div>
+      <a class="v2ni on" href="/dashboard3"><svg><use href="#i-grid"/></svg>통합 현황</a>
+      <a class="v2ni" href="/day"><svg><use href="#i-clock"/></svg>하루 일과표</a>
+      <a class="v2ni" href="/view"><svg><use href="#i-place"/></svg>장소별 보기</a>
+      <a class="v2ni" href="/env-monitor"><svg><use href="#i-temp"/></svg>사무실 환경</a>
+      <div class="v2nl">가구 · 시설</div>
+      <div class="d3tree" id="d3tree">{p['tree']}</div>
+      <div class="v2nl">관리</div>
+      <a class="v2ni" href="/devices"><svg><use href="#i-cog"/></svg>기기 관리</a>
+      <a class="v2ni" href="/admin/tokens"><svg><use href="#i-cog"/></svg>사용자 URL</a>
+      <a class="v2ni" href="/admin/discord"><svg><use href="#i-alert"/></svg>알림 설정</a>
+      <div class="v2nl">자료</div>
+      <a class="v2ni" href="/reports"><svg><use href="#i-report"/></svg>리포트</a>
+      <a class="v2ni" href="/dashboard/raw"><svg><use href="#i-book"/></svg>원본 데이터</a>
+      <a class="v2ni" href="/help"><svg><use href="#i-book"/></svg>사용 가이드</a>
+      <div class="v2nl">기존 화면</div>
+      <a class="v2ni" href="/dashboard"><svg><use href="#i-grid"/></svg>관제 (기존)</a>
+      <a class="v2ni" href="/dashboard2"><svg><use href="#i-grid"/></svg>관제 (기기별)</a>
+    </nav>
+    <div class="v2foot"><span>v{VERSION}</span></div>
+  </aside>
+  <main class="v2main">
+    <div class="v2top">
+      <div><h1>{html.escape(p['title'])}</h1>
+        <div class="sub">사람·가구 단위 통합 관제 — 기기는 카드 안의 줄입니다</div></div>
+      <div class="v2sp"></div>
+      <span class="v2chip" id="d3sum">{p['summary']}</span>
+      <span class="v2clock" id="d3clk">{p['now']}</span>
+    </div>
+    <div class="v2wrap">
+      <div id="d3attn">{p['attn']}</div>
+      <p class="d3note">카드 하나가 가구(또는 실) 하나입니다. 그 위치에 사람이 한 명이면 제목이 그 사람 이름이 됩니다.
+        값은 <b>재실일 때만</b> 보여줍니다 — 부재 중 남아 있는 마지막 심박을 지금 값처럼 띄우지 않기 위해서입니다.
+        워치 값은 몇 시간 전이 정상이라 줄마다 언제 것인지 함께 적습니다.</p>
+      <div class="d3grid" id="d3cards">{p['cards']}</div>
+    </div>
+  </main>
+</div>
+<script>
+const D3LOC = new URLSearchParams(location.search).get('loc');
+async function d3refresh(){{try{{
+  const r = await fetch('/api/cards3' + (D3LOC ? '?loc=' + encodeURIComponent(D3LOC) : ''));
+  if(!r.ok) return;
+  const d = await r.json();
+  document.getElementById('d3cards').innerHTML = d.cards;
+  document.getElementById('d3attn').innerHTML = d.attn;
+  document.getElementById('d3tree').innerHTML = d.tree;
+  document.getElementById('d3sum').innerHTML = d.summary;
+  document.getElementById('d3clk').textContent = d.now;
+}}catch(e){{}}}}
+setInterval(d3refresh, 15000);
+document.addEventListener('visibilitychange', () => {{ if(!document.hidden) d3refresh(); }});
+</script></body></html>"""
+
+
+@app.get("/dashboard3", response_class=HTMLResponse)
+def view_dashboard3(request: Request, loc: str = Query(None), _: str = Depends(require_admin)):
+    """사람·가구 중심 통합 관제 (A+C). 기존 /dashboard·/dashboard2 는 그대로 둔다."""
+    return _d3_page(_build_dash3_payload(loc or None))
+
+
+@app.get("/api/cards3")
+def api_cards3(request: Request, loc: str = Query(None), _: str = Depends(require_admin)):
+    """15초 갱신용 — 화면 전체를 다시 안 받고 본문만 바꾼다."""
+    return _build_dash3_payload(loc or None)
 
 
 if __name__ == "__main__":
