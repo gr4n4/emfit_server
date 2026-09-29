@@ -17,7 +17,7 @@ from nrcarec_alert import send_alert, should_send
 
 # SemVer (MAJOR.MINOR.PATCH) — 변경 시 CHANGELOG.md 같이 업데이트.
 # MAJOR: 기존 사용 방식이 깨지는 변경 / MINOR: 기능 추가 / PATCH: 버그·자잘한 수정.
-VERSION = "3.22.0"
+VERSION = "3.23.0"
 
 app = FastAPI()
 LOG_FILE = "emfit_data.jsonl"
@@ -79,9 +79,9 @@ DEVICE_BLOCKS = {
     "radar":  ["postures", "hr", "rr", "posture"],
     "mckare": ["presence", "hr", "rr", "temp"],
     "fsr":    ["usage", "daily"],
-    # 워치는 2분 간격 심박과 일별 수면 요약을 준다. 호흡·활동량은 일별 값이라
-    # 시계열 그래프로 그릴 것이 없어 블록을 만들지 않는다.
-    "garmin": ["summary", "hr"],
+    # 워치는 2분 간격 심박(종일)과 수면 중 호흡·HRV 시계열, 일별 수면 요약을 준다.
+    # 호흡은 밤에만 값이 있어 그래프도 그 구간만 그려진다.
+    "garmin": ["summary", "hr", "rr"],
 }
 # 블록 순서 환경설정에서 허용하는 전체 블록 목록 (viewer 단위라 기기 종류와 무관하게 저장됨).
 # 화면에 없는 블록 id 는 프런트에서 그냥 무시되므로 한 목록으로 관리해도 안전하다.
@@ -899,7 +899,7 @@ def _is_garmin_device(sn, state=None, ds=None):
     올바른 섹션에 뜨게 하기 위함이다 (FSR 과 같은 이유)."""
     if (analyzer.DEVICE_INFO.get(sn) or {}).get("kind") == analyzer.KIND_GARMIN:
         return True
-    if isinstance(state, dict) and state.get("유형") in ("Garmin", "Garmin일별"):
+    if isinstance(state, dict) and state.get("유형") in ("Garmin", "Garmin수면", "Garmin일별"):
         return True
     if isinstance(ds, dict) and ds.get("source") == "garmin":
         return True
@@ -4009,7 +4009,7 @@ def _resolve_report_target(device, assignment):
 # 이것도 성격이 달라 파일을 나눈다. 분석할 때 섞여 있으면 오히려 다루기 어렵다.
 # Garmin 워치도 같은 이유로 '_Garmin' 꼬리표를 붙여 따로 뽑는다.
 RADAR_CSV_KINDS = [("bed", "Radar-BED"), ("fall", "Radar-FALL")]
-GARMIN_ROW_TYPES = {"Garmin", "Garmin일별"}
+GARMIN_ROW_TYPES = {"Garmin", "Garmin수면", "Garmin일별"}
 
 
 def _report_frames(date_str, sn, aid, kind=None):

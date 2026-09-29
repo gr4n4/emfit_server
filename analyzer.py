@@ -516,6 +516,10 @@ def add_to_storage(storage, sn, ts, dtype, extra):
         elif dtype == "Garmin":
             # 워치 심박 시계열(2분 간격). 호흡·산소포화도는 일별 값이라 여기 없다.
             default_fields = {"심박수(HR)": None, "상태설명": ""}
+        elif dtype == "Garmin수면":
+            # 수면 중에만 나오는 시계열. 어떤 항목이 오는지는 기기·계정마다 달라서
+            # (HRV 가 없는 모델도 있다) 고정 칸을 만들지 않고 온 컬럼만 채운다.
+            default_fields = {"상태설명": ""}
         elif dtype == "Garmin일별":
             # 하루 한 줄짜리 요약. 어떤 지표가 오는지는 계정·기기마다 달라서
             # (휠체어 사용자는 걸음 대신 밀기, SpO2 없는 계정도 있다) 고정 칸을 만들지 않고
@@ -839,6 +843,26 @@ def _store_garmin_record(storage, g):
             "심박수(HR)": bpm,
             "상태설명": "Garmin 심박",
         })
+
+    # ── 야간 시계열 (수면 중 심박·호흡·HRV·스트레스) ────────────
+    # 컬럼 이름을 Emfit 과 맞춰 뒀으므로, 같은 사람의 침대 센서 기록과 CSV 에서
+    # 같은 열에 나란히 놓인다. 중복 방어는 심박과 같은 방식(시각 기준).
+    seen_sleep_by_date = {}
+    for ts, cols in g.get("sleep_rows") or []:
+        if not cols:
+            continue
+        date_key, time_str = _kst_parts(ts)
+        seen = seen_sleep_by_date.get(date_key)
+        if seen is None:
+            seen = {r.get("시간(KST)") for r in storage.get((sn, date_key), [])
+                    if r.get("유형") == "Garmin수면"}
+            seen_sleep_by_date[date_key] = seen
+        if time_str in seen:
+            continue
+        seen.add(time_str)
+        extra = dict(cols)
+        extra["상태설명"] = "Garmin 수면중"
+        add_to_storage(storage, sn, ts, "Garmin수면", extra)
 
     # ── 일별 요약 ───────────────────────────────────────────────
     # 부분 동기화된 값(예: 오전 6시까지의 걸음 13)이 나중에 완전한 값으로 바뀐다.

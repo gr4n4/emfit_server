@@ -130,6 +130,16 @@ _SUMMARY_MAP = (
     ("바디배터리",      "bodyBatteryMostRecentValue",    _integer),
 )
 
+# 야간 시계열 — **Emfit 이 같은 밤에 재는 항목과 컬럼 이름을 맞춘다.**
+# 그래야 같은 사람의 침대 센서 기록과 워치 기록이 CSV 에서 같은 열에 나란히 놓여
+# 곧바로 대조된다 (Emfit 은 Live 행에 심박·호흡, HRV 행에 RMSSD 를 쓴다).
+_SLEEP_SERIES_MAP = (
+    ("hr",     "심박수(HR)",        _integer),
+    ("rr",     "호흡수(RR)",        _number),
+    ("hrv",    "심박변이도(RMSSD)", _number),
+    ("stress", "스트레스",          _integer),
+)
+
 # 수면 — Emfit '수면종료요약' 행과 컬럼 이름을 맞춘다 (위 docstring 참고).
 _SLEEP_MAP = (
     ("총수면(분)",     "sleepTimeSeconds",       _minutes),
@@ -138,6 +148,30 @@ _SLEEP_MAP = (
     ("얕은수면(분)",   "lightSleepSeconds",      _minutes),
     ("각성시간(분)",   "awakeSleepSeconds",      _minutes),
 )
+
+
+def _build_sleep_rows(series):
+    """야간 시계열 → [(epoch초, {컬럼: 값}), ...] 시각 오름차순.
+
+    항목마다 측정 시각이 몇십 초씩 어긋나 있다(심박 :00, 호흡 :41, HRV :05 …).
+    그대로 두면 한 컬럼만 채워진 행이 항목 수만큼 따로 생겨 CSV 가 읽기 어려워지므로,
+    **분 단위로 묶어** 같은 분에 들어온 값들을 한 행에 모은다."""
+    if not isinstance(series, dict):
+        return []
+
+    by_minute = {}
+    for key, col, conv in _SLEEP_SERIES_MAP:
+        for item in series.get(key) or []:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            ts = _epoch_seconds(item[0])
+            val = conv(item[1])
+            if ts is None or val is None:
+                continue
+            minute = int(ts // 60 * 60)
+            by_minute.setdefault(minute, {})[col] = val
+
+    return sorted(by_minute.items())
 
 
 def _build_daily(summary, sleep):
@@ -173,6 +207,7 @@ def parse_garmin_payload(row):
       {"sn", "account", "date", "server_received_at",
        "last_sync_ts": epoch초|None,
        "hr": [(epoch초, bpm), ...],          ← 시각 오름차순, 값 없는 구간은 제외
+       "sleep_rows": [(epoch초, {컬럼: 값}), ...],  ← 수면 중 심박·호흡·HRV·스트레스 (분 단위로 묶음)
        "daily": {한국어 컬럼: 값} | None,
        "daily_ts": epoch초|None,
        "auth_error": str|None}
@@ -211,6 +246,7 @@ def parse_garmin_payload(row):
     hr.sort(key=lambda x: x[0])
 
     daily = _build_daily(row.get("summary"), row.get("sleep"))
+    sleep_rows = _build_sleep_rows(row.get("sleep_series"))
 
     return {
         "sn": sn,
@@ -219,6 +255,7 @@ def parse_garmin_payload(row):
         "server_received_at": row.get("server_received_at"),
         "last_sync_ts": _epoch_from_gmt(row.get("last_sync_gmt")),
         "hr": hr,
+        "sleep_rows": sleep_rows,
         "daily": daily,
         "daily_ts": _date_end_epoch(date_str) if daily else None,
         "auth_error": auth_error,

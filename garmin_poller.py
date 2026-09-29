@@ -84,6 +84,23 @@ SLEEP_FIELDS = (
     "averageRespirationValue", "averageSpO2Value", "avgSleepStress",
 )
 
+# 야간 시계열 — get_sleep_data 응답 **한 덩어리 안에** 요약과 같이 들어온다.
+# 예전에는 dailySleepDTO 만 꺼내 쓰고 나머지를 그냥 흘려보냈는데, 그건 이미 받아온 것을
+# 버리는 셈이었다. 추가 API 호출 없이 가져갈 수 있어 그대로 실어 보낸다.
+#
+# 침대 센서(EMFIT)가 같은 밤에 재는 항목과 겹치므로, 같은 사람·같은 밤을 두 기기로
+# 대조할 수 있다. 그래서 서버 쪽 컬럼 이름도 EMFIT 과 맞춰 둔다.
+#
+# (키, Garmin 원본 필드, 시각 필드, 값 필드)
+SLEEP_SERIES_SPEC = (
+    ("hr",     "sleepHeartRate",                       "startGMT",     "value"),
+    ("rr",     "wellnessEpochRespirationDataDTOList",  "startTimeGMT", "respirationValue"),
+    ("hrv",    "hrvData",                              "startGMT",     "value"),
+    ("stress", "sleepStress",                          "startGMT",     "value"),
+)
+# sleepMovement(하루 263포인트)는 넣지 않는다 — 가장 크면서 EMFIT 활동량과 척도가 달라
+# 곧바로 비교되지 않는다. 필요해지면 위 목록에 한 줄 추가하면 된다.
+
 
 # ── 계정·상태 ─────────────────────────────────────────────────────────
 
@@ -172,9 +189,35 @@ def fetch_date(api, label: str, date_str: str) -> dict:
     return {
         "summary": pick(summary, SUMMARY_FIELDS),
         "sleep": pick(sleep_dto, SLEEP_FIELDS),
+        "sleep_series": extract_sleep_series(sleep_raw),
         "hr_values": (hr_raw or {}).get("heartRateValues") if isinstance(hr_raw, dict) else None,
         "last_sync_gmt": (summary or {}).get("wellnessEndTimeGmt") if isinstance(summary, dict) else None,
     }
+
+
+def extract_sleep_series(sleep_raw) -> dict:
+    """야간 시계열을 [[epoch_ms, 값], ...] 꼴로 정규화한다.
+
+    Garmin 은 항목마다 시각·값 필드 이름이 다르다(startGMT/startTimeGMT,
+    value/respirationValue). 그 차이를 여기서 흡수해 서버에는 한 가지 모양으로 보낸다.
+    원본 dict 를 그대로 보내면 같은 내용이 3~4배로 커져서, 재파싱해야 하는 로그가
+    그만큼 무거워진다."""
+    if not isinstance(sleep_raw, dict):
+        return {}
+    out = {}
+    for key, field, ts_key, val_key in SLEEP_SERIES_SPEC:
+        points = []
+        for item in sleep_raw.get(field) or []:
+            if not isinstance(item, dict):
+                continue
+            ts, val = item.get(ts_key), item.get(val_key)
+            # 측정이 없는 구간은 null 로 온다. 그대로 담으면 빈 행만 늘어난다.
+            if ts is None or val is None:
+                continue
+            points.append([ts, val])
+        if points:
+            out[key] = points
+    return out
 
 
 def build_payload(label: str, date_str: str, fetched: dict,
@@ -200,9 +243,14 @@ def build_payload(label: str, date_str: str, fetched: dict,
     # 일별 요약 — 내용이 바뀌었을 때만 보낸다. 동기화가 없으면 값이 그대로라
     # 매 폴링마다 보내면 같은 줄이 하루 48개씩 쌓인다.
     summary, sleep = fetched.get("summary") or {}, fetched.get("sleep") or {}
+    series = fetched.get("sleep_series") or {}
     sig = None
-    if summary or sleep:
-        sig = json.dumps({"s": summary, "z": sleep}, sort_keys=True, ensure_ascii=False)
+    if summary or sleep or series:
+        # 야간 시계열은 통째로 넣지 않고 '몇 개까지 왔는지'만 넣는다 — 서명은 상태 파일에
+        # 저장되므로, 6KB 짜리 배열을 그대로 넣으면 날짜·계정마다 그만큼 쌓인다.
+        series_mark = {k: [len(v), v[-1][0]] for k, v in series.items()}
+        sig = json.dumps({"s": summary, "z": sleep, "n": series_mark},
+                         sort_keys=True, ensure_ascii=False)
     send_daily = bool(sig) and sig != prev_sig
 
     if not new_hr and not send_daily:
@@ -220,6 +268,8 @@ def build_payload(label: str, date_str: str, fetched: dict,
     if send_daily:
         payload["summary"] = summary
         payload["sleep"] = sleep
+        if series:
+            payload["sleep_series"] = series
     return payload, max_ts, (sig if send_daily else prev_sig)
 
 
